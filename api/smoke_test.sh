@@ -182,5 +182,57 @@ SPOOF_CITES=$(curl -sf "$BASE/audit/$SPOOF_QID" -H "$(auth_header "$TOKEN")" \
 [ "$SPOOF_CITES" = "0" ] && pass "role spoof: zero citations returned (no source leakage)" \
   || fail "role spoof: $SPOOF_CITES citation(s) leaked despite refusal"
 
+
+# ---- 14. Corpus FTS ingest smoke test (optional) ----------------------
+# Only runs when RUN_CORPUS_INGEST_TEST=1. Requires the stack to be up
+# and docker compose reachable (set COMPOSE_DIR to keystone-deploy/ if needed).
+# Creates a synthetic doc inside the container, ingests it, queries for a
+# unique token, verifies approved + citation, then cleans up the DB row.
+
+if [[ "${RUN_CORPUS_INGEST_TEST:-0}" == "1" ]]; then
+  echo "=== 14. Corpus FTS ingest smoke test ==="
+
+  _SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  COMPOSE_DIR="${COMPOSE_DIR:-${_SCRIPT_DIR}/../../keystone-deploy}"
+  UNIQUE_TOKEN="KEYSTONEFTSSMK$(date +%s)"
+
+  # Create temp corpus inside the container and ingest it
+  (cd "$COMPOSE_DIR" && docker compose exec -T api bash -c "
+    mkdir -p /tmp/smoke-corpus/active /tmp/smoke-corpus/receipts
+    echo 'The ${UNIQUE_TOKEN} emergency protocol requires all responders to acknowledge within thirty seconds.' \
+      > /tmp/smoke-corpus/active/smoke-test.txt
+    CORPUS_ROOT=/tmp/smoke-corpus python3 /app/ingest_corpus.py >/dev/null
+    rm -rf /tmp/smoke-corpus
+  ")
+
+  # Query for the unique token
+  FTS_Q=$(curl -sf -X POST "$BASE/query" \
+    -H 'Content-Type: application/json' \
+    -H "$(auth_header "$TOKEN")" \
+    -d "{\"question\":\"${UNIQUE_TOKEN} emergency protocol\",\"mode\":\"operational\"}")
+  FTS_QID=$(echo "$FTS_Q" | python3 -c "import sys,json; print(json.load(sys.stdin)['query_id'])")
+  FTS_GUIDANCE=$(curl -sf "$BASE/guidance/$FTS_QID" -H "$(auth_header "$TOKEN")")
+  FTS_TYPE=$(echo "$FTS_GUIDANCE" | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance']['type'])")
+  [ "$FTS_TYPE" = "approved" ] \
+    && pass "corpus FTS: unique token returns approved" \
+    || fail "corpus FTS: expected approved, got $FTS_TYPE"
+
+  FTS_CITE=$(curl -sf "$BASE/audit/$FTS_QID" -H "$(auth_header "$TOKEN")" \
+    | python3 -c "import sys,json; cites=json.load(sys.stdin)['citationsReturned']; print(cites[0]['documentId'] if cites else '')")
+  echo "$FTS_CITE" | grep -qF "smoke-test" \
+    && pass "corpus FTS: citation references smoke-test.txt" \
+    || fail "corpus FTS: unexpected citation documentId: $FTS_CITE"
+
+  # Clean up smoke doc from DB (owner credentials already in container env)
+  (cd "$COMPOSE_DIR" && docker compose exec -T api python3 -c "
+import psycopg2, os
+conn = psycopg2.connect(os.environ.get('TAMPER_DATABASE_URL', os.environ['DATABASE_URL']))
+cur = conn.cursor()
+cur.execute(\"DELETE FROM corpus_documents WHERE rel_path = 'smoke-test.txt'\")
+conn.commit(); cur.close(); conn.close()
+print('smoke corpus cleaned up')
+  ")
+fi
+
 echo ""
 echo "All smoke tests passed."

@@ -81,14 +81,112 @@ def _lexical_score(terms: set[str], doc: Document) -> int:
     return sum(1 for t in terms if t in corpus)
 
 
+def _corpus_fts_retrieve(
+    question: str, db: DBSession
+) -> "tuple[dict, str, list, list] | None":
+    """
+    Postgres FTS retrieval from corpus_chunks.
+
+    Returns None if corpus is empty — caller falls through to lexical fixtures.
+    Returns a refusal tuple if corpus is non-empty but no FTS hits are found.
+    All corpus docs are treated as role-0 (no per-doc ACL on corpus yet).
+    """
+    try:
+        count = db.execute(text("SELECT COUNT(*) FROM corpus_chunks LIMIT 1")).scalar()
+    except Exception:
+        # Table may not exist on first startup before schema migration runs.
+        # Must rollback: a failed SQL statement aborts the psycopg2 transaction,
+        # which would cause every subsequent query in the same session to fail.
+        db.rollback()
+        return None
+
+    if not count:
+        return None  # corpus not yet ingested — fall through to lexical fixtures
+
+    rows = db.execute(
+        text("""
+            SELECT
+                cd.rel_path,
+                cd.title,
+                cc.chunk_index,
+                cc.text,
+                ts_rank_cd(cc.tsv, query) AS rank
+            FROM corpus_chunks cc
+            JOIN corpus_documents cd ON cd.id = cc.doc_id
+            CROSS JOIN websearch_to_tsquery('english', :q) query
+            WHERE cc.tsv @@ query
+            ORDER BY rank DESC
+            LIMIT 5
+        """),
+        {"q": question},
+    ).fetchall()
+
+    if not rows:
+        guidance = {
+            "type": "refusal",
+            "reasonCode": "INSUFFICIENT_EVIDENCE",
+            "title": "No matching guidance",
+            "message": "The system could not find a matching document for this question.",
+            "safeNextStep": "Rephrase your question or consult your supervisor.",
+            "hiddenSource": False,
+        }
+        return guidance, "refused", [], []
+
+    top_rel, top_title, top_chunk, top_text, _ = rows[0]
+
+    guidance = {
+        "type": "approved",
+        "summary": top_text[:200],
+        "excerpt": top_text[:800],
+        "document": {
+            "documentId": top_rel,
+            "title": top_title,
+            "section": f"chunk {top_chunk}",
+            "page": top_chunk,
+            "status": "active",
+            "effectiveDate": "",
+            "reviewDate": "",
+            "owner": "",
+        },
+    }
+    sources = [
+        {
+            "documentId": rel_path,
+            "title": title,
+            "status": "active",
+            "allowed": True,
+            "page": chunk_idx,
+            "section": f"chunk {chunk_idx}",
+            "note": f"FTS rank {rank:.4f}",
+        }
+        for rel_path, title, chunk_idx, _text, rank in rows
+    ]
+    citations = [
+        {
+            "documentId": rel_path,
+            "chunkIndex": chunk_idx,
+            "snippet": chunk_text[:300],
+        }
+        for rel_path, _title, chunk_idx, chunk_text, _rank in rows
+    ]
+    return guidance, "allowed", sources, citations
+
+
 def _retrieve(
     question: str, mode: str, role_level: int, db: DBSession
 ) -> tuple[dict, str, list, list]:
     """
-    Lexical retrieval with ACL enforcement.
-    Returns (guidance, policy_outcome, sources_considered, citations_returned).
-    Fail-closed: returns INSUFFICIENT_EVIDENCE if no document scores above threshold.
+    Primary retrieval dispatcher:
+    - If corpus_chunks has rows: use Postgres FTS (websearch_to_tsquery).
+    - Otherwise: lexical scoring against synthetic document fixtures.
+    Fail-closed in both paths: INSUFFICIENT_EVIDENCE if nothing matches.
     """
+    # FTS path — active whenever corpus has been ingested.
+    fts_result = _corpus_fts_retrieve(question, db)
+    if fts_result is not None:
+        return fts_result
+
+    # Lexical fallback — used when corpus_chunks is empty (fresh DB / smoke tests).
     terms = _tokenize(question)
 
     all_docs = db.query(Document).all()
