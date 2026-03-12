@@ -13,8 +13,9 @@ jobs:
 
       - name: Fail if forbidden strings appear in api/ (Python source only)
         run: |
-          if grep -rni --include="*.py" "lrfd" api/; then
-            echo "ERROR: forbidden string 'lrfd' found in api/*.py"
+          PATTERN='lrfd|long reach|saint john fire'
+          if grep -rniP --include="*.py" "$PATTERN" api/; then
+            echo "ERROR: forbidden string found in api/*.py"
             exit 1
           fi
           echo "OK: no forbidden strings in api/*.py"

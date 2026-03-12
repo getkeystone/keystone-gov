@@ -1,4 +1,8 @@
-"""Seed demo fixtures into the database on startup if empty."""
+"""Seed demo fixtures into the database on startup if empty.
+
+Synthetic demo fixtures. No real agency names, personnel, or incident data.
+Do not substitute real agency names without written permission from that agency.
+"""
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session as DBSession
