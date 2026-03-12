@@ -1,10 +1,13 @@
+import os
 import re
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session as DBSession
 
 from audit import compute_entry_hash, verify_entry
@@ -153,18 +156,29 @@ def _scenario_key_from_guidance(guidance: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Startup
+# Startup — DB init is non-fatal; /health reflects readiness
 # ---------------------------------------------------------------------------
+
+_db_ready = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+    global _db_ready
     try:
-        seed_demo_data(db)
-    finally:
-        db.close()
+        # Tables are pre-created by initdb/00-schema.sql when connecting as
+        # keystone_app.  create_all() is a no-op if tables already exist.
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        try:
+            seed_demo_data(db)
+        finally:
+            db.close()
+        _db_ready = True
+    except Exception as exc:
+        print(f"[startup] DB init failed: {exc}", file=sys.stderr, flush=True)
+        print("[startup] API will serve /health as degraded until DB is available.",
+              file=sys.stderr, flush=True)
     yield
 
 
@@ -204,7 +218,9 @@ def get_current_session(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "keystone-gov-api"}
+    if _db_ready:
+        return {"status": "ok", "service": "keystone-gov-api"}
+    return {"status": "degraded", "service": "keystone-gov-api", "db": False}
 
 
 # ---------------------------------------------------------------------------
@@ -239,55 +255,61 @@ def submit_query(
     role = current_session.role
     role_level = _ROLE_LEVEL.get(role, 0)
 
-    # Admin override: scenario_key shortcircuits retrieval for demo purposes only.
-    if role_level >= _ROLE_LEVEL["admin"] and req.scenario_key and req.scenario_key in _GUIDANCE_TEMPLATES:
-        template = _GUIDANCE_TEMPLATES[req.scenario_key]
-        guidance = template["guidance"]
-        policy_outcome = "allowed" if guidance["type"] == "approved" else "refused"
-        sources = template["audit"]["sourcesConsidered"]
-        citations = template["audit"]["citationsReturned"]
-        stored_scenario_key = req.scenario_key
-    elif role_level >= _ROLE_LEVEL["admin"] and req.scenario_key == "restricted":
-        # admin override for restricted scenario (not in _GUIDANCE_TEMPLATES directly)
-        min_level = _SCENARIO_MIN_LEVEL.get("restricted", 1)
-        if role_level >= min_level:
-            guidance = {
-                "type": "approved",
-                "summary": "Restricted post-incident disciplinary information. Access granted for current role.",
-                "excerpt": (
-                    "Post-incident review dated 2025-11-03: disciplinary action was taken per department "
-                    "standard operating procedure section 7.4. Details are restricted to supervisory "
-                    "and administrative personnel only."
-                ),
-                "note": "Restricted to officer and admin roles only.",
-                "document": {
+    # Admin override: scenario_key short-circuits retrieval for demo purposes.
+    # "restricted" is handled first (its template contains the member-refused fixture,
+    # not the officer/admin approved guidance, so it needs ACL-aware handling).
+    if req.scenario_key and role_level >= _ROLE_LEVEL["admin"]:
+        if req.scenario_key == "restricted":
+            min_level = _SCENARIO_MIN_LEVEL.get("restricted", 1)
+            if role_level >= min_level:
+                guidance = {
+                    "type": "approved",
+                    "summary": "Restricted post-incident disciplinary information. Access granted for current role.",
+                    "excerpt": (
+                        "Post-incident review dated 2025-11-03: disciplinary action was taken per department "
+                        "standard operating procedure section 7.4. Details are restricted to supervisory "
+                        "and administrative personnel only."
+                    ),
+                    "note": "Restricted to officer and admin roles only.",
+                    "document": {
+                        "documentId": "demo-fd-restricted-001",
+                        "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
+                        "section": "7.4",
+                        "page": 1,
+                        "status": "active",
+                        "effectiveDate": "2025-11-03",
+                        "reviewDate": "2026-11-03",
+                        "owner": "Fire Chief",
+                    },
+                }
+                policy_outcome = "allowed"
+                sources = [{
                     "documentId": "demo-fd-restricted-001",
-                    "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
-                    "section": "7.4",
-                    "page": 1,
+                    "title": "Demo FD Post-Incident Disciplinary Memo",
                     "status": "active",
-                    "effectiveDate": "2025-11-03",
-                    "reviewDate": "2026-11-03",
-                    "owner": "Fire Chief",
-                },
-            }
-            policy_outcome = "allowed"
-            sources = [{
-                "documentId": "demo-fd-restricted-001",
-                "title": "Demo FD Post-Incident Disciplinary Memo",
-                "status": "active",
-                "allowed": True,
-                "page": 1,
-                "section": "7.4",
-                "note": "Accessible to officer/admin only.",
-            }]
-            citations = [{"documentId": "demo-fd-restricted-001", "page": 1, "section": "7.4"}]
+                    "allowed": True,
+                    "page": 1,
+                    "section": "7.4",
+                    "note": "Accessible to officer/admin only.",
+                }]
+                citations = [{"documentId": "demo-fd-restricted-001", "page": 1, "section": "7.4"}]
+            else:
+                guidance = _ACL_REFUSAL_GUIDANCE
+                policy_outcome = "refused"
+                sources = []
+                citations = []
+            stored_scenario_key = "restricted"
+        elif req.scenario_key in _GUIDANCE_TEMPLATES:
+            template = _GUIDANCE_TEMPLATES[req.scenario_key]
+            guidance = template["guidance"]
+            policy_outcome = "allowed" if guidance["type"] == "approved" else "refused"
+            sources = template["audit"]["sourcesConsidered"]
+            citations = template["audit"]["citationsReturned"]
+            stored_scenario_key = req.scenario_key
         else:
-            guidance = _ACL_REFUSAL_GUIDANCE
-            policy_outcome = "refused"
-            sources = []
-            citations = []
-        stored_scenario_key = "restricted"
+            # Unknown scenario_key — fall through to retrieval
+            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db)
+            stored_scenario_key = _scenario_key_from_guidance(guidance)
     else:
         # Real retrieval — scenario_key ignored for non-admins
         guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db)
@@ -451,20 +473,34 @@ def tamper_audit_entry(
 ):
     """
     Demo-only endpoint. Corrupts the stored policy_outcome for a given query,
-    causing the HMAC verification to return valid=false. Admin token required.
-    This proves tamper-evidence: a field edit is detectable via /audit/{id}/verify.
+    causing HMAC verification to return valid=false. Admin token required.
+    Uses DB owner credentials (TAMPER_DATABASE_URL) to simulate a privileged
+    insider threat — proving tamper-evidence holds even against owner-level edits.
     """
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin token required")
 
+    # Verify the entry exists via runtime connection first.
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Audit entry not found")
-
     original_outcome = entry.policy_outcome
-    # Simulate a malicious edit: change policy_outcome without recomputing HMAC
-    entry.policy_outcome = "TAMPERED"
-    db.commit()
+
+    # Perform the tamper using DB owner credentials (keystone_app cannot UPDATE).
+    tamper_url = os.environ.get("TAMPER_DATABASE_URL", "")
+    if not tamper_url:
+        raise HTTPException(status_code=501, detail="TAMPER_DATABASE_URL not configured")
+
+    tamper_engine = create_engine(tamper_url)
+    try:
+        with tamper_engine.connect() as conn:
+            conn.execute(
+                text("UPDATE audit_log SET policy_outcome='TAMPERED' WHERE query_id=:qid"),
+                {"qid": query_id},
+            )
+            conn.commit()
+    finally:
+        tamper_engine.dispose()
 
     return {
         "tampered": True,
