@@ -134,7 +134,11 @@ def main() -> None:
     conn = psycopg2.connect(DATABASE_URL)
     cur  = conn.cursor()
 
-    stats: dict = {"added": 0, "updated": 0, "skipped": 0, "failed": 0, "docs": []}
+    stats: dict = {
+        "added": 0, "updated": 0, "skipped": 0,
+        "skipped_keep_previous": 0, "failed": 0,
+        "docs": [],
+    }
 
     files = sorted(
         p for p in ACTIVE_DIR.rglob("*")
@@ -185,14 +189,31 @@ def main() -> None:
         if not text:
             # Image-only PDF, encrypted doc, or unsupported format.
             # Do NOT write placeholder chunks — that poisons FTS with noise.
-            # Do NOT overwrite a previously ingested good version.
-            stats["failed"] += 1
-            stats["docs"].append({
-                "rel_path": rel,
-                "action":   "failed",
-                "reason":   "NO_TEXT_EXTRACTED",
-            })
-            print(f"  WARN [{rel}] NO_TEXT_EXTRACTED — skipping DB write", file=sys.stderr)
+            if action == "updated":
+                # A previous good version exists in the DB. Keep it intact.
+                # Treat as skipped_keep_previous so the operator can see the warning
+                # without losing the old retrieval data.
+                stats["skipped_keep_previous"] += 1
+                stats["docs"].append({
+                    "rel_path": rel,
+                    "action":   "skipped_keep_previous",
+                    "reason":   "NO_TEXT_EXTRACTED",
+                    "warning":  "file sha256 changed but new extraction returned empty; previous DB version preserved",
+                })
+                print(
+                    f"  WARN [{rel}] NO_TEXT_EXTRACTED (sha changed) — "
+                    f"preserving previous DB version",
+                    file=sys.stderr,
+                )
+            else:
+                # New doc, no text, nothing to fall back on.
+                stats["failed"] += 1
+                stats["docs"].append({
+                    "rel_path": rel,
+                    "action":   "failed",
+                    "reason":   "NO_TEXT_EXTRACTED",
+                })
+                print(f"  WARN [{rel}] NO_TEXT_EXTRACTED — skipping DB write", file=sys.stderr)
             continue
 
         # ── Write to DB only after confirmed good text ────────────────────────
@@ -247,8 +268,18 @@ def main() -> None:
             for d in stats["docs"] if d.get("action") == "failed"
         ]
         print(
-            f"  WARNING: {stats['failed']} doc(s) produced no extractable text "
+            f"  WARNING: {stats['failed']} new doc(s) produced no extractable text "
             f"and were NOT ingested:\n" + "\n".join(failed_paths),
+            file=sys.stderr,
+        )
+    if stats["skipped_keep_previous"] > 0:
+        skp_paths = [
+            f'  {d["rel_path"]} ({d.get("reason","?")})'
+            for d in stats["docs"] if d.get("action") == "skipped_keep_previous"
+        ]
+        print(
+            f"  WARNING: {stats['skipped_keep_previous']} doc(s) had sha256 changes "
+            f"but empty extraction; previous DB version preserved:\n" + "\n".join(skp_paths),
             file=sys.stderr,
         )
 
