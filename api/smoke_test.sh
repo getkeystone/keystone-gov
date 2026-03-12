@@ -184,10 +184,15 @@ SPOOF_CITES=$(curl -sf "$BASE/audit/$SPOOF_QID" -H "$(auth_header "$TOKEN")" \
 
 
 # ---- 14. Corpus FTS ingest smoke test (optional) ----------------------
-# Only runs when RUN_CORPUS_INGEST_TEST=1. Requires the stack to be up
-# and docker compose reachable (set COMPOSE_DIR to keystone-deploy/ if needed).
-# Creates a synthetic doc inside the container, ingests it, queries for a
-# unique token, verifies approved + citation, then cleans up the DB row.
+# Only runs when RUN_CORPUS_INGEST_TEST=1. Requires the stack to be up,
+# docker compose reachable, and the real corpus already ingested.
+# (set COMPOSE_DIR to keystone-deploy/ if needed)
+#
+# Checks:
+#   a) Synthetic ingest: failed=0, added>0
+#   b) Unique-token query: type=approved, citation references smoke-test.txt
+#   c) Real corpus query: citation is a document file (.pdf or .docx)
+#   d) Clean up synthetic doc from DB
 
 if [[ "${RUN_CORPUS_INGEST_TEST:-0}" == "1" ]]; then
   echo "=== 14. Corpus FTS ingest smoke test ==="
@@ -196,16 +201,32 @@ if [[ "${RUN_CORPUS_INGEST_TEST:-0}" == "1" ]]; then
   COMPOSE_DIR="${COMPOSE_DIR:-${_SCRIPT_DIR}/../../keystone-deploy}"
   UNIQUE_TOKEN="KEYSTONEFTSSMK$(date +%s)"
 
-  # Create temp corpus inside the container and ingest it
-  (cd "$COMPOSE_DIR" && docker compose exec -T api bash -c "
+  # 14a. Create temp corpus inside the container and capture ingest JSON output.
+  INGEST_OUT=$(cd "$COMPOSE_DIR" && docker compose exec -T api bash -c "
     mkdir -p /tmp/smoke-corpus/active /tmp/smoke-corpus/receipts
-    echo 'The ${UNIQUE_TOKEN} emergency protocol requires all responders to acknowledge within thirty seconds.' \
+    printf '%s\n' 'The ${UNIQUE_TOKEN} emergency protocol requires all responders to acknowledge within thirty seconds.' \
       > /tmp/smoke-corpus/active/smoke-test.txt
-    CORPUS_ROOT=/tmp/smoke-corpus python3 /app/ingest_corpus.py >/dev/null
+    CORPUS_ROOT=/tmp/smoke-corpus python3 /app/ingest_corpus.py
     rm -rf /tmp/smoke-corpus
-  ")
+  " 2>/dev/null)
 
-  # Query for the unique token
+  # Parse the JSON line from ingest output (last line starting with '{')
+  INGEST_JSON=$(echo "$INGEST_OUT" | grep '^{' | tail -1)
+
+  INGEST_FAILED=$(echo "$INGEST_JSON" \
+    | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('failed',1))" 2>/dev/null || echo "1")
+  INGEST_ADDED=$(echo "$INGEST_JSON" \
+    | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('added',0))" 2>/dev/null || echo "0")
+
+  [ "$INGEST_FAILED" = "0" ] \
+    && pass "corpus FTS: synthetic ingest failed=0" \
+    || fail "corpus FTS: synthetic ingest failed=${INGEST_FAILED} (expected 0)"
+
+  [ "$INGEST_ADDED" -gt 0 ] \
+    && pass "corpus FTS: synthetic ingest added=${INGEST_ADDED}" \
+    || fail "corpus FTS: synthetic ingest added=0 (expected >0)"
+
+  # 14b. Query for the unique token
   FTS_Q=$(curl -sf -X POST "$BASE/query" \
     -H 'Content-Type: application/json' \
     -H "$(auth_header "$TOKEN")" \
@@ -223,7 +244,30 @@ if [[ "${RUN_CORPUS_INGEST_TEST:-0}" == "1" ]]; then
     && pass "corpus FTS: citation references smoke-test.txt" \
     || fail "corpus FTS: unexpected citation documentId: $FTS_CITE"
 
-  # Clean up smoke doc from DB (owner credentials already in container env)
+  # 14c. Real corpus query: verify citation is a real document file.
+  # Assumes the real corpus (PDFs/DOCX) has been ingested before this test runs.
+  REAL_Q=$(curl -sf -X POST "$BASE/query" \
+    -H 'Content-Type: application/json' \
+    -H "$(auth_header "$TOKEN")" \
+    -d '{"question":"emergency response procedure","mode":"operational"}')
+  REAL_QID=$(echo "$REAL_Q" | python3 -c "import sys,json; print(json.load(sys.stdin)['query_id'])")
+  REAL_CITE=$(curl -sf "$BASE/audit/$REAL_QID" -H "$(auth_header "$TOKEN")" \
+    | python3 -c "
+import sys, json
+cites = json.load(sys.stdin)['citationsReturned']
+print(cites[0]['documentId'] if cites else '')
+")
+  echo "$REAL_CITE" | python3 -c "
+import sys, re
+cid = sys.stdin.read().strip()
+if re.search(r'\.(pdf|docx)$', cid, re.IGNORECASE):
+    sys.exit(0)
+sys.exit(1)
+" \
+    && pass "corpus FTS: real corpus citation is a document file (${REAL_CITE})" \
+    || fail "corpus FTS: real corpus citation not a .pdf/.docx: '${REAL_CITE}'"
+
+  # 14d. Clean up smoke doc from DB (owner credentials already in container env)
   (cd "$COMPOSE_DIR" && docker compose exec -T api python3 -c "
 import psycopg2, os
 conn = psycopg2.connect(os.environ.get('TAMPER_DATABASE_URL', os.environ['DATABASE_URL']))

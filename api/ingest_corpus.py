@@ -13,7 +13,15 @@ Environment (all inherited from container):
 Reads:   $CORPUS_ROOT/active/
 Writes:  corpus_documents + corpus_chunks tables (PostgreSQL)
          Skips files whose sha256 matches what is already stored.
+         FAILS (no DB write) if extracted text length is 0.
 Stdout:  JSON summary (shell wrapper writes receipt files on host).
+
+Failure rules:
+  - EXTRACTION_ERROR  : extraction raised an exception
+  - NO_TEXT_EXTRACTED : all extractors ran without error but returned "" — this
+                        includes image-only PDFs. Previous good data is preserved.
+  In both cases: NO corpus_document row is inserted/updated and NO chunks are
+  written. The file will be retried on the next ingest run.
 """
 
 import hashlib
@@ -142,7 +150,7 @@ def main() -> None:
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
         title = fpath.stem.replace("_", " ").replace("-", " ")
 
-        # Skip if sha256 unchanged
+        # ── Check existing record ──────────────────────────────────────────────
         cur.execute("SELECT id, sha256 FROM corpus_documents WHERE rel_path = %s", (rel,))
         row = cur.fetchone()
 
@@ -152,7 +160,47 @@ def main() -> None:
                 stats["skipped"] += 1
                 stats["docs"].append({"rel_path": rel, "action": "skipped"})
                 continue
-            # Re-ingest: clear stale chunks, update document record
+            action = "updated"
+        else:
+            doc_id = None
+            action = "added"
+
+        # ── Extract text BEFORE touching the DB ───────────────────────────────
+        # This guarantees that if extraction fails, the previous good version
+        # in the DB is never touched.
+
+        try:
+            text = extract_text(fpath, mime)
+        except Exception as exc:
+            stats["failed"] += 1
+            stats["docs"].append({
+                "rel_path": rel,
+                "action":   "failed",
+                "reason":   "EXTRACTION_ERROR",
+                "error":    str(exc),
+            })
+            print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
+            continue
+
+        if not text:
+            # Image-only PDF, encrypted doc, or unsupported format.
+            # Do NOT write placeholder chunks — that poisons FTS with noise.
+            # Do NOT overwrite a previously ingested good version.
+            stats["failed"] += 1
+            stats["docs"].append({
+                "rel_path": rel,
+                "action":   "failed",
+                "reason":   "NO_TEXT_EXTRACTED",
+            })
+            print(f"  WARN [{rel}] NO_TEXT_EXTRACTED — skipping DB write", file=sys.stderr)
+            continue
+
+        # ── Write to DB only after confirmed good text ────────────────────────
+
+        chunks = chunk_text(text)
+
+        if action == "updated":
+            # doc_id is set (row existed); clear stale chunks first.
             cur.execute("DELETE FROM corpus_chunks WHERE doc_id = %s", (doc_id,))
             cur.execute(
                 """UPDATE corpus_documents
@@ -160,7 +208,6 @@ def main() -> None:
                     WHERE id=%s""",
                 (sha, size, mtime, mime, title, doc_id),
             )
-            action = "updated"
         else:
             cur.execute(
                 """INSERT INTO corpus_documents (rel_path, sha256, size_bytes, mtime_utc, mime, title)
@@ -168,21 +215,6 @@ def main() -> None:
                 (rel, sha, size, mtime, mime, title),
             )
             doc_id = cur.fetchone()[0]
-            action = "added"
-
-        # Extract text and chunk
-        try:
-            text = extract_text(fpath, mime)
-        except Exception as exc:
-            conn.rollback()
-            stats["failed"] += 1
-            stats["docs"].append({"rel_path": rel, "action": "failed", "error": str(exc)})
-            continue
-
-        chunks = chunk_text(text)
-        if not chunks:
-            # Track doc even if no extractable text (e.g. image-only PDF)
-            chunks = [f"[No extractable text: {rel}]"]
 
         for idx, chunk in enumerate(chunks):
             cur.execute(
@@ -194,7 +226,11 @@ def main() -> None:
 
         conn.commit()
 
-        stats["added" if action == "added" else "updated"] += 1
+        if action == "added":
+            stats["added"] += 1
+        else:
+            stats["updated"] += 1
+
         stats["docs"].append({
             "rel_path": rel,
             "action":   action,
@@ -204,6 +240,18 @@ def main() -> None:
 
     cur.close()
     conn.close()
+
+    if stats["failed"] > 0:
+        failed_paths = [
+            f'  {d["rel_path"]} ({d.get("reason","?")})'
+            for d in stats["docs"] if d.get("action") == "failed"
+        ]
+        print(
+            f"  WARNING: {stats['failed']} doc(s) produced no extractable text "
+            f"and were NOT ingested:\n" + "\n".join(failed_paths),
+            file=sys.stderr,
+        )
+
     print(json.dumps(stats))
 
 
