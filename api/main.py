@@ -1,8 +1,9 @@
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session as DBSession
 
@@ -29,7 +30,6 @@ _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
 # Access control
 # ---------------------------------------------------------------------------
 
-# Minimum role level required to receive non-refused guidance per scenario.
 _SCENARIO_MIN_LEVEL: dict[str, int] = {
     "restricted": 1,   # officer+ only
 }
@@ -39,41 +39,6 @@ _ROLE_LEVEL: dict[str, int] = {
     "officer": 1,
     "admin": 2,
 }
-
-# Guidance returned to officer/admin when they access the "restricted" scenario.
-_RESTRICTED_OFFICER_GUIDANCE = {
-    "type": "approved",
-    "summary": "Restricted post-incident disciplinary information. Access granted for current role.",
-    "excerpt": (
-        "Post-incident review dated 2025-11-03: disciplinary action was taken per department SOP §7.4. "
-        "Details are restricted to supervisory and administrative personnel only."
-    ),
-    "note": "This content is restricted to officer and admin roles. Not visible to member role.",
-    "document": {
-        "documentId": "demo-fd-restricted-001",
-        "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
-        "section": "7.4",
-        "page": 1,
-        "status": "active",
-        "effectiveDate": "2025-11-03",
-        "reviewDate": "2026-11-03",
-        "owner": "Fire Chief",
-    },
-}
-_RESTRICTED_OFFICER_SOURCES = [
-    {
-        "documentId": "demo-fd-restricted-001",
-        "title": "Demo FD Post-Incident Disciplinary Memo",
-        "status": "active",
-        "allowed": True,
-        "page": 1,
-        "section": "7.4",
-        "note": "Accessible to officer/admin only.",
-    }
-]
-_RESTRICTED_OFFICER_CITATIONS = [
-    {"documentId": "demo-fd-restricted-001", "page": 1, "section": "7.4"}
-]
 
 # Fail-closed refusal used when role is denied by ACL.
 _ACL_REFUSAL_GUIDANCE = {
@@ -88,6 +53,109 @@ _ACL_REFUSAL_GUIDANCE = {
     "hiddenSource": True,
 }
 
+# ---------------------------------------------------------------------------
+# Retrieval engine (lexical scoring)
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = {
+    '', 'a', 'an', 'the', 'is', 'are', 'our', 'what', 'how', 'show', 'me',
+    'to', 'of', 'and', 'or', 'in', 'for', 'did', 'i', 'my', 'should',
+    'right', 'now', 'do', 'does', 'it', 'this', 'that', 'be', 'was', 'were',
+    'have', 'has', 'had', 'with', 'at', 'by', 'from', 'up', 'about', 'into',
+    'on', 'if', 'no', 'not', 'so', 'as', 'we', 'you', 'they', 'their',
+}
+
+_EVIDENCE_THRESHOLD = 1
+
+
+def _tokenize(text: str) -> set[str]:
+    return {t for t in re.split(r'\W+', text.lower()) if t not in _STOP_WORDS and len(t) > 2}
+
+
+def _lexical_score(terms: set[str], doc: Document) -> int:
+    corpus = f"{doc.title} {doc.section} {doc.excerpt or ''}".lower()
+    return sum(1 for t in terms if t in corpus)
+
+
+def _retrieve(
+    question: str, mode: str, role_level: int, db: DBSession
+) -> tuple[dict, str, list, list]:
+    """
+    Lexical retrieval with ACL enforcement.
+    Returns (guidance, policy_outcome, sources_considered, citations_returned).
+    Fail-closed: returns INSUFFICIENT_EVIDENCE if no document scores above threshold.
+    """
+    terms = _tokenize(question)
+
+    all_docs = db.query(Document).all()
+
+    # Mode filter: operational = active only; training = active + superseded
+    if mode == "operational":
+        candidates = [d for d in all_docs if d.status == "active"]
+    else:
+        candidates = [d for d in all_docs if d.status in ("active", "superseded")]
+
+    scored = [(d, _lexical_score(terms, d)) for d in candidates]
+    scored.sort(key=lambda x: -x[1])
+
+    best_doc, best_score = (scored[0] if scored else (None, 0))
+
+    if not best_doc or best_score < _EVIDENCE_THRESHOLD:
+        guidance = {
+            "type": "refusal",
+            "reasonCode": "INSUFFICIENT_EVIDENCE",
+            "title": "No matching guidance",
+            "message": "The system could not find a matching policy document for this question.",
+            "safeNextStep": "Rephrase your question or consult your supervisor.",
+            "hiddenSource": False,
+        }
+        return guidance, "refused", [], []
+
+    # ACL check: if best doc requires higher role level, fail closed — no title/citations leaked
+    if best_doc.min_role_level > role_level:
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
+
+    guidance = {
+        "type": "approved",
+        "summary": (best_doc.excerpt or "")[:200],
+        "excerpt": best_doc.excerpt or "",
+        "document": {
+            "documentId": best_doc.document_id,
+            "title": best_doc.title,
+            "section": best_doc.section,
+            "page": best_doc.page,
+            "status": best_doc.status,
+            "effectiveDate": best_doc.effective_date or "",
+            "reviewDate": best_doc.review_date or "",
+            "owner": best_doc.owner or "",
+        },
+    }
+    sources = [{
+        "documentId": best_doc.document_id,
+        "title": best_doc.title,
+        "status": best_doc.status,
+        "allowed": True,
+        "page": best_doc.page,
+        "section": best_doc.section,
+        "note": "Retrieved by lexical match.",
+    }]
+    citations = [{"documentId": best_doc.document_id, "page": best_doc.page, "section": best_doc.section}]
+    return guidance, "allowed", sources, citations
+
+
+def _scenario_key_from_guidance(guidance: dict) -> str:
+    if guidance.get("type") == "approved":
+        return "approved"
+    code = guidance.get("reasonCode", "")
+    if code == "ACCESS_RESTRICTED":
+        return "restricted"
+    return "refusal"
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -100,7 +168,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Keystone Gov API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Keystone Gov API", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -112,7 +180,25 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Health
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+
+def get_current_session(
+    authorization: str | None = Header(default=None),
+    db: DBSession = Depends(get_db),
+) -> Session:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.removeprefix("Bearer ")
+    session = db.query(Session).filter(Session.token == token).first()
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Health (no auth)
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +208,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Auth
+# Auth (no auth)
 # ---------------------------------------------------------------------------
 
 
@@ -139,37 +225,73 @@ def login(req: LoginRequest, db: DBSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Query  (creates a new audit-logged record each time)
+# Query (requires auth; role from token only)
 # ---------------------------------------------------------------------------
 
 
 @app.post("/query", response_model=QueryResponse)
-def submit_query(req: QueryRequest, db: DBSession = Depends(get_db)):
-    if req.scenario_key not in _GUIDANCE_TEMPLATES:
-        raise HTTPException(status_code=400, detail=f"Unknown scenario_key: {req.scenario_key}")
+def submit_query(
+    req: QueryRequest,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    # Role is ALWAYS derived from the authenticated session — request body value ignored.
+    role = current_session.role
+    role_level = _ROLE_LEVEL.get(role, 0)
 
-    user_level = _ROLE_LEVEL.get(req.role, 0)
-    min_level = _SCENARIO_MIN_LEVEL.get(req.scenario_key, 0)
-    acl_denied = user_level < min_level
-
-    # Resolve guidance and audit sources based on ACL outcome.
-    if acl_denied:
-        guidance = _ACL_REFUSAL_GUIDANCE
-        policy_outcome = "refused"
-        sources: list = []       # no source leakage for denied requests
-        citations: list = []
-    elif req.scenario_key == "restricted":
-        # officer/admin accessing restricted content — approved
-        guidance = _RESTRICTED_OFFICER_GUIDANCE
-        policy_outcome = "allowed"
-        sources = _RESTRICTED_OFFICER_SOURCES
-        citations = _RESTRICTED_OFFICER_CITATIONS
-    else:
+    # Admin override: scenario_key shortcircuits retrieval for demo purposes only.
+    if role_level >= _ROLE_LEVEL["admin"] and req.scenario_key and req.scenario_key in _GUIDANCE_TEMPLATES:
         template = _GUIDANCE_TEMPLATES[req.scenario_key]
         guidance = template["guidance"]
         policy_outcome = "allowed" if guidance["type"] == "approved" else "refused"
         sources = template["audit"]["sourcesConsidered"]
         citations = template["audit"]["citationsReturned"]
+        stored_scenario_key = req.scenario_key
+    elif role_level >= _ROLE_LEVEL["admin"] and req.scenario_key == "restricted":
+        # admin override for restricted scenario (not in _GUIDANCE_TEMPLATES directly)
+        min_level = _SCENARIO_MIN_LEVEL.get("restricted", 1)
+        if role_level >= min_level:
+            guidance = {
+                "type": "approved",
+                "summary": "Restricted post-incident disciplinary information. Access granted for current role.",
+                "excerpt": (
+                    "Post-incident review dated 2025-11-03: disciplinary action was taken per department "
+                    "standard operating procedure section 7.4. Details are restricted to supervisory "
+                    "and administrative personnel only."
+                ),
+                "note": "Restricted to officer and admin roles only.",
+                "document": {
+                    "documentId": "demo-fd-restricted-001",
+                    "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
+                    "section": "7.4",
+                    "page": 1,
+                    "status": "active",
+                    "effectiveDate": "2025-11-03",
+                    "reviewDate": "2026-11-03",
+                    "owner": "Fire Chief",
+                },
+            }
+            policy_outcome = "allowed"
+            sources = [{
+                "documentId": "demo-fd-restricted-001",
+                "title": "Demo FD Post-Incident Disciplinary Memo",
+                "status": "active",
+                "allowed": True,
+                "page": 1,
+                "section": "7.4",
+                "note": "Accessible to officer/admin only.",
+            }]
+            citations = [{"documentId": "demo-fd-restricted-001", "page": 1, "section": "7.4"}]
+        else:
+            guidance = _ACL_REFUSAL_GUIDANCE
+            policy_outcome = "refused"
+            sources = []
+            citations = []
+        stored_scenario_key = "restricted"
+    else:
+        # Real retrieval — scenario_key ignored for non-admins
+        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db)
+        stored_scenario_key = _scenario_key_from_guidance(guidance)
 
     query_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -177,19 +299,18 @@ def submit_query(req: QueryRequest, db: DBSession = Depends(get_db)):
     db.add(Query(
         id=query_id,
         question=req.question,
-        role=req.role,
+        role=role,
         mode=req.mode,
-        scenario_key=req.scenario_key,
+        scenario_key=stored_scenario_key,
         guidance_json=guidance,
         created_at=datetime.now(timezone.utc),
     ))
 
-    # HMAC chain: prev_hash = hash of the most-recent audit entry
     last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
     prev_hash = last.entry_hash if last else ""
 
     entry_hash = compute_entry_hash(
-        query_id, now, req.role, req.mode, policy_outcome, prev_hash
+        query_id, now, role, req.mode, policy_outcome, prev_hash
     )
 
     db.add(AuditEntry(
@@ -197,7 +318,7 @@ def submit_query(req: QueryRequest, db: DBSession = Depends(get_db)):
         query_id=query_id,
         receipt_id=f"receipt-{query_id[:8]}",
         timestamp=now,
-        role_used=req.role,
+        role_used=role,
         mode_used=req.mode,
         policy_outcome=policy_outcome,
         sources_considered_json=sources,
@@ -207,16 +328,20 @@ def submit_query(req: QueryRequest, db: DBSession = Depends(get_db)):
     ))
     db.commit()
 
-    return QueryResponse(query_id=query_id, scenario_key=req.scenario_key)
+    return QueryResponse(query_id=query_id, scenario_key=stored_scenario_key)
 
 
 # ---------------------------------------------------------------------------
-# Guidance
+# Guidance (requires auth)
 # ---------------------------------------------------------------------------
 
 
 @app.get("/guidance/{query_id}", response_model=GuidanceResponse)
-def get_guidance(query_id: str, db: DBSession = Depends(get_db)):
+def get_guidance(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
     q = db.query(Query).filter(Query.id == query_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Query not found")
@@ -233,16 +358,26 @@ def get_guidance(query_id: str, db: DBSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Source
+# Source (requires auth; ACL enforced on document access)
 # ---------------------------------------------------------------------------
 
 
 @app.get("/source/{document_id}/{page}", response_model=SourceResponse)
-def get_source(document_id: str, page: int, db: DBSession = Depends(get_db)):
+def get_source(
+    document_id: str,
+    page: int,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
     key = f"{document_id}:{page}"
     doc = db.query(Document).filter(Document.key == key).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Source not found")
+
+    role_level = _ROLE_LEVEL.get(current_session.role, 0)
+    if doc.min_role_level > role_level:
+        raise HTTPException(status_code=403, detail="Access restricted for current role")
+
     return SourceResponse(
         documentId=doc.document_id,
         page=doc.page,
@@ -259,20 +394,30 @@ def get_source(document_id: str, page: int, db: DBSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Audit
+# Audit (requires auth)
 # ---------------------------------------------------------------------------
 
 
 @app.get("/audit/{query_id}", response_model=AuditResponse)
-def get_audit(query_id: str, db: DBSession = Depends(get_db)):
+def get_audit(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Audit entry not found")
-    return AuditResponse(**_build_audit_dict(entry), queryId=query_id)
+    q = db.query(Query).filter(Query.id == query_id).first()
+    question = q.question if q else ""
+    return AuditResponse(**_build_audit_dict(entry), queryId=query_id, question=question)
 
 
 @app.get("/audit/{query_id}/verify", response_model=AuditVerifyResponse)
-def verify_audit(query_id: str, db: DBSession = Depends(get_db)):
+def verify_audit(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Audit entry not found")
@@ -291,6 +436,42 @@ def verify_audit(query_id: str, db: DBSession = Depends(get_db)):
         valid=valid,
         detail="HMAC matches" if valid else "HMAC mismatch — record may have been tampered",
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin: tamper endpoint (demo proof — admin token required)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/admin/tamper/{query_id}")
+def tamper_audit_entry(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    """
+    Demo-only endpoint. Corrupts the stored policy_outcome for a given query,
+    causing the HMAC verification to return valid=false. Admin token required.
+    This proves tamper-evidence: a field edit is detectable via /audit/{id}/verify.
+    """
+    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+    entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Audit entry not found")
+
+    original_outcome = entry.policy_outcome
+    # Simulate a malicious edit: change policy_outcome without recomputing HMAC
+    entry.policy_outcome = "TAMPERED"
+    db.commit()
+
+    return {
+        "tampered": True,
+        "query_id": query_id,
+        "original_outcome": original_outcome,
+        "detail": "policy_outcome field corrupted; HMAC verification will now return valid=false",
+    }
 
 
 # ---------------------------------------------------------------------------

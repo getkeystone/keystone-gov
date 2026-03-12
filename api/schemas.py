@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 from pydantic import BaseModel
 
 
@@ -15,9 +15,11 @@ class LoginResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    role: str
     mode: str
-    scenario_key: str
+    # role is accepted for backward-compat but ignored — server derives from token
+    role: Optional[str] = None
+    # scenario_key is an admin-only override; ignored for non-admin sessions
+    scenario_key: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
@@ -50,6 +52,7 @@ class SourceResponse(BaseModel):
 
 class AuditResponse(BaseModel):
     queryId: str
+    question: str = ""
     receiptId: str
     timestamp: str
     roleUsed: str

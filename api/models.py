@@ -26,6 +26,7 @@ class Document(Base):
     excerpt = Column(Text)
     highlight = Column(String)
     notes_json = Column(JSON, default=list)
+    min_role_level = Column(Integer, nullable=False, default=0)  # 0=any, 1=officer+, 2=admin+
 
 
 class Query(Base):
