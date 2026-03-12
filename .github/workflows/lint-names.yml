@@ -1,0 +1,20 @@
+name: lint-names
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check-forbidden-strings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if forbidden strings appear in api/ (Python source only)
+        run: |
+          if grep -rni --include="*.py" "lrfd" api/; then
+            echo "ERROR: forbidden string 'lrfd' found in api/*.py"
+            exit 1
+          fi
+          echo "OK: no forbidden strings in api/*.py"

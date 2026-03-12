@@ -185,6 +185,27 @@ DEMO_QUERIES = [
 
 DEMO_SOURCES = [
     {
+        "document_id": "demo-fd-restricted-001",
+        "page": 1,
+        "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
+        "section": "7.4",
+        "status": "active",
+        "effective_date": "2025-11-03",
+        "review_date": "2026-11-03",
+        "owner": "Fire Chief",
+        "excerpt": (
+            "Post-incident review dated 2025-11-03: disciplinary action was taken "
+            "per department standard operating procedure section 7.4. "
+            "Details are restricted to supervisory and administrative personnel only."
+        ),
+        "highlight": "disciplinary action per department SOP section 7.4",
+        "notes": [
+            "Restricted to officer and admin roles.",
+            "Not visible to member role.",
+        ],
+        "min_role_level": 1,
+    },
+    {
         "document_id": "demo-fd-mayday-v3",
         "page": 4,
         "title": "Demo FD MAYDAY Procedure v3",
@@ -203,6 +224,7 @@ DEMO_SOURCES = [
             "Operationally approved source.",
             "Exact page and section shown for citation validation.",
         ],
+        "min_role_level": 0,
     },
     {
         "document_id": "demo-fd-mayday-v2",
@@ -222,6 +244,7 @@ DEMO_SOURCES = [
             "Training-only historical source.",
             "Must not be presented as active operational guidance.",
         ],
+        "min_role_level": 0,
     },
 ]
 
@@ -255,6 +278,7 @@ def seed_demo_data(db: DBSession) -> None:
             excerpt=src["excerpt"],
             highlight=src["highlight"],
             notes_json=src["notes"],
+            min_role_level=src.get("min_role_level", 0),
         ))
 
     # Queries + audit log with HMAC chain
