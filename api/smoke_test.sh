@@ -158,5 +158,29 @@ NOAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/admin/tamper
   -H "$(auth_header "$TOKEN")")
 [ "$NOAUTH_CODE" = "403" ] && pass "tamper proof: member gets 403 on tamper endpoint" || fail "tamper proof: expected 403, got $NOAUTH_CODE"
 
+# ---- 13. Role spoofing is ignored ------------------------------------
+echo "=== 13. Role spoofing is ignored ==="
+# Submit query as member but include role="admin" in the request body.
+# The server must derive role from the session token, not the request body.
+SPOOF=$(curl -sf -X POST "$BASE/query" \
+  -H 'Content-Type: application/json' \
+  -H "$(auth_header "$TOKEN")" \
+  -d '{"question":"Show the restricted post-incident disciplinary memo","mode":"operational","role":"admin"}')
+SPOOF_QID=$(echo "$SPOOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['query_id'])")
+
+SPOOF_GUIDANCE=$(curl -sf "$BASE/guidance/$SPOOF_QID" -H "$(auth_header "$TOKEN")")
+SPOOF_TYPE=$(echo "$SPOOF_GUIDANCE" | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance']['type'])")
+[ "$SPOOF_TYPE" = "refusal" ] && pass "role spoof: member still gets refusal (role in body ignored)" \
+  || fail "role spoof: expected refusal, got $SPOOF_TYPE (role from body was accepted)"
+
+SPOOF_REASON=$(echo "$SPOOF_GUIDANCE" | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance']['reasonCode'])")
+[ "$SPOOF_REASON" = "ACCESS_RESTRICTED" ] && pass "role spoof: reasonCode=ACCESS_RESTRICTED" \
+  || fail "role spoof: wrong reasonCode=$SPOOF_REASON"
+
+SPOOF_CITES=$(curl -sf "$BASE/audit/$SPOOF_QID" -H "$(auth_header "$TOKEN")" \
+  | python3 -c "import sys,json; print(len(json.load(sys.stdin)['citationsReturned']))")
+[ "$SPOOF_CITES" = "0" ] && pass "role spoof: zero citations returned (no source leakage)" \
+  || fail "role spoof: $SPOOF_CITES citation(s) leaked despite refusal"
+
 echo ""
 echo "All smoke tests passed."
