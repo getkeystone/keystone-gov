@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -161,6 +162,16 @@ def _scenario_key_from_guidance(guidance: dict) -> str:
 
 _db_ready = False
 
+# Resolved once at startup; falls back to "0.1.0" when git is unavailable.
+try:
+    _VERSION: str = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stderr=subprocess.DEVNULL,
+    ).decode().strip()
+except Exception:
+    _VERSION = "0.1.0"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -218,9 +229,13 @@ def get_current_session(
 
 @app.get("/health")
 def health():
-    if _db_ready:
-        return {"status": "ok", "service": "keystone-gov-api"}
-    return {"status": "degraded", "service": "keystone-gov-api", "db": False}
+    return {
+        "status": "ok" if _db_ready else "degraded",
+        "service": "keystone-gov-api",
+        "db": _db_ready,
+        "version": _VERSION,
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
