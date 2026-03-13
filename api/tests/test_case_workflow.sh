@@ -191,13 +191,13 @@ TL_RESP="$(curl -sf --max-time 10 "$BASE/cases/${CASE_ID}/timeline" \
   -H "Authorization: Bearer $T_ADMIN" 2>/dev/null || true)"
 TL_TYPES="$(echo "$TL_RESP" | python3 -c "
 import sys,json; d=json.load(sys.stdin)
-types = [e['event_type'] for e in d.get('events',[])]
+types = [e['type'] for e in d.get('items',[])]
 print(','.join(types))
 " 2>/dev/null || echo '')"
-if echo "$TL_TYPES" | grep -q "decision_recorded"; then
-  pass "T7: timeline has decision_recorded event (types: ${TL_TYPES})"
+if echo "$TL_TYPES" | grep -q "decision"; then
+  pass "T7: timeline has decision event (types: ${TL_TYPES})"
 else
-  fail "T7: timeline missing decision_recorded (types: ${TL_TYPES})"
+  fail "T7: timeline missing decision event (types: ${TL_TYPES})"
 fi
 
 # ── T8: PATCH /cases/{id} → close case ────────────────────────────────────────
