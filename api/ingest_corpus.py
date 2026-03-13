@@ -60,6 +60,8 @@ _LRFD_SIGNALS = re.compile(
 
 _VALID_DOMAINS = frozenset({"fire_ops", "medical_emr", "lrfd_protocol"})
 
+_VALID_CONTENT_KINDS = frozenset({"procedure", "requirements", "reference"})
+
 
 def _infer_domain(rel_path: str, title: str) -> str:
     """Return domain inferred from filename/title; medical_emr checked first, then lrfd_protocol."""
@@ -243,29 +245,36 @@ def main() -> None:
 
         # ── Read optional metadata sidecar ────────────────────────────────────
         # Convention: <filename>.metadata.json  (e.g. report.pdf.metadata.json)
-        meta_owner:  str = ""
-        meta_eff:    str = ""
-        meta_rev:    str = ""
-        meta_status: str = ""
-        meta_domain: str = ""
+        meta_owner:        str = ""
+        meta_eff:          str = ""
+        meta_rev:          str = ""
+        meta_status:       str = ""
+        meta_domain:       str = ""
+        meta_content_kind: str = ""
         meta_path = Path(str(fpath) + ".metadata.json")
         if meta_path.exists():
             try:
                 _meta = json.loads(meta_path.read_text())
-                meta_owner  = str(_meta.get("owner",        "") or "")
-                meta_eff    = str(_meta.get("effectiveDate", "") or "")
-                meta_rev    = str(_meta.get("reviewDate",    "") or "")
-                meta_status = str(_meta.get("status",        "") or "")
-                meta_domain = str(_meta.get("domain",        "") or "")
+                meta_owner        = str(_meta.get("owner",        "") or "")
+                meta_eff          = str(_meta.get("effectiveDate", "") or "")
+                meta_rev          = str(_meta.get("reviewDate",    "") or "")
+                meta_status       = str(_meta.get("status",        "") or "")
+                meta_domain       = str(_meta.get("domain",        "") or "")
+                meta_content_kind = str(_meta.get("content_kind",  "") or "")
                 if meta_domain not in _VALID_DOMAINS:
                     if meta_domain:
                         print(f"  WARN [{rel}] unknown domain '{meta_domain}' — inferring", file=sys.stderr)
                     meta_domain = ""
+                if meta_content_kind not in _VALID_CONTENT_KINDS:
+                    if meta_content_kind:
+                        print(f"  WARN [{rel}] unknown content_kind '{meta_content_kind}' — using 'procedure'", file=sys.stderr)
+                    meta_content_kind = ""
             except Exception as _exc:
                 print(f"  WARN [{rel}] metadata parse error: {_exc}", file=sys.stderr)
 
         # Fall back to filename-based domain detection when sidecar omits it.
-        domain = meta_domain or _infer_domain(rel, title)
+        domain       = meta_domain or _infer_domain(rel, title)
+        content_kind = meta_content_kind or "procedure"
 
         # ── Check existing record ──────────────────────────────────────────────
         cur.execute("SELECT id, sha256 FROM corpus_documents WHERE rel_path = %s", (rel,))
@@ -274,17 +283,30 @@ def main() -> None:
         if row:
             doc_id, stored_sha = row
             if stored_sha == sha:
-                # SHA unchanged — only update domain if the sidecar changed it.
+                # SHA unchanged — update domain and/or content_kind if sidecar changed them.
                 cur.execute(
-                    "SELECT domain FROM corpus_documents WHERE id = %s", (doc_id,)
+                    "SELECT domain, content_kind FROM corpus_documents WHERE id = %s", (doc_id,)
                 )
-                stored_domain = (cur.fetchone() or ("fire_ops",))[0]
+                _stored = cur.fetchone() or ("fire_ops", "procedure")
+                stored_domain, stored_content_kind = _stored[0], _stored[1]
+                _updates: list[str] = []
+                _update_vals: list = []
                 if stored_domain != domain:
+                    _updates.append("domain=%s")
+                    _update_vals.append(domain)
+                if stored_content_kind != content_kind:
+                    _updates.append("content_kind=%s")
+                    _update_vals.append(content_kind)
+                if _updates:
+                    _update_vals.append(doc_id)
                     cur.execute(
-                        "UPDATE corpus_documents SET domain=%s WHERE id=%s",
-                        (domain, doc_id),
+                        f"UPDATE corpus_documents SET {', '.join(_updates)} WHERE id=%s",
+                        tuple(_update_vals),
                     )
-                    stats["docs"].append({"rel_path": rel, "action": "domain_updated", "domain": domain})
+                    stats["docs"].append({
+                        "rel_path": rel, "action": "metadata_updated",
+                        "domain": domain, "content_kind": content_kind,
+                    })
                 else:
                     stats["skipped"] += 1
                     stats["docs"].append({"rel_path": rel, "action": "skipped"})
@@ -426,19 +448,20 @@ def main() -> None:
                 """UPDATE corpus_documents
                       SET sha256=%s, size_bytes=%s, mtime_utc=%s, mime=%s, title=%s,
                           owner=%s, effective_date=%s, review_date=%s, status_override=%s,
-                          domain=%s
+                          domain=%s, content_kind=%s
                     WHERE id=%s""",
                 (sha, size, mtime, mime, title,
-                 meta_owner, meta_eff, meta_rev, meta_status, domain, doc_id),
+                 meta_owner, meta_eff, meta_rev, meta_status, domain, content_kind, doc_id),
             )
         else:
             cur.execute(
                 """INSERT INTO corpus_documents
                        (rel_path, sha256, size_bytes, mtime_utc, mime, title,
-                        owner, effective_date, review_date, status_override, domain)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                        owner, effective_date, review_date, status_override, domain,
+                        content_kind)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (rel, sha, size, mtime, mime, title,
-                 meta_owner, meta_eff, meta_rev, meta_status, domain),
+                 meta_owner, meta_eff, meta_rev, meta_status, domain, content_kind),
             )
             doc_id = cur.fetchone()[0]
 

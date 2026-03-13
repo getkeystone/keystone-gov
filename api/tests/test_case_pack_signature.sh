@@ -10,18 +10,18 @@
 #   T6:  Member role → 403 on GET /cases/{id}/pack.zip
 #
 # Prerequisites:
-#   - Stack running at BASE_URL (default http://127.0.0.1:5174/api)
+#   - Stack running at BASE_URL (default http://127.0.0.1:8080/api)
 #   - Signing key configured (EVIDENCE_SIGNING_KEY_PATH set in container)
 #   - cryptography Python package installed on host
 #   - verify_case_pack.py present in tools/
 #
 # Usage:
 #   bash api/tests/test_case_pack_signature.sh [BASE_URL]
-#   BASE_URL defaults to http://127.0.0.1:5174/api
+#   BASE_URL defaults to http://127.0.0.1:8080/api
 
 set -euo pipefail
 
-BASE="${1:-http://127.0.0.1:5174/api}"
+BASE="${1:-http://127.0.0.1:8080/api}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFIER="$(cd "$SCRIPT_DIR/../../.." && pwd)/keystone-deploy/tools/verify_case_pack.py"
 

@@ -15,7 +15,7 @@ set -euo pipefail
 ENV_FILE="${HOME}/.config/keystone/env"
 _PUBLISH_IP="$(grep '^PUBLISH_IP=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' ')"
 _PUBLISH_IP="${_PUBLISH_IP:-127.0.0.1}"
-BASE="${1:-http://${_PUBLISH_IP}:5174/api}"
+BASE="${1:-http://${_PUBLISH_IP}:8080/api}"
 PASS=0
 FAIL=0
 

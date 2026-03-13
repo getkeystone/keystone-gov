@@ -108,6 +108,57 @@ def _dedup(lst: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Hygiene filter
+# ---------------------------------------------------------------------------
+
+# Keywords that make a note worth keeping — electrical/grounding relevance.
+_HYGIENE_KEEP_KW = re.compile(
+    r'\b(?:vdc|volt|amp|battery|disconnect|contactor|pto'
+    r'|ground(?:ing)?|strap|rfi|emi)\b',
+    re.IGNORECASE,
+)
+
+# Pointer-only phrases that make a line a redirect, not content.
+_HYGIENE_POINTER = re.compile(
+    r'\b(?:refer\s+to\s+(?:section|page)'
+    r'|see\s+(?:section|page)'
+    r'|for\s+(?:complete|more|full|additional|detailed?)\s+'
+    r'(?:information|details?|specifications?|requirements?))\b',
+    re.IGNORECASE,
+)
+
+
+def filter_requirements_notes(
+    wiring_notes: list[str],
+    grounding_notes: list[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Remove low-signal notes from wiring/grounding lists.
+
+    Rules (applied in order, preserving original order):
+    1. Keep a note only if it contains at least one relevance keyword
+       (vdc, volt, amp, battery, disconnect, contactor, pto, ground,
+       strap, rfi, emi).
+    2. Drop a note that is pointer-only ("refer to section", "see section",
+       "for details") UNLESS it also contains a relevance keyword.
+    3. Cap: wiring_notes to 4, grounding_notes to 2.
+    """
+    def _keep(note: str) -> bool:
+        has_kw = bool(_HYGIENE_KEEP_KW.search(note))
+        if not has_kw:
+            return False
+        if _HYGIENE_POINTER.search(note):
+            # Pointer phrases allowed only when they also carry spec keywords.
+            # (The has_kw check above already ensures at least one kw is present.)
+            return True
+        return True
+
+    filtered_wiring = [n for n in wiring_notes if _keep(n)][:4]
+    filtered_grounding = [n for n in grounding_notes if _keep(n)][:2]
+    return filtered_wiring, filtered_grounding
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -162,6 +213,9 @@ def parse_requirements(text: str) -> dict:
 
     wiring_notes = _dedup(wiring_notes)[:6]
     grounding_notes = _dedup(grounding_notes)[:4]
+
+    # Hygiene pass: remove pointer-only / low-signal notes and cap counts.
+    wiring_notes, grounding_notes = filter_requirements_notes(wiring_notes, grounding_notes)
 
     return {
         "items": items,

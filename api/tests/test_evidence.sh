@@ -4,12 +4,12 @@
 # Usage:
 #   bash api/tests/test_evidence.sh [BASE_URL]
 #
-# Requires: a running API at BASE_URL (default http://127.0.0.1:5174/api).
+# Requires: a running API at BASE_URL (default http://127.0.0.1:8080/api).
 # Auth: auto-logins as admin/admin (override with ADMIN_USER / ADMIN_PASS).
 
 set -euo pipefail
 
-BASE="${1:-http://127.0.0.1:5174/api}"
+BASE="${1:-http://127.0.0.1:8080/api}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:-admin}"
 
