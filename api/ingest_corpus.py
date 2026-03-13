@@ -32,12 +32,34 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
+
+# ── Domain auto-detection ─────────────────────────────────────────────────────
+# Applied when the metadata sidecar does not set an explicit "domain" key.
+# Matches filename stems / titles that are clearly medical/EMR in nature.
+
+_MEDICAL_EMR_SIGNALS = re.compile(
+    r'\b(?:cpr|first[\s\-]?aid|emr|emt|paramedic|medical|patient'
+    r'|aed|defibrillat|emergency\s+care|emergency\s+medical'
+    r'|vital\s+sign|bandage|airway|resuscitat|triage)\b',
+    re.IGNORECASE,
+)
+
+_VALID_DOMAINS = frozenset({"fire_ops", "medical_emr"})
+
+
+def _infer_domain(rel_path: str, title: str) -> str:
+    """Return 'medical_emr' if the filename/title match EMR signals; else 'fire_ops'."""
+    stem = Path(rel_path).stem.lower().replace("_", " ").replace("-", " ")
+    if _MEDICAL_EMR_SIGNALS.search(stem) or _MEDICAL_EMR_SIGNALS.search(title.lower()):
+        return "medical_emr"
+    return "fire_ops"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -211,10 +233,11 @@ def main() -> None:
 
         # ── Read optional metadata sidecar ────────────────────────────────────
         # Convention: <filename>.metadata.json  (e.g. report.pdf.metadata.json)
-        meta_owner: str = ""
-        meta_eff:   str = ""
-        meta_rev:   str = ""
+        meta_owner:  str = ""
+        meta_eff:    str = ""
+        meta_rev:    str = ""
         meta_status: str = ""
+        meta_domain: str = ""
         meta_path = Path(str(fpath) + ".metadata.json")
         if meta_path.exists():
             try:
@@ -223,8 +246,16 @@ def main() -> None:
                 meta_eff    = str(_meta.get("effectiveDate", "") or "")
                 meta_rev    = str(_meta.get("reviewDate",    "") or "")
                 meta_status = str(_meta.get("status",        "") or "")
+                meta_domain = str(_meta.get("domain",        "") or "")
+                if meta_domain not in _VALID_DOMAINS:
+                    if meta_domain:
+                        print(f"  WARN [{rel}] unknown domain '{meta_domain}' — inferring", file=sys.stderr)
+                    meta_domain = ""
             except Exception as _exc:
                 print(f"  WARN [{rel}] metadata parse error: {_exc}", file=sys.stderr)
+
+        # Fall back to filename-based domain detection when sidecar omits it.
+        domain = meta_domain or _infer_domain(rel, title)
 
         # ── Check existing record ──────────────────────────────────────────────
         cur.execute("SELECT id, sha256 FROM corpus_documents WHERE rel_path = %s", (rel,))
@@ -233,8 +264,20 @@ def main() -> None:
         if row:
             doc_id, stored_sha = row
             if stored_sha == sha:
-                stats["skipped"] += 1
-                stats["docs"].append({"rel_path": rel, "action": "skipped"})
+                # SHA unchanged — only update domain if the sidecar changed it.
+                cur.execute(
+                    "SELECT domain FROM corpus_documents WHERE id = %s", (doc_id,)
+                )
+                stored_domain = (cur.fetchone() or ("fire_ops",))[0]
+                if stored_domain != domain:
+                    cur.execute(
+                        "UPDATE corpus_documents SET domain=%s WHERE id=%s",
+                        (domain, doc_id),
+                    )
+                    stats["docs"].append({"rel_path": rel, "action": "domain_updated", "domain": domain})
+                else:
+                    stats["skipped"] += 1
+                    stats["docs"].append({"rel_path": rel, "action": "skipped"})
                 continue
             action = "updated"
         else:
@@ -372,19 +415,20 @@ def main() -> None:
             cur.execute(
                 """UPDATE corpus_documents
                       SET sha256=%s, size_bytes=%s, mtime_utc=%s, mime=%s, title=%s,
-                          owner=%s, effective_date=%s, review_date=%s, status_override=%s
+                          owner=%s, effective_date=%s, review_date=%s, status_override=%s,
+                          domain=%s
                     WHERE id=%s""",
                 (sha, size, mtime, mime, title,
-                 meta_owner, meta_eff, meta_rev, meta_status, doc_id),
+                 meta_owner, meta_eff, meta_rev, meta_status, domain, doc_id),
             )
         else:
             cur.execute(
                 """INSERT INTO corpus_documents
                        (rel_path, sha256, size_bytes, mtime_utc, mime, title,
-                        owner, effective_date, review_date, status_override)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                        owner, effective_date, review_date, status_override, domain)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (rel, sha, size, mtime, mime, title,
-                 meta_owner, meta_eff, meta_rev, meta_status),
+                 meta_owner, meta_eff, meta_rev, meta_status, domain),
             )
             doc_id = cur.fetchone()[0]
 
@@ -408,6 +452,7 @@ def main() -> None:
         stats["docs"].append({
             "rel_path": rel,
             "action":   action,
+            "domain":   domain,
             "chunks":   len(chunks_data),
             "pages":    n_pages or None,
             "chars":    sum(len(c) for _, _, c in chunks_data),
