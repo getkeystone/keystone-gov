@@ -214,24 +214,37 @@ def _corpus_fts_retrieve(
     if not count:
         return None  # corpus not yet ingested — fall through to lexical fixtures
 
-    rows = db.execute(
-        text("""
-            SELECT
-                cd.rel_path,
-                cd.title,
-                cc.chunk_index,
-                cc.text,
-                ts_rank_cd(cc.tsv, query) AS rank,
-                cc.page
-            FROM corpus_chunks cc
-            JOIN corpus_documents cd ON cd.id = cc.doc_id
-            CROSS JOIN websearch_to_tsquery('english', :q) query
-            WHERE cc.tsv @@ query
-            ORDER BY rank DESC
-            LIMIT 50
-        """),
-        {"q": question},
-    ).fetchall()
+    _FTS_SQL = """
+        SELECT
+            cd.rel_path,
+            cd.title,
+            cc.chunk_index,
+            cc.text,
+            ts_rank_cd(cc.tsv, query) AS rank,
+            cc.page
+        FROM corpus_chunks cc
+        JOIN corpus_documents cd ON cd.id = cc.doc_id
+        CROSS JOIN websearch_to_tsquery('english', :q) query
+        WHERE cc.tsv @@ query
+        ORDER BY rank DESC
+        LIMIT 50
+    """
+    rows = db.execute(text(_FTS_SQL), {"q": question}).fetchall()
+
+    # OR-expansion fallback: when AND-FTS returns nothing, retry with any matching term.
+    # This handles equipment questions where brand/type keywords only appear in the
+    # title/front-matter while operational content uses generic terms.
+    _used_or_fts = False
+    if not rows:
+        tokens = [t for t in re.split(r'\W+', question.lower())
+                  if t not in _STOP_WORDS and len(t) > 2]
+        if tokens:
+            or_question = " OR ".join(tokens[:8])
+            try:
+                rows = db.execute(text(_FTS_SQL), {"q": or_question}).fetchall()
+                _used_or_fts = bool(rows)
+            except Exception:
+                db.rollback()
 
     if not rows:
         guidance = {
@@ -251,11 +264,14 @@ def _corpus_fts_retrieve(
         reverse=True,
     )
 
-    top_rel, top_title, top_chunk, top_text, _, top_page = reranked[0]
+    top_rel, top_title, top_chunk, top_text, _fts_rank, top_page = reranked[0]
+    _toc_filtered = False
+    _used_fallback = False
 
     # If the best candidate still looks like TOC, try a document-level fallback:
     # fetch the first procedural (non-TOC) chunks from the same matched docs.
     if _is_toc_like(top_chunk, top_text):
+        _toc_filtered = True
         matched_docs = list({r[0] for r in reranked[:5]})
         fallback_rows = db.execute(
             text("""
@@ -283,6 +299,8 @@ def _corpus_fts_retrieve(
                 top_rel, top_title, top_chunk, top_text, top_page = (
                     fb_rel, fb_title, fb_chunk, fb_text, fb_page
                 )
+                _used_fallback = True
+                _fts_rank = _BASE
                 break
         else:
             # All candidates — including fallback — look like TOC/front-matter.
@@ -308,6 +326,7 @@ def _corpus_fts_retrieve(
 
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
+    # Run combined text through clean_lines before parsing.
     try:
         adj_rows = db.execute(
             text("""
@@ -320,11 +339,11 @@ def _corpus_fts_retrieve(
             """),
             {"rel": top_rel, "lo": top_chunk - 2, "hi": top_chunk + 2},
         ).fetchall()
-        _combined = "\n".join(r[0] for r in adj_rows)
+        _combined = clean_lines("\n".join(r[0] for r in adj_rows))
     except Exception:
         db.rollback()
-        _combined = top_text
-    procedure = parse_procedure(_combined)
+        _combined = _clean_top
+    proc = parse_procedure(_combined)
 
     # ── Fetch document-level metadata (owner/dates/status) ───────────────────
     try:
@@ -336,12 +355,21 @@ def _corpus_fts_retrieve(
     except Exception:
         db.rollback()
         _meta = None
-    _owner      = (_meta[0] if _meta else "") or ""
-    _eff_date   = (_meta[1] if _meta else "") or ""
-    _rev_date   = (_meta[2] if _meta else "") or ""
-    _status_ov  = (_meta[3] if _meta else "") or ""
+    _owner     = (_meta[0] if _meta else "") or ""
+    _eff_date  = (_meta[1] if _meta else "") or ""
+    _rev_date  = (_meta[2] if _meta else "") or ""
+    _status_ov = (_meta[3] if _meta else "") or ""
 
-    guidance = {
+    # ── Confidence metadata ───────────────────────────────────────────────────
+    _rerank_val = _rerank_score(top_chunk, top_text, _fts_rank)
+    _reason_parts = [f"chunk {top_chunk} page {top_page}"]
+    if _used_or_fts:
+        _reason_parts.append("OR-expanded FTS (AND returned 0 hits)")
+    if _used_fallback:
+        _reason_parts.append(f"document fallback (initial top was TOC-like)")
+    _reason_parts.append(f"FTS rank {_fts_rank:.4f}; rerank {_rerank_val:.4f}")
+
+    guidance: dict = {
         "type": "approved",
         "summary": make_summary(_clean_top),
         "excerpt": _clean_top[:800],
@@ -356,10 +384,17 @@ def _corpus_fts_retrieve(
             "reviewDate": _rev_date,
             "owner": _owner,
         },
+        # Top-level structured procedure fields (always present, may be empty lists)
+        "steps":           proc["steps"],
+        "warnings":        proc["warnings"],
+        "prereqs":         proc["prereqs"],
+        "troubleshooting": proc["troubleshooting"],
+        "confidence": {
+            "rerank_reason": "; ".join(_reason_parts),
+            "toc_filtered":  _toc_filtered,
+            "used_fallback": _used_fallback,
+        },
     }
-    # Only include procedure when it has meaningful content.
-    if any(procedure[k] for k in ("steps", "warnings", "prereqs", "codes")):
-        guidance["procedure"] = procedure
     # Return top 5 reranked candidates as sources/citations.
     top5 = reranked[:5]
     sources = [

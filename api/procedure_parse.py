@@ -2,14 +2,14 @@
 procedure_parse.py — heuristic parser for structured procedure content.
 
 parse_procedure(text: str) -> dict with keys:
-  steps:    list[str]  — numbered/bulleted action steps
-  warnings: list[str]  — WARNING/CAUTION/DANGER/NOTE lines
-  prereqs:  list[str]  — prerequisite/ensure/check lines
-  codes:    list[str]  — fault/alarm/error codes
+  steps:           list[str]  — numbered/bulleted action steps       (max 8)
+  warnings:        list[str]  — WARNING/CAUTION/DANGER/IMPORTANT     (max 6)
+  prereqs:         list[str]  — PPE/prepare/ensure/required lines    (max 6)
+  troubleshooting: list[str]  — error/alarm/fault/troubleshooting    (max 6)
 
+All values are deduplicated (case-insensitive) and each entry ≤ 300 chars.
 Caller should concatenate the cited chunk with adjacent chunks (same doc,
-nearby indices) before calling, so warnings/prereqs that appear just before
-or after the exact step sequence are captured.
+±2 around the cited index) before calling, for broader context.
 """
 
 from __future__ import annotations
@@ -27,51 +27,73 @@ _NUMBERED = re.compile(
 # Bullet step: "• ", "- ", "* " at line start
 _BULLET = re.compile(r'^\s*[•\-\*]\s+')
 
-# Explicit warning/caution/danger header at line start
+# Explicit warning/caution/danger/important/note header at line start
 _WARNING_HEADER = re.compile(
-    r'^\s*(?:warning|caution|danger|alert|note)\s*[:!]?\s*',
+    r'^\s*(?:warning|caution|danger|important|alert|note)\s*[:!]?\s*',
     re.IGNORECASE,
 )
 
-# Inline safety-critical language anywhere in a non-step line
+# Inline safety-critical language (for non-step lines)
 _WARNING_INLINE = re.compile(
-    r'\b(?:warning|caution|danger|do\s+not|must\s+not|should\s+not|never|hazard)\b',
-    re.IGNORECASE,
+    r'\b(?:WARNING|CAUTION|DANGER|IMPORTANT)\b',
 )
 
-# Prerequisite start: "Ensure …", "Check …", "Verify …", "Before beginning …"
+# Prerequisite: explicit start word or inline prerequisite language
 _PREREQ_START = re.compile(
-    r'^\s*(?:ensure|check|verify|confirm|before\s+(?:you\s+)?(?:begin|start|operat|using|perform))',
+    r'^\s*(?:ensure|check|verify|confirm|prepare|wear|don\b|put\s+on'
+    r'|before\s+(?:you\s+)?(?:begin|start|operat|using|perform|use))',
     re.IGNORECASE,
 )
-
-# Inline prerequisite language
 _PREREQ_INLINE = re.compile(
-    r'\b(?:required|prerequisite|must\s+be\s+(?:in\s+place|present|ready|installed)'
+    r'\b(?:PPE|personal\s+protective\s+equipment|required|prerequisite'
+    r'|preparation|before\s+use|must\s+be\s+(?:in\s+place|present|ready|worn)'
     r'|prior\s+to|before\s+beginning|before\s+starting)\b',
     re.IGNORECASE,
 )
 
-# Fault/alarm/error codes: "E-01", "F3", "ERR 404", "ALARM-02"
-_FAULT_CODE = re.compile(
-    r'\b(?:error|alarm|fault|code|err)\s*[-:#]?\s*\d+\b'
-    r'|\b[A-Z]{1,4}[-_]\d{2,4}\b',
+# Troubleshooting: lines mentioning error conditions, alarms, faults, codes
+_TROUBLESHOOT = re.compile(
+    r'\b(?:troubleshoot(?:ing)?'
+    r'|error(?:\s+code)?'
+    r'|alarm'
+    r'|fault(?:\s+code)?'
+    r'|malfunction'
+    r'|diagnostic'
+    r'|if\s+the\s+(?:machine|unit|device|display|led|light|indicator)'
+    r')\b',
     re.IGNORECASE,
 )
 
 
-def parse_procedure(text: str, max_each: int = 12) -> dict:
+def _dedup(lst: list[str]) -> list[str]:
+    """Return list with case-insensitive duplicates removed (first occurrence wins)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in lst:
+        key = re.sub(r'\s+', ' ', item.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def parse_procedure(
+    text: str,
+    max_steps: int = 8,
+    max_warnings: int = 6,
+    max_prereqs: int = 6,
+    max_troubleshooting: int = 6,
+) -> dict:
     """
     Parse procedure text into structured components.
 
-    Returns dict with keys: steps, warnings, prereqs, codes.
-    All values are lists of clean strings (≤ 300 chars each).
+    Returns dict with keys: steps, warnings, prereqs, troubleshooting.
+    All values are deduplicated lists of clean strings (≤ 300 chars each).
     """
-    steps: list[str]    = []
-    warnings: list[str] = []
-    prereqs: list[str]  = []
-    codes: list[str]    = []
-    codes_seen: set[str] = set()
+    steps:           list[str] = []
+    warnings:        list[str] = []
+    prereqs:         list[str] = []
+    troubleshooting: list[str] = []
 
     for raw_line in text.split('\n'):
         line = raw_line.strip()
@@ -82,46 +104,41 @@ def parse_procedure(text: str, max_each: int = 12) -> dict:
         if _WARNING_HEADER.match(line):
             body = _WARNING_HEADER.sub('', line).strip()
             entry = body if len(body) > 4 else line
-            if len(warnings) < max_each:
-                warnings.append(entry[:300])
+            warnings.append(entry[:300])
             continue
 
         # ── Numbered step ─────────────────────────────────────────────────────
         if _NUMBERED.match(line):
             body = _NUMBERED.sub('', line).strip()
-            if body and len(body) > 4 and len(steps) < max_each:
+            if body and len(body) > 4:
                 steps.append(body[:300])
             continue
 
         # ── Bullet step ───────────────────────────────────────────────────────
         if _BULLET.match(line):
             body = _BULLET.sub('', line).strip()
-            if body and len(body) > 4 and len(steps) < max_each:
+            if body and len(body) > 4:
                 steps.append(body[:300])
             continue
 
-        # ── Inline warning sentence (not already a step) ──────────────────────
+        # ── Inline WARNING/CAUTION/DANGER/IMPORTANT (all-caps signal only) ───
         if _WARNING_INLINE.search(line) and 10 < len(line) <= 400:
-            if len(warnings) < max_each:
-                warnings.append(line[:300])
+            warnings.append(line[:300])
+            continue
+
+        # ── Troubleshooting ───────────────────────────────────────────────────
+        if _TROUBLESHOOT.search(line) and 10 < len(line) <= 400:
+            troubleshooting.append(line[:300])
             continue
 
         # ── Prerequisite ──────────────────────────────────────────────────────
         if (_PREREQ_START.match(line) or _PREREQ_INLINE.search(line)) and 10 < len(line) <= 400:
-            if len(prereqs) < max_each:
-                prereqs.append(line[:300])
+            prereqs.append(line[:300])
             continue
 
-        # ── Fault/alarm codes from any remaining line ─────────────────────────
-        for m in _FAULT_CODE.finditer(line):
-            code = m.group().strip()
-            if code not in codes_seen and len(codes) < max_each:
-                codes_seen.add(code)
-                codes.append(code)
-
     return {
-        "steps":    steps,
-        "warnings": warnings,
-        "prereqs":  prereqs,
-        "codes":    codes,
+        "steps":           _dedup(steps)[:max_steps],
+        "warnings":        _dedup(warnings)[:max_warnings],
+        "prereqs":         _dedup(prereqs)[:max_prereqs],
+        "troubleshooting": _dedup(troubleshooting)[:max_troubleshooting],
     }
