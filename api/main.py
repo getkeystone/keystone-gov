@@ -126,6 +126,32 @@ _ELECTRICAL_INJURY_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
+# ── CPR procedure intent ──────────────────────────────────────────────────────
+# When a query is about CPR/rescue breathing in the context of an electrical
+# or cardiac emergency, boost chunks containing CPR procedure keywords and
+# penalize chunks that are primarily about MAYDAY/radio procedures.
+
+# Triggers CPR intent detection on the query side.
+_CPR_INTENT = re.compile(
+    r'\bcpr\b|\bcompress(?:ion|ions)\b|\brescue\s+breath(?:ing|s)?\b'
+    r'|\bcardiac\s+arrest\b|\bresuscitat|\bchest\s+compress',
+    re.IGNORECASE,
+)
+
+# Keywords in a chunk that confirm CPR procedure content.
+_CPR_PROCEDURE_MARKERS = re.compile(
+    r'\bcpr\b|\bcompress(?:ion|ions)\b|\brescue\s+breath|\bairway\b'
+    r'|\bbreath(?:ing|s)?\b|\bchest\b|\baed\b|\bdefibrillat'
+    r'|\bpulse\b|\bresuscitat|\bcardiac',
+    re.IGNORECASE,
+)
+
+# Markers in a chunk that indicate primarily MAYDAY/radio/fire-ops content.
+_MAYDAY_CONTENT_MARKERS = re.compile(
+    r'\bmayday\b|\bpass\s+device\b|\bscba\b|\brit\b|\brapid\s+intervention',
+    re.IGNORECASE,
+)
+
 
 def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     """
@@ -381,6 +407,26 @@ def _corpus_fts_retrieve(
             return base
         reranked = sorted(rows, key=_intent_score, reverse=True)
 
+    # CPR intent: boost chunks with CPR procedure keywords; penalize MAYDAY/fire-ops chunks
+    # that match on "shock" or "rescue" but are not about CPR.
+    if _CPR_INTENT.search(question):
+        def _cpr_intent_score(row: tuple) -> float:
+            _ri, _ti, ci, txt, rank, _pg, _dom = row
+            base = _rerank_score(ci, txt, rank)
+            if _CPR_PROCEDURE_MARKERS.search(txt):
+                base *= 2.0   # strong boost for CPR procedure content
+            if _MAYDAY_CONTENT_MARKERS.search(txt) and not _CPR_PROCEDURE_MARKERS.search(txt):
+                base *= 0.15  # penalize MAYDAY content without CPR keywords
+            return base
+        reranked = sorted(reranked, key=_cpr_intent_score, reverse=True)
+
+        # Must-have gate: if the top candidate has no CPR keywords, scan the
+        # candidate pool for any chunk that does and promote it.
+        if not _CPR_PROCEDURE_MARKERS.search(reranked[0][3]):
+            cpr_hits = [r for r in reranked if _CPR_PROCEDURE_MARKERS.search(r[3])]
+            if cpr_hits:
+                reranked = cpr_hits + [r for r in reranked if r not in cpr_hits]
+
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _toc_filtered = False
     _used_fallback = False
@@ -577,12 +623,13 @@ def _corpus_fts_retrieve(
             "hiddenSource": False,
         }, "refused", [], []
 
-    # ── Policy gate B: medical_emr domain requires medical_reference mode ────
-    # Any mode other than medical_reference that retrieves a medical_emr document
-    # is refused with MEDICAL_MODE_REQUIRED so the operator must explicitly
-    # opt in to the reference card path.
+    # ── Policy gate B: medical_emr domain → medical_reference card ──────────
+    # Operational/training queries that retrieve medical_emr documents are
+    # allowed during the pilot but must never show as "Approved Guidance".
+    # They are returned as type="medical_reference" — a distinct card type
+    # that carries a hard banner and no "approved" label.
+    # Exception: operational + weak/reject quality → fail-closed LOW_CONFIDENCE_MEDICAL.
     if _top_domain == "medical_emr" and mode != "medical_reference":
-        # Special case: operational + low-confidence medical → existing LOW_CONFIDENCE_MEDICAL code
         if mode == "operational" and _pq["decision"] in ("reject", "weak"):
             return {
                 "type": "refusal",
@@ -599,15 +646,65 @@ def _corpus_fts_retrieve(
                 ),
                 "hiddenSource": False,
             }, "refused", [], []
-        # All other non-medical_reference modes: require explicit mode selection.
-        return {
-            "type": "refusal",
-            "reasonCode": "MEDICAL_MODE_REQUIRED",
-            "title": "Medical Reference mode required",
-            "message": "Medical content requires Medical Reference mode.",
-            "safeNextStep": "Use approved medical protocols or medical control.",
-            "hiddenSource": False,
-        }, "refused", [], []
+        # Allowed — build a medical_reference guidance card (not "approved").
+        _emr_disclaimer = (
+            "This is EMR reference material only — NOT an approved LRFD protocol. "
+            "Follow medical control direction and your agency's standing orders."
+        )
+        top5 = reranked[:5]
+        medref_sources = [
+            {
+                "documentId": rel_path,
+                "title": title,
+                "status": "active",
+                "allowed": True,
+                "page": pg if pg is not None else chunk_idx,
+                "chunkIndex": chunk_idx,
+                "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
+                "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
+            }
+            for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
+        ]
+        medref_citations = [
+            {
+                "documentId": rel_path,
+                "chunkIndex": chunk_idx,
+                "page": pg,
+                "snippet": chunk_text_val[:300],
+            }
+            for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg, _dom in top5
+        ]
+        medref_notice = "LOW_CONFIDENCE" if mode == "training" and _pq["decision"] == "weak" else None
+        medref_guidance: dict = {
+            "type": "medical_reference",
+            "notice": medref_notice,
+            "disclaimer": _emr_disclaimer,
+            "summary": make_summary(_clean_top),
+            "excerpt": _clean_top[:800],
+            "keyPoints": _pq_warnings,
+            "document": {
+                "documentId": top_rel,
+                "title": top_title,
+                "section": f"page {top_page}" if top_page is not None else f"chunk {top_chunk}",
+                "page": _eff_page,
+                "chunkIndex": top_chunk,
+                "status": _status_ov if _status_ov else "active",
+                "effectiveDate": _eff_date,
+                "reviewDate": _rev_date,
+                "owner": _owner,
+                "available": _doc_available(top_rel),
+                "domain": _top_domain,
+            },
+            "steps": _pq_steps if _pq["decision"] == "ok" else [],
+            "warnings": _pq_warnings,
+            "confidence": {
+                "rerank_reason": "; ".join(_reason_parts),
+                "toc_filtered":  _toc_filtered,
+                "used_fallback": _used_fallback,
+            },
+            "procedure_quality": _pq,
+        }
+        return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
     # Returns type="reference" (not "approved") with a hard disclaimer.
@@ -839,8 +936,18 @@ def _retrieve(
 
 
 def _scenario_key_from_guidance(guidance: dict) -> str:
-    if guidance.get("type") == "approved":
+    """Derive a scenarioKey that matches the guidance payload type."""
+    t = guidance.get("type", "")
+    if t == "approved":
         return "approved"
+    if t in ("reference", "medical_reference"):
+        return t          # "reference" or "medical_reference"
+    if t == "refusal":
+        code = guidance.get("reasonCode", "")
+        if code == "ACCESS_RESTRICTED":
+            return "restricted"
+        return "refusal"
+    # Unknown / legacy — fall back to reasonCode heuristic
     code = guidance.get("reasonCode", "")
     if code == "ACCESS_RESTRICTED":
         return "restricted"
@@ -1135,9 +1242,13 @@ def get_guidance(
         raise HTTPException(status_code=404, detail="Query not found")
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     audit = _build_audit_dict(entry) if entry else {}
+    # Derive scenarioKey from the stored guidance payload so that the UI
+    # always reflects what was actually returned (e.g. reference/medical_reference)
+    # rather than the scenario that was requested or stored at query time.
+    derived_key = _scenario_key_from_guidance(q.guidance_json or {})
     return GuidanceResponse(
         queryId=q.id,
-        scenarioKey=q.scenario_key,
+        scenarioKey=derived_key,
         question=q.question,
         mode=q.mode,
         guidance=q.guidance_json,
