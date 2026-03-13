@@ -278,8 +278,48 @@ conn.commit(); cur.close(); conn.close()
 print('smoke corpus cleaned up')
   ")
 
-  # 14e. Reranker: decon question must not return TOC/front-matter chunk.
-  echo "--- 14e. Reranker: decon question skips TOC ---"
+  # 14e. /document endpoint: serve PDF, content-type check.
+  echo "--- 14e. /document: PDF content-type ---"
+  DOC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/Emergency_Medical_Response_E-Textbook.pdf?mode=operational")
+  [ "$DOC_STATUS" = "200" ] \
+    && pass "document: HTTP 200 for known PDF" \
+    || fail "document: expected 200, got $DOC_STATUS"
+
+  DOC_CT=$(curl -sI -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/Emergency_Medical_Response_E-Textbook.pdf?mode=operational" \
+    | tr -d '\r' | grep -i '^content-type:' | awk '{print $2}')
+  echo "$DOC_CT" | grep -q '^application/pdf' \
+    && pass "document: content-type=application/pdf" \
+    || fail "document: wrong content-type: $DOC_CT"
+
+  # Mode gating: operational returns 200 (doc is active).
+  DOC_OP=$(curl -s -o /dev/null -w "%{http_code}" -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/Emergency_Medical_Response_E-Textbook.pdf?mode=operational")
+  [ "$DOC_OP" = "200" ] \
+    && pass "document: mode=operational allowed for active doc" \
+    || fail "document: mode=operational expected 200, got $DOC_OP"
+
+  # Non-existent document returns 404.
+  DOC_404=$(curl -s -o /dev/null -w "%{http_code}" -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/this-does-not-exist.pdf")
+  [ "$DOC_404" = "404" ] \
+    && pass "document: 404 for unknown document_id" \
+    || fail "document: expected 404 for unknown doc, got $DOC_404"
+
+  # Unauthenticated request returns 401.
+  DOC_UNAUTH=$(curl -s -o /dev/null -w "%{http_code}" \
+    "${BASE}/document/Emergency_Medical_Response_E-Textbook.pdf")
+  [ "$DOC_UNAUTH" = "401" ] \
+    && pass "document: 401 without auth token" \
+    || fail "document: expected 401 without auth, got $DOC_UNAUTH"
+
+  # 14f. Reranker: decon question must not return TOC/front-matter chunk.
+  echo "--- 14f. Reranker: decon question skips TOC ---"
   DECON_Q=$(curl -sf -X POST "$BASE/query" \
     -H 'Content-Type: application/json' \
     -H "$(auth_header "$TOKEN")" \
