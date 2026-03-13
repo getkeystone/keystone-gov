@@ -9,6 +9,9 @@
 #   T4: Decon machine query (valid) → guidance.document.available present
 #   T5: Out-of-corpus question ("chocolate cake") → refusal
 #   T6: MAYDAY query → still approved (relevance gate not over-firing)
+#   T7: Electric-shock CPR → documentId must NOT be an AED device manual
+#   T8: MAYDAY+AED query → approved/refusal (intent gate not over-suppressing)
+#   T9: CPR electric-shock steps must all be CPR-relevant (no unrelated steps)
 #
 # Note: T1/T2 accept EITHER approved-with-CPR-doc OR refusal.  The gate must
 # prevent MAYDAY from being returned; it does not require a refusal when a
@@ -205,6 +208,69 @@ if [[ "$MAYDAY2_TYPE" == "approved" || "$MAYDAY2_TYPE" == "refusal" ]]; then
   pass "T8: MAYDAY+AED query handled without error (type=${MAYDAY2_TYPE})"
 else
   fail "T8: MAYDAY+AED query returned unexpected type=${MAYDAY2_TYPE}"
+fi
+echo ""
+
+# ── T9: CPR electric-shock steps must all be CPR-relevant ────────────────────
+#
+# Anchor-first procedure extraction contract: steps returned for a CPR
+# electric-shock query must each contain at least one CPR/first-aid keyword.
+# No step should be exclusively about an unrelated topic (e.g. AED device
+# setup) without any CPR-relevant vocabulary.
+echo "── T9: CPR electric-shock steps must all be CPR-relevant (anchor-first filter)"
+
+# Re-use CPR_RESP from T1 if available, otherwise re-query
+if [[ -n "${CPR_RESP:-}" ]] && echo "$CPR_RESP" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+  CPR9_RESP="$CPR_RESP"
+else
+  CPR9_RESP="$(query_guidance "what cpr procedure should use for victim from electric shock" "training")"
+fi
+
+CPR9_TYPE="$(echo "$CPR9_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); print(g.get('type','?'))" 2>/dev/null || true)"
+CPR9_STEPS_JSON="$(echo "$CPR9_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); import json as J; print(J.dumps(g.get('steps',[])))" 2>/dev/null || echo '[]')"
+
+info "type=${CPR9_TYPE}  steps=${CPR9_STEPS_JSON:0:120}"
+
+if [[ "$CPR9_TYPE" == "refusal" ]]; then
+  pass "T9: refusal — no steps to check"
+elif [[ "$CPR9_TYPE" == "approved" ]]; then
+  # Each step must contain at least one CPR-relevant token.
+  # A step that is exclusively about an unrelated topic fails this check.
+  python3 - "$CPR9_STEPS_JSON" <<'PYEOF'
+import sys, json, re
+
+steps = json.loads(sys.argv[1])
+if not steps:
+    print("[PASS] T9: no steps returned (procedure_quality may have rejected)")
+    sys.exit(0)
+
+# Keywords expected in a CPR/first-aid procedure
+CPR_KW = re.compile(
+    r'\b(?:breath(?:ing)?|chest|compress(?:ion|ions)?|cpr|pulse|airway|rescue'
+    r'|ventilat|cardiac|heart|unconscious|tilt|chin|mouth|breath|defib|shock'
+    r'|resuscitat|ems|call|911|position|victim|patient|person|begin|start'
+    r'|electric(?:al)?|injur)\b',
+    re.IGNORECASE,
+)
+
+irrelevant = [s for s in steps if not CPR_KW.search(s)]
+if irrelevant:
+    print(f"[FAIL] T9: {len(irrelevant)} step(s) appear unrelated to CPR/first-aid:")
+    for s in irrelevant[:3]:
+        print(f"       — {s[:120]}")
+    sys.exit(1)
+else:
+    print(f"[PASS] T9: all {len(steps)} step(s) contain CPR-relevant keywords")
+    sys.exit(0)
+PYEOF
+  T9_EXIT=$?
+  if [[ $T9_EXIT -ne 0 ]]; then
+    FAIL=$((FAIL+1))
+  else
+    PASS=$((PASS+1))
+  fi
+else
+  fail "T9: unexpected type=${CPR9_TYPE}"
 fi
 echo ""
 

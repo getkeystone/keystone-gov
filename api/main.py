@@ -455,7 +455,28 @@ def _corpus_fts_retrieve(
     except Exception:
         db.rollback()
         _combined = _clean_top
-    proc = parse_procedure(_combined)
+    # ── Anchor-first procedure extraction ─────────────────────────────────────
+    # Parse procedure steps from the cited (anchor) chunk only.  Adjacent
+    # chunks are kept in _combined for the excerpt/summary but must NOT
+    # contribute to step extraction — adjacent sections often contain unrelated
+    # bullet lists (e.g. AED device setup adjacent to CPR treatment steps).
+    #
+    # If the anchor yields ≥4 steps: use as-is.
+    # If the anchor yields fewer: accept the sparse result and let
+    # procedure_quality flag it as "weak" rather than pulling in noise.
+    # Apply a final step-level relevance filter to drop any step that shares no
+    # token with the question — catches residual noise from ambiguous anchors.
+    proc = parse_procedure(_clean_top)
+
+    _question_tokens = _tokenize(question)
+    if _question_tokens:
+        # Drop steps whose token set is entirely disjoint from the question tokens.
+        # A single shared token is sufficient to keep the step.
+        proc["steps"] = [
+            s for s in proc["steps"]
+            if _tokenize(s) & _question_tokens
+        ]
+
     _pq = procedure_quality(proc, _clean_top)
 
     # ── Fetch document-level metadata (owner/dates/status) ───────────────────
