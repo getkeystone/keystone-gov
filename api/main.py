@@ -186,6 +186,67 @@ _STOP_WORDS = {
 
 _EVIDENCE_THRESHOLD = 1
 
+# ---------------------------------------------------------------------------
+# Corpus root (used by retrieval, document endpoint, and availability check)
+# ---------------------------------------------------------------------------
+
+_CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "/srv/keystone-corpus"))
+
+# Extensions that the /document endpoint can actually serve.
+_SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx"})
+
+# ---------------------------------------------------------------------------
+# Relevance gate — deterministic token-overlap check applied before returning
+# approved guidance.  Prevents unrelated documents from being approved.
+# ---------------------------------------------------------------------------
+
+# Minimum fraction of question tokens that must appear in the excerpt.
+# Example: "cpr electric shock" vs MAYDAY excerpt → 0/3 = 0.0 → refusal.
+#          "MAYDAY procedure"  vs MAYDAY excerpt → 1/2 = 0.5 → approved.
+_RELEVANCE_THRESHOLD = 0.12
+
+_NO_RELEVANT_PROCEDURE_REFUSAL = {
+    "type": "refusal",
+    "reasonCode": "NO_RELEVANT_PROCEDURE",
+    "title": "No relevant procedure found",
+    "message": (
+        "The system found documents but none are relevant to your question. "
+        "Ask about a specific procedure, equipment, or emergency that this "
+        "system covers."
+    ),
+    "safeNextStep": "Rephrase your question with specific equipment or procedure names.",
+    "hiddenSource": False,
+}
+
+
+def _relevance_score(question: str, excerpt: str) -> float:
+    """
+    Token-overlap relevance score.
+
+    score = |question_tokens ∩ excerpt_tokens| / max(1, |question_tokens|)
+
+    Deterministic, no network calls.  Returns 1.0 when the question has no
+    meaningful tokens (empty question → don't gate).
+    """
+    q_tokens = _tokenize(question)
+    if not q_tokens:
+        return 1.0
+    e_tokens = _tokenize(excerpt)
+    return len(q_tokens & e_tokens) / len(q_tokens)
+
+
+def _doc_available(doc_id: str) -> bool:
+    """
+    True iff the corpus document file exists on disk with a supported extension.
+
+    Used to populate guidance.document.available so the console can decide
+    whether to render the "Open document" button.
+    """
+    if not doc_id:
+        return False
+    target = (_CORPUS_ROOT / "active" / doc_id).resolve()
+    return target.exists() and target.suffix.lower() in _SUPPORTED_DOC_EXTENSIONS
+
 
 def _tokenize(text: str) -> set[str]:
     return {t for t in re.split(r'\W+', text.lower()) if t not in _STOP_WORDS and len(t) > 2}
@@ -328,6 +389,11 @@ def _corpus_fts_retrieve(
     _clean_top = clean_lines(top_text)
     _eff_page = top_page if top_page is not None else top_chunk
 
+    # ── Relevance gate — refuse if question tokens have no overlap with excerpt
+    # Applied in both operational and training modes.
+    if _relevance_score(question, _clean_top) < _RELEVANCE_THRESHOLD:
+        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
+
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
     # Run combined text through clean_lines before parsing.
@@ -434,6 +500,9 @@ def _corpus_fts_retrieve(
             "effectiveDate": _eff_date,
             "reviewDate": _rev_date,
             "owner": _owner,
+            # True iff file exists on disk with supported extension.
+            # Console uses this to gate the "Open document" button.
+            "available": _doc_available(top_rel),
         },
         # Top-level structured procedure fields (always present, may be empty lists)
         "steps":           _pq_steps,
@@ -522,6 +591,12 @@ def _retrieve(
         return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
     _clean_ex = clean_lines(best_doc.excerpt or "")
+
+    # Relevance gate — lexical score only checks token presence in doc body;
+    # it doesn't confirm the question is *about* that document's topic.
+    if _relevance_score(question, _clean_ex) < _RELEVANCE_THRESHOLD:
+        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
+
     guidance = {
         "type": "approved",
         "summary": make_summary(_clean_ex),
@@ -535,6 +610,8 @@ def _retrieve(
             "effectiveDate": best_doc.effective_date or "",
             "reviewDate": best_doc.review_date or "",
             "owner": best_doc.owner or "",
+            # Lexical fixture docs do not have corpus files on disk.
+            "available": False,
         },
     }
     sources = [{
@@ -970,8 +1047,6 @@ def get_source_chunk(
 # ---------------------------------------------------------------------------
 # Document file download (requires auth; serves corpus active/ files)
 # ---------------------------------------------------------------------------
-
-_CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "/srv/keystone-corpus"))
 
 _DOC_MEDIA_TYPES: dict[str, str] = {
     ".pdf":  "application/pdf",
@@ -2193,89 +2268,89 @@ def get_case_timeline(
 
     query_ids = [str(r[0]) for r in query_rows]
     if not query_ids:
-        return {"case_id": case_id, "generated_at": datetime.now(timezone.utc).isoformat(), "events": []}
+        return {"case_id": case_id, "generated_at": datetime.now(timezone.utc).isoformat(), "items": []}
 
     # Build IN clause safely using numbered params
     in_params = {f"qid{i}": qid for i, qid in enumerate(query_ids)}
     in_clause = ", ".join(f":qid{i}" for i in range(len(query_ids)))
 
-    events: list[dict] = []
+    items: list[dict] = []
 
     try:
-        # Audit entries (query_created)
+        # query — one row per linked query (from audit_log)
         audit_rows = db.execute(text(f"""
             SELECT query_id, timestamp, role_used, policy_outcome
             FROM audit_log WHERE query_id IN ({in_clause})
         """), in_params).fetchall()
         for r in audit_rows:
-            events.append({
-                "ts":         r[1],
-                "event_type": "query_created",
-                "actor":      r[2],
-                "query_id":   r[0],
-                "summary":    f"Query created (outcome: {r[3]})",
-                "detail":     {"role_used": r[2], "policy_outcome": r[3]},
+            items.append({
+                "ts":          r[1].isoformat() if hasattr(r[1], "isoformat") else str(r[1]),
+                "type":        "query",
+                "title":       f"Query created — outcome: {r[3]}",
+                "detail":      {"role_used": r[2], "policy_outcome": r[3], "actor": r[2]},
+                "query_id":    r[0],
+                "document_id": None,
             })
 
-        # Operator decisions
+        # decision + review — from operator_decisions
         dec_rows = db.execute(text(f"""
             SELECT query_id, created_at_utc, created_by_username, created_by_role,
                    decision, supervisor_reviewed, supervisor_username, supervisor_reviewed_at_utc
             FROM operator_decisions WHERE query_id IN ({in_clause})
         """), in_params).fetchall()
         for r in dec_rows:
-            events.append({
-                "ts":         r[1].isoformat() if r[1] else None,
-                "event_type": "decision_recorded",
-                "actor":      r[2],
-                "query_id":   r[0],
-                "summary":    f"Decision recorded: {r[4]}",
-                "detail":     {"decision": r[4], "role": r[3]},
+            items.append({
+                "ts":          r[1].isoformat() if r[1] else None,
+                "type":        "decision",
+                "title":       f"Decision recorded: {r[4]} by {r[2]}",
+                "detail":      {"decision": r[4], "role": r[3], "actor": r[2]},
+                "query_id":    r[0],
+                "document_id": None,
             })
             if r[5] and r[7]:
-                events.append({
-                    "ts":         r[7].isoformat() if r[7] else None,
-                    "event_type": "supervisor_reviewed",
-                    "actor":      r[6] or "",
-                    "query_id":   r[0],
-                    "summary":    f"Supervisor review by {r[6]}",
-                    "detail":     {"supervisor": r[6]},
+                items.append({
+                    "ts":          r[7].isoformat() if r[7] else None,
+                    "type":        "review",
+                    "title":       f"Supervisor review by {r[6]}",
+                    "detail":      {"actor": r[6] or ""},
+                    "query_id":    r[0],
+                    "document_id": None,
                 })
 
-        # Evidence export requests
+        # evidence — from evidence_export_requests
         exp_rows = db.execute(text(f"""
             SELECT query_id, requested_by, requested_at, status, decided_by, decided_at
             FROM evidence_export_requests WHERE query_id IN ({in_clause})
         """), in_params).fetchall()
         for r in exp_rows:
-            events.append({
-                "ts":         r[2].isoformat() if r[2] else None,
-                "event_type": "export_requested",
-                "actor":      r[1],
-                "query_id":   r[0],
-                "summary":    f"Evidence export requested by {r[1]}",
-                "detail":     {},
+            items.append({
+                "ts":          r[2].isoformat() if r[2] else None,
+                "type":        "evidence",
+                "title":       f"Evidence export requested by {r[1]}",
+                "detail":      {"actor": r[1]},
+                "query_id":    r[0],
+                "document_id": None,
             })
             if r[3] in ("approved", "rejected") and r[5]:
-                events.append({
-                    "ts":         r[5].isoformat() if r[5] else None,
-                    "event_type": f"export_{r[3]}",
-                    "actor":      r[4] or "",
-                    "query_id":   r[0],
-                    "summary":    f"Export {r[3]} by {r[4]}",
-                    "detail":     {"status": r[3]},
+                items.append({
+                    "ts":          r[5].isoformat() if r[5] else None,
+                    "type":        "evidence",
+                    "title":       f"Evidence export {r[3]} by {r[4]}",
+                    "detail":      {"status": r[3], "actor": r[4] or ""},
+                    "query_id":    r[0],
+                    "document_id": None,
                 })
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error building timeline: {exc}")
 
-    # Sort by ts; nulls last
-    events.sort(key=lambda e: (e["ts"] is None, e["ts"] or ""))
+    # Stable sort: ts asc (nulls last), then type, then query_id
+    items.sort(key=lambda e: (e["ts"] is None, e["ts"] or "", e["type"], e.get("query_id") or ""))
 
     return {
         "case_id":      case_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "events":       events,
+        "items":        items,
     }
 
 
