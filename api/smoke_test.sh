@@ -277,6 +277,38 @@ cur.execute(\"DELETE FROM corpus_documents WHERE rel_path = 'smoke-test.txt'\")
 conn.commit(); cur.close(); conn.close()
 print('smoke corpus cleaned up')
   ")
+
+  # 14e. Reranker: decon question must not return TOC/front-matter chunk.
+  echo "--- 14e. Reranker: decon question skips TOC ---"
+  DECON_Q=$(curl -sf -X POST "$BASE/query" \
+    -H 'Content-Type: application/json' \
+    -H "$(auth_header "$TOKEN")" \
+    -d '{"question":"How to use the rescue decon machine?","mode":"operational"}')
+  DECON_QID=$(echo "$DECON_Q" | python3 -c "import sys,json; print(json.load(sys.stdin)['query_id'])")
+  DECON_GUIDANCE=$(curl -sf "$BASE/guidance/$DECON_QID" -H "$(auth_header "$TOKEN")")
+
+  DECON_TYPE=$(echo "$DECON_GUIDANCE" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance']['type'])")
+  [ "$DECON_TYPE" = "approved" ] \
+    && pass "reranker: decon question returns approved" \
+    || fail "reranker: decon returned $DECON_TYPE (expected approved)"
+
+  DECON_EXCERPT=$(echo "$DECON_GUIDANCE" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance'].get('excerpt',''))")
+  echo "$DECON_EXCERPT" | python3 -c "
+import sys
+text = sys.stdin.read().upper()
+if 'CONTENTS' in text:
+    print('  excerpt snippet:', text[:200])
+    sys.exit(1)
+" && pass "reranker: excerpt does not contain 'CONTENTS'" \
+  || fail "reranker: excerpt contains 'CONTENTS' — TOC chunk was returned"
+
+  DECON_PAGE=$(echo "$DECON_GUIDANCE" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['guidance'].get('document',{}).get('page','0'))")
+  [ "$DECON_PAGE" != "0" ] \
+    && pass "reranker: page=$DECON_PAGE (not front-matter chunk 0)" \
+    || fail "reranker: page=0 — front-matter/TOC chunk was returned"
 fi
 
 echo ""
