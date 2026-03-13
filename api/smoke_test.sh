@@ -194,6 +194,7 @@ SPOOF_CITES=$(curl -sf "$BASE/audit/$SPOOF_QID" -H "$(auth_header "$TOKEN")" \
 #   c) Real corpus query: citation is a document file (.pdf or .docx)
 #   d) Clean up synthetic doc from DB
 
+
 if [[ "${RUN_CORPUS_INGEST_TEST:-0}" == "1" ]]; then
   echo "=== 14. Corpus FTS ingest smoke test ==="
 
