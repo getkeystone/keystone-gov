@@ -6,8 +6,11 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query as QueryParam
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session as DBSession
 
@@ -694,6 +697,83 @@ def get_source(
         excerpt=doc.excerpt or "",
         highlight=doc.highlight or "",
         notes=doc.notes_json or [],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Document file download (requires auth; serves corpus active/ files)
+# ---------------------------------------------------------------------------
+
+_CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "/srv/keystone-corpus"))
+
+_DOC_MEDIA_TYPES: dict[str, str] = {
+    ".pdf":  "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+@app.get("/document/{document_id:path}")
+def get_document(
+    document_id: str,
+    mode: str = QueryParam(default="operational", pattern="^(operational|training)$"),
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    """
+    Serve a corpus document file from CORPUS_ROOT/active/<document_id>.
+
+    Mode gating:
+      - operational: document must be present in corpus_documents (implicitly active)
+      - training:    same (all ingested corpus docs are active; superseded is not
+                     implemented at corpus level yet)
+      - restricted docs: corpus_documents has no restricted concept — all served docs
+                         are active. Seeded fixtures with min_role_level > 0 are NOT
+                         served here; use /source for those.
+
+    Security:
+      - Path is resolved and checked to be under CORPUS_ROOT/active/ (no traversal).
+      - Only .pdf and .docx are served; others return 415.
+      - File must exist in corpus_documents table (existence not guessable).
+    """
+    # Validate document exists in DB (prevents guessing arbitrary filenames).
+    try:
+        doc_row = db.execute(
+            text("SELECT rel_path FROM corpus_documents WHERE rel_path = :rel"),
+            {"rel": document_id},
+        ).fetchone()
+    except Exception:
+        db.rollback()
+        doc_row = None
+
+    if not doc_row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Resolve filesystem path and prevent path traversal.
+    active_root = (_CORPUS_ROOT / "active").resolve()
+    target = (active_root / document_id).resolve()
+
+    if not str(target).startswith(str(active_root) + "/") and target != active_root:
+        raise HTTPException(status_code=400, detail="Invalid document path")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Document file not found on disk")
+
+    suffix = target.suffix.lower()
+    media_type = _DOC_MEDIA_TYPES.get(suffix)
+    if not media_type:
+        raise HTTPException(status_code=415, detail=f"Unsupported document type: {suffix}")
+
+    # PDFs: inline so browser renders in-tab; DOCX: attachment for download.
+    disposition = "inline" if suffix == ".pdf" else "attachment"
+    filename = target.name
+
+    return FileResponse(
+        path=str(target),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 
