@@ -74,7 +74,20 @@ _PROCEDURAL = re.compile(
     r'\b(?:operat(?:ion|e|ing|ional)|procedur(?:e|es|al)|steps?\b|start(?:ing|up)?'
     r'|shutdown|troubleshoot(?:ing)?|maintenanc(?:e|ing)|alarm|warning|caution'
     r'|danger|decontaminat|decon|rescue|hazmat|response|deploy|activat|emergency'
-    r'|instruction|manual|guidanc|protocol)\b',
+    r'|instruction|guidanc|protocol)\b',
+    re.IGNORECASE,
+)
+
+# Front-matter signals: vendor name, city/state, copyright, URLs, "user manual"
+_FRONT_MATTER_SIGNAL = re.compile(
+    r'rescueintellitech|katy[\s,]+tx|copyright|all\s+rights\s+reserved'
+    r'|user[\s\-_]*manual|www\.\S+\.\S+|https?://\S+',
+    re.IGNORECASE,
+)
+
+# Numbered step pattern: "1." / "Step 1" / "1)" at line start (boost signal)
+_NUMBERED_STEP = re.compile(
+    r'(?:^|\n)\s*(?:step\s+\d+|(?:\d+)[.)]\s)',
     re.IGNORECASE,
 )
 
@@ -85,12 +98,15 @@ def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
 
     Penalties:
       - "table of contents" / "contents" keyword  → ×0.10
+      - Front-matter signals (vendor, city/state, copyright, URL, "user manual")
+                                                   → ×0.05
       - Digit density > 8 %                        → ×(0.1 … 1.0)
       - Section-number density > 12 %              → ×0.20
       - First chunk of document (chunk_index == 0) → ×0.50
 
     Boosts:
       - Each procedural signal word                → ×(1.0 + min(n×0.25, 2.0))
+      - Numbered-step patterns (Step 1, 1., 2))    → ×1.50
     """
     score = float(fts_rank)
 
@@ -98,6 +114,9 @@ def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
 
     if _TOC_SIGNAL.search(lower):
         score *= 0.10
+
+    if _FRONT_MATTER_SIGNAL.search(text):
+        score *= 0.05
 
     n_chars = max(len(text), 1)
     digit_density = sum(1 for c in text if c.isdigit()) / n_chars
@@ -116,6 +135,9 @@ def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     if n_proc > 0:
         score *= 1.0 + min(n_proc * 0.25, 2.0)
 
+    if _NUMBERED_STEP.search(text):
+        score *= 1.50
+
     return score
 
 
@@ -123,10 +145,10 @@ def _is_toc_like(chunk_index: int, text: str) -> bool:
     """Return True if chunk is almost certainly TOC or front-matter.
 
     Criteria (any one is sufficient):
-      - Contains "table of contents" or bare "contents" heading (matches _TOC_SIGNAL)
+      - Contains "table of contents" or bare "contents" heading
       - Section-number density > 12 % of words  (e.g. "1.1  Foo  1.2  Bar …")
-      - First chunk of document AND no procedural signals
-        (title pages / cover sheets are index-0 with no step/operation text)
+      - Front-matter signals (vendor name, city/state, copyright, URL, user manual)
+      - First chunk AND no procedural signals (title pages / cover sheets)
     """
     lower = text.lower()
     if _TOC_SIGNAL.search(lower):
@@ -134,6 +156,8 @@ def _is_toc_like(chunk_index: int, text: str) -> bool:
     n_words = max(len(text.split()), 1)
     n_section_nums = len(_SECTION_NUM.findall(text))
     if n_section_nums / n_words > 0.12:
+        return True
+    if _FRONT_MATTER_SIGNAL.search(text):
         return True
     if chunk_index == 0 and not _PROCEDURAL.search(text):
         return True
