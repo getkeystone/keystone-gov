@@ -71,25 +71,42 @@ def is_supported_mime(mime: str) -> bool:
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
-def extract_text_pdf(path: Path) -> str:
-    """Try pypdf first; fall back to pdftotext (poppler-utils)."""
-    text = ""
+def _extract_pdf_by_page(path: Path) -> list[tuple[int, str]]:
+    """
+    Extract text per page from a PDF using pypdf.
+
+    Returns a list of (page_num_1based, text) for pages that have extractable
+    text.  Returns an empty list if pypdf is unavailable, raises, or yields no
+    text on any page (image-only / encrypted PDF).
+    """
     try:
         from pypdf import PdfReader
         reader = PdfReader(str(path))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+        result = []
+        for i, pg in enumerate(reader.pages):
+            t = (pg.extract_text() or "").strip()
+            if t:
+                result.append((i + 1, t))
+        return result
     except Exception:
-        pass
-    if not text:
-        try:
-            result = subprocess.run(
-                ["pdftotext", "-layout", str(path), "-"],
-                capture_output=True, text=True, timeout=60,
-            )
-            text = result.stdout.strip()
-        except Exception:
-            pass
-    return text
+        return []
+
+
+def extract_text_pdf(path: Path) -> str:
+    """Full-document PDF extraction (whole text, no page tracking).
+
+    Used as a fallback when pypdf per-page extraction yields nothing.
+    Tries pdftotext (poppler-utils) only; pypdf whole-doc is skipped here
+    because if it failed per-page it will fail again.
+    """
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", str(path), "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
 
 
 def extract_text_docx(path: Path) -> str:
@@ -231,39 +248,82 @@ def main() -> None:
         # ── Extract text BEFORE touching the DB ───────────────────────────────
         # This guarantees that if extraction fails, the previous good version
         # in the DB is never touched.
+        #
+        # For PDFs we attempt per-page extraction (pypdf) so each chunk carries
+        # its 1-based page number.  When that yields nothing we fall back to
+        # whole-document pdftotext; page is then NULL for every chunk.
+        # For DOCX / text files page is always NULL.
+        #
+        # chunks_data: list of (chunk_index, page_or_None, chunk_text)
 
-        try:
-            text = extract_text(fpath, mime)
-        except Exception as exc:
-            reason = "EXTRACTION_ERROR"
-            detail = str(exc)
-            if action == "updated":
-                stats["skipped_keep_previous"] += 1
-                stats["docs"].append({
-                    "rel_path": rel,
-                    "action":   "skipped_keep_previous",
-                    "reason":   reason,
-                    "detail":   detail,
-                })
-                stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
-                print(
-                    f"  WARN [{rel}] EXTRACTION_ERROR (sha changed) — "
-                    f"preserving previous DB version: {exc}",
-                    file=sys.stderr,
-                )
+        chunks_data: list[tuple[int, int | None, str]] = []
+
+        if mime == "application/pdf":
+            page_texts = _extract_pdf_by_page(fpath)
+            if page_texts:
+                idx = 0
+                for page_num, page_text in page_texts:
+                    for chunk_str in chunk_text(page_text):
+                        chunks_data.append((idx, page_num, chunk_str))
+                        idx += 1
             else:
-                stats["failed"] += 1
-                stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason, "detail": detail})
-                stats["failed_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
-                print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
-            continue
+                # pypdf per-page gave nothing; try pdftotext whole-doc fallback.
+                try:
+                    full_text = extract_text_pdf(fpath)
+                except Exception as exc:
+                    reason = "EXTRACTION_ERROR"
+                    detail = str(exc)
+                    if action == "updated":
+                        stats["skipped_keep_previous"] += 1
+                        stats["docs"].append({
+                            "rel_path": rel, "action": "skipped_keep_previous",
+                            "reason": reason, "detail": detail,
+                        })
+                        stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                        print(
+                            f"  WARN [{rel}] EXTRACTION_ERROR (sha changed) — "
+                            f"preserving previous DB version: {exc}", file=sys.stderr,
+                        )
+                    else:
+                        stats["failed"] += 1
+                        stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason, "detail": detail})
+                        stats["failed_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                        print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
+                    continue
+                for idx, chunk_str in enumerate(chunk_text(full_text)):
+                    chunks_data.append((idx, None, chunk_str))
+        else:
+            # DOCX / text — no page tracking.
+            try:
+                full_text = extract_text(fpath, mime)
+            except Exception as exc:
+                reason = "EXTRACTION_ERROR"
+                detail = str(exc)
+                if action == "updated":
+                    stats["skipped_keep_previous"] += 1
+                    stats["docs"].append({
+                        "rel_path": rel, "action": "skipped_keep_previous",
+                        "reason": reason, "detail": detail,
+                    })
+                    stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                    print(
+                        f"  WARN [{rel}] EXTRACTION_ERROR (sha changed) — "
+                        f"preserving previous DB version: {exc}", file=sys.stderr,
+                    )
+                else:
+                    stats["failed"] += 1
+                    stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason, "detail": detail})
+                    stats["failed_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                    print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
+                continue
+            for idx, chunk_str in enumerate(chunk_text(full_text)):
+                chunks_data.append((idx, None, chunk_str))
 
-        if not text:
+        if not chunks_data:
             # Image-only PDF, encrypted doc, or supported format with no extractable content.
             # Do NOT write placeholder chunks — that poisons FTS with noise.
             reason = "NO_TEXT_EXTRACTED"
             if action == "updated":
-                # A previous good version exists in the DB. Keep it intact.
                 stats["skipped_keep_previous"] += 1
                 stats["docs"].append({
                     "rel_path": rel,
@@ -278,7 +338,6 @@ def main() -> None:
                     file=sys.stderr,
                 )
             else:
-                # New doc, no text, nothing to fall back on.
                 stats["failed"] += 1
                 stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason})
                 stats["failed_docs"].append({"rel_path": rel, "reason": reason})
@@ -287,10 +346,7 @@ def main() -> None:
 
         # ── Write to DB only after confirmed good text ────────────────────────
 
-        chunks = chunk_text(text)
-
         if action == "updated":
-            # doc_id is set (row existed); clear stale chunks first.
             cur.execute("DELETE FROM corpus_chunks WHERE doc_id = %s", (doc_id,))
             cur.execute(
                 """UPDATE corpus_documents
@@ -306,16 +362,18 @@ def main() -> None:
             )
             doc_id = cur.fetchone()[0]
 
-        for idx, chunk in enumerate(chunks):
+        for chunk_index, page_num, chunk_str in chunks_data:
             cur.execute(
-                """INSERT INTO corpus_chunks (doc_id, chunk_index, text)
-                   VALUES (%s, %s, %s)
-                   ON CONFLICT (doc_id, chunk_index) DO UPDATE SET text = EXCLUDED.text""",
-                (doc_id, idx, chunk),
+                """INSERT INTO corpus_chunks (doc_id, chunk_index, page, text)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (doc_id, chunk_index)
+                   DO UPDATE SET text = EXCLUDED.text, page = EXCLUDED.page""",
+                (doc_id, chunk_index, page_num, chunk_str),
             )
 
         conn.commit()
 
+        n_pages = len({pg for _, pg, _ in chunks_data if pg is not None})
         if action == "added":
             stats["added"] += 1
         else:
@@ -324,8 +382,9 @@ def main() -> None:
         stats["docs"].append({
             "rel_path": rel,
             "action":   action,
-            "chunks":   len(chunks),
-            "chars":    len(text),
+            "chunks":   len(chunks_data),
+            "pages":    n_pages or None,
+            "chars":    sum(len(c) for _, _, c in chunks_data),
         })
 
     cur.close()

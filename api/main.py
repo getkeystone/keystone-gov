@@ -217,7 +217,8 @@ def _corpus_fts_retrieve(
                 cd.title,
                 cc.chunk_index,
                 cc.text,
-                ts_rank_cd(cc.tsv, query) AS rank
+                ts_rank_cd(cc.tsv, query) AS rank,
+                cc.page
             FROM corpus_chunks cc
             JOIN corpus_documents cd ON cd.id = cc.doc_id
             CROSS JOIN websearch_to_tsquery('english', :q) query
@@ -246,7 +247,7 @@ def _corpus_fts_retrieve(
         reverse=True,
     )
 
-    top_rel, top_title, top_chunk, top_text, _ = reranked[0]
+    top_rel, top_title, top_chunk, top_text, _, top_page = reranked[0]
 
     # If the best candidate still looks like TOC, try a document-level fallback:
     # fetch the first procedural (non-TOC) chunks from the same matched docs.
@@ -254,7 +255,7 @@ def _corpus_fts_retrieve(
         matched_docs = list({r[0] for r in reranked[:5]})
         fallback_rows = db.execute(
             text("""
-                SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text
+                SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text, cc.page
                 FROM corpus_chunks cc
                 JOIN corpus_documents cd ON cd.id = cc.doc_id
                 WHERE cd.rel_path = ANY(:docs)
@@ -273,9 +274,11 @@ def _corpus_fts_retrieve(
             reverse=True,
         )
 
-        for fb_rel, fb_title, fb_chunk, fb_text in fallback_reranked:
+        for fb_rel, fb_title, fb_chunk, fb_text, fb_page in fallback_reranked:
             if not _is_toc_like(fb_chunk, fb_text):
-                top_rel, top_title, top_chunk, top_text = fb_rel, fb_title, fb_chunk, fb_text
+                top_rel, top_title, top_chunk, top_text, top_page = (
+                    fb_rel, fb_title, fb_chunk, fb_text, fb_page
+                )
                 break
         else:
             # All candidates — including fallback — look like TOC/front-matter.
@@ -297,6 +300,7 @@ def _corpus_fts_retrieve(
             return guidance, "refused", [], []
 
     _clean_top = clean_lines(top_text)
+    _eff_page = top_page if top_page is not None else top_chunk
     guidance = {
         "type": "approved",
         "summary": make_summary(_clean_top),
@@ -304,8 +308,9 @@ def _corpus_fts_retrieve(
         "document": {
             "documentId": top_rel,
             "title": top_title,
-            "section": f"chunk {top_chunk}",
-            "page": top_chunk,
+            "section": f"page {top_page}" if top_page is not None else f"chunk {top_chunk}",
+            "page": _eff_page,
+            "chunkIndex": top_chunk,
             "status": "active",
             "effectiveDate": "",
             "reviewDate": "",
@@ -320,19 +325,21 @@ def _corpus_fts_retrieve(
             "title": title,
             "status": "active",
             "allowed": True,
-            "page": chunk_idx,
-            "section": f"chunk {chunk_idx}",
+            "page": pg if pg is not None else chunk_idx,
+            "chunkIndex": chunk_idx,
+            "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
             "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
         }
-        for rel_path, title, chunk_idx, _text, rank in top5
+        for rel_path, title, chunk_idx, _text, rank, pg in top5
     ]
     citations = [
         {
             "documentId": rel_path,
             "chunkIndex": chunk_idx,
-            "snippet": chunk_text[:300],
+            "page": pg,
+            "snippet": chunk_text_val[:300],
         }
-        for rel_path, _title, chunk_idx, chunk_text, _rank in top5
+        for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg in top5
     ]
     return guidance, "allowed", sources, citations
 
@@ -724,6 +731,54 @@ def get_source(
         excerpt=doc.excerpt or "",
         highlight=doc.highlight or "",
         notes=doc.notes_json or [],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source by chunk index (corpus only; used when page is null)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/source-chunk/{document_id:path}", response_model=SourceResponse)
+def get_source_chunk(
+    document_id: str,
+    chunk_index: int,
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
+    """Fetch a corpus source page by chunk_index instead of PDF page number.
+    Used by the UI when guidance.document.chunkIndex is known but page is null.
+    """
+    try:
+        corpus_row = db.execute(
+            text("""
+                SELECT cd.rel_path, cd.title, cc.text, cc.page
+                FROM corpus_documents cd
+                JOIN corpus_chunks cc ON cc.doc_id = cd.id
+                WHERE cd.rel_path = :rel AND cc.chunk_index = :idx
+            """),
+            {"rel": document_id, "idx": chunk_index},
+        ).fetchone()
+    except Exception:
+        db.rollback()
+        corpus_row = None
+
+    if not corpus_row:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    rel_path, title, chunk_text_val, page_num = corpus_row
+    return SourceResponse(
+        documentId=rel_path,
+        page=page_num if page_num is not None else chunk_index,
+        title=title,
+        section=f"page {page_num}" if page_num is not None else f"chunk {chunk_index}",
+        status="active",
+        effectiveDate="",
+        reviewDate="",
+        owner="",
+        excerpt=(chunk_text_val or "")[:800],
+        highlight="",
+        notes=[],
     )
 
 
