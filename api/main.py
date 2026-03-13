@@ -58,6 +58,85 @@ _ACL_REFUSAL_GUIDANCE = {
 }
 
 # ---------------------------------------------------------------------------
+# Chunk reranker — penalizes TOC/front-matter, boosts procedural content
+# ---------------------------------------------------------------------------
+
+_TOC_SIGNAL = re.compile(
+    r'\btable[\s\-_]*of[\s\-_]*contents\b|\bcontents\b',
+    re.IGNORECASE,
+)
+_SECTION_NUM = re.compile(r'\b\d+(\.\d+)+\b')
+_PROCEDURAL = re.compile(
+    r'\b(?:operat(?:ion|e|ing|ional)|procedur(?:e|es|al)|steps?\b|start(?:ing|up)?'
+    r'|shutdown|troubleshoot(?:ing)?|maintenanc(?:e|ing)|alarm|warning|caution'
+    r'|danger|decontaminat|decon|rescue|hazmat|response|deploy|activat|emergency'
+    r'|instruction|manual|guidanc|protocol)\b',
+    re.IGNORECASE,
+)
+
+
+def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
+    """
+    Deterministic reranker score (higher = prefer this chunk).
+
+    Penalties:
+      - "table of contents" / "contents" keyword  → ×0.10
+      - Digit density > 8 %                        → ×(0.1 … 1.0)
+      - Section-number density > 12 %              → ×0.20
+      - First chunk of document (chunk_index == 0) → ×0.50
+
+    Boosts:
+      - Each procedural signal word                → ×(1.0 + min(n×0.25, 2.0))
+    """
+    score = float(fts_rank)
+
+    lower = text.lower()
+
+    if _TOC_SIGNAL.search(lower):
+        score *= 0.10
+
+    n_chars = max(len(text), 1)
+    digit_density = sum(1 for c in text if c.isdigit()) / n_chars
+    if digit_density > 0.08:
+        score *= max(0.10, 1.0 - digit_density * 4)
+
+    n_words = max(len(text.split()), 1)
+    n_section_nums = len(_SECTION_NUM.findall(text))
+    if n_section_nums / n_words > 0.12:
+        score *= 0.20
+
+    if chunk_index == 0:
+        score *= 0.50
+
+    n_proc = len(_PROCEDURAL.findall(text))
+    if n_proc > 0:
+        score *= 1.0 + min(n_proc * 0.25, 2.0)
+
+    return score
+
+
+def _is_toc_like(chunk_index: int, text: str) -> bool:
+    """Return True if chunk is almost certainly TOC or front-matter.
+
+    Criteria (any one is sufficient):
+      - Contains "table of contents" or bare "contents" heading (matches _TOC_SIGNAL)
+      - Section-number density > 12 % of words  (e.g. "1.1  Foo  1.2  Bar …")
+      - First chunk of document AND no procedural signals
+        (title pages / cover sheets are index-0 with no step/operation text)
+    """
+    lower = text.lower()
+    if _TOC_SIGNAL.search(lower):
+        return True
+    n_words = max(len(text.split()), 1)
+    n_section_nums = len(_SECTION_NUM.findall(text))
+    if n_section_nums / n_words > 0.12:
+        return True
+    if chunk_index == 0 and not _PROCEDURAL.search(text):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Retrieval engine (lexical scoring)
 # ---------------------------------------------------------------------------
 
@@ -116,7 +195,7 @@ def _corpus_fts_retrieve(
             CROSS JOIN websearch_to_tsquery('english', :q) query
             WHERE cc.tsv @@ query
             ORDER BY rank DESC
-            LIMIT 5
+            LIMIT 50
         """),
         {"q": question},
     ).fetchall()
@@ -132,7 +211,62 @@ def _corpus_fts_retrieve(
         }
         return guidance, "refused", [], []
 
-    top_rel, top_title, top_chunk, top_text, _ = rows[0]
+    # Rerank: penalize TOC/front-matter chunks, boost procedural content.
+    reranked = sorted(
+        rows,
+        key=lambda r: _rerank_score(r[2], r[3], r[4]),
+        reverse=True,
+    )
+
+    top_rel, top_title, top_chunk, top_text, _ = reranked[0]
+
+    # If the best candidate still looks like TOC, try a document-level fallback:
+    # fetch the first procedural (non-TOC) chunks from the same matched docs.
+    if _is_toc_like(top_chunk, top_text):
+        matched_docs = list({r[0] for r in reranked[:5]})
+        fallback_rows = db.execute(
+            text("""
+                SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text
+                FROM corpus_chunks cc
+                JOIN corpus_documents cd ON cd.id = cc.doc_id
+                WHERE cd.rel_path = ANY(:docs)
+                  AND cc.chunk_index > 0
+                ORDER BY cd.rel_path, cc.chunk_index ASC
+                LIMIT 40
+            """),
+            {"docs": matched_docs},
+        ).fetchall()
+
+        # Rerank with a neutral base score; procedural boosts differentiate them.
+        _BASE = 0.001
+        fallback_reranked = sorted(
+            fallback_rows,
+            key=lambda r: _rerank_score(r[2], r[3], _BASE),
+            reverse=True,
+        )
+
+        for fb_rel, fb_title, fb_chunk, fb_text in fallback_reranked:
+            if not _is_toc_like(fb_chunk, fb_text):
+                top_rel, top_title, top_chunk, top_text = fb_rel, fb_title, fb_chunk, fb_text
+                break
+        else:
+            # All candidates — including fallback — look like TOC/front-matter.
+            guidance = {
+                "type": "refusal",
+                "reasonCode": "NO_PROCEDURE_FOUND",
+                "title": "No procedural section found",
+                "message": (
+                    "The documents matched your question but only returned "
+                    "table-of-contents or front-matter sections. "
+                    "Try a more specific question about the procedure or step you need."
+                ),
+                "safeNextStep": (
+                    "Ask about a specific operation, step, or maintenance task "
+                    "by name (e.g. 'decon machine startup steps')."
+                ),
+                "hiddenSource": False,
+            }
+            return guidance, "refused", [], []
 
     guidance = {
         "type": "approved",
@@ -149,6 +283,8 @@ def _corpus_fts_retrieve(
             "owner": "",
         },
     }
+    # Return top 5 reranked candidates as sources/citations.
+    top5 = reranked[:5]
     sources = [
         {
             "documentId": rel_path,
@@ -157,9 +293,9 @@ def _corpus_fts_retrieve(
             "allowed": True,
             "page": chunk_idx,
             "section": f"chunk {chunk_idx}",
-            "note": f"FTS rank {rank:.4f}",
+            "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
         }
-        for rel_path, title, chunk_idx, _text, rank in rows
+        for rel_path, title, chunk_idx, _text, rank in top5
     ]
     citations = [
         {
@@ -167,7 +303,7 @@ def _corpus_fts_retrieve(
             "chunkIndex": chunk_idx,
             "snippet": chunk_text[:300],
         }
-        for rel_path, _title, chunk_idx, chunk_text, _rank in rows
+        for rel_path, _title, chunk_idx, chunk_text, _rank in top5
     ]
     return guidance, "allowed", sources, citations
 
