@@ -99,6 +99,33 @@ _NUMBERED_STEP = re.compile(
     re.IGNORECASE,
 )
 
+# ── Electrical-injury vs AED-shock-delivery disambiguation ──────────────────
+# When a query is about treating an electric-shock victim (electrical_injury
+# intent), penalize chunks about AED shock delivery (the device shocking the
+# patient) so CPR/first-aid content ranks above AED-operation content.
+
+# Triggers electrical_injury intent detection on the query side.
+_ELECTRICAL_INJURY_INTENT = re.compile(
+    r'\belectric(?:al)?\s+shock\b|\belectrocut(?:ed|ion)\b'
+    r'|\bshock\s+victim\b|\belectrical\s+injur(?:y|ies)\b',
+    re.IGNORECASE,
+)
+
+# Markers in a *chunk* that indicate AED shock-delivery content (not victim care).
+_AED_DELIVERY_MARKERS = re.compile(
+    r'\baed\b|\bdefibrillat(?:e|ion|or|ing)\b'
+    r'|\bshock\s+(?:advised|delivered|indicated)\b'
+    r'|\banalyzing\s+rhythm\b|\bshockable\s+rhythm\b',
+    re.IGNORECASE,
+)
+
+# Markers in a *chunk* that confirm electrical-injury treatment content.
+_ELECTRICAL_INJURY_MARKERS = re.compile(
+    r'\belectrocut(?:ed|ion)\b|\belectric(?:al)?\s+(?:shock|burn|injur)\b'
+    r'|\bcardiac\s+arrest\b|\bcpr\b|\bresuscitat',
+    re.IGNORECASE,
+)
+
 
 def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     """
@@ -328,6 +355,21 @@ def _corpus_fts_retrieve(
         key=lambda r: _rerank_score(r[2], r[3], r[4]),
         reverse=True,
     )
+
+    # Intent-based secondary rerank: if the question is about treating an
+    # electric-shock victim (electrical_injury intent), penalize AED shock-
+    # delivery chunks and boost electrical-injury treatment chunks so that
+    # CPR/first-aid content ranks above AED-operation content.
+    if _ELECTRICAL_INJURY_INTENT.search(question):
+        def _intent_score(row: tuple) -> float:
+            _ri, _ti, ci, txt, rank, _pg = row
+            base = _rerank_score(ci, txt, rank)
+            if _AED_DELIVERY_MARKERS.search(txt):
+                base *= 0.25  # penalize AED shock-delivery content
+            if _ELECTRICAL_INJURY_MARKERS.search(txt):
+                base *= 1.60  # boost electrical-injury treatment content
+            return base
+        reranked = sorted(rows, key=_intent_score, reverse=True)
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page = reranked[0]
     _toc_filtered = False
