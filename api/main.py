@@ -29,6 +29,7 @@ from schemas import (
     SourceResponse,
 )
 from seed import DEMO_QUERIES, seed_demo_data
+from text_clean import clean_lines, make_summary
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -271,10 +272,11 @@ def _corpus_fts_retrieve(
             }
             return guidance, "refused", [], []
 
+    _clean_top = clean_lines(top_text)
     guidance = {
         "type": "approved",
-        "summary": top_text[:200],
-        "excerpt": top_text[:800],
+        "summary": make_summary(_clean_top),
+        "excerpt": _clean_top[:800],
         "document": {
             "documentId": top_rel,
             "title": top_title,
@@ -356,10 +358,11 @@ def _retrieve(
     if best_doc.min_role_level > role_level:
         return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
+    _clean_ex = clean_lines(best_doc.excerpt or "")
     guidance = {
         "type": "approved",
-        "summary": (best_doc.excerpt or "")[:200],
-        "excerpt": best_doc.excerpt or "",
+        "summary": make_summary(_clean_ex),
+        "excerpt": _clean_ex[:800],
         "document": {
             "documentId": best_doc.document_id,
             "title": best_doc.title,
