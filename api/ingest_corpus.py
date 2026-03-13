@@ -51,14 +51,24 @@ _MEDICAL_EMR_SIGNALS = re.compile(
     re.IGNORECASE,
 )
 
-_VALID_DOMAINS = frozenset({"fire_ops", "medical_emr"})
+_LRFD_SIGNALS = re.compile(
+    r'\b(?:lrfd|structural[\s\-]?protocol|load[\s\-]?bearing|roof[\s\-]?load'
+    r'|floor[\s\-]?collapse|structural[\s\-]?triage|collapse[\s\-]?zone'
+    r'|truss[\s\-]?assessment|parapet|bowstring|i[\s\-]?joist)\b',
+    re.IGNORECASE,
+)
+
+_VALID_DOMAINS = frozenset({"fire_ops", "medical_emr", "lrfd_protocol"})
 
 
 def _infer_domain(rel_path: str, title: str) -> str:
-    """Return 'medical_emr' if the filename/title match EMR signals; else 'fire_ops'."""
+    """Return domain inferred from filename/title; medical_emr checked first, then lrfd_protocol."""
     stem = Path(rel_path).stem.lower().replace("_", " ").replace("-", " ")
-    if _MEDICAL_EMR_SIGNALS.search(stem) or _MEDICAL_EMR_SIGNALS.search(title.lower()):
+    title_lower = title.lower()
+    if _MEDICAL_EMR_SIGNALS.search(stem) or _MEDICAL_EMR_SIGNALS.search(title_lower):
         return "medical_emr"
+    if _LRFD_SIGNALS.search(stem) or _LRFD_SIGNALS.search(title_lower):
+        return "lrfd_protocol"
     return "fire_ops"
 
 # ── Configuration ─────────────────────────────────────────────────────────────

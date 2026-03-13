@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel
 
 
@@ -15,7 +15,7 @@ class LoginResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    mode: str
+    mode: Literal["operational", "training", "medical_reference"]
     # role is accepted for backward-compat but ignored — server derives from token
     role: Optional[str] = None
     # scenario_key is an admin-only override; ignored for non-admin sessions

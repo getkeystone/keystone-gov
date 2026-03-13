@@ -560,17 +560,30 @@ def _corpus_fts_retrieve(
     elif _pq["decision"] == "weak":
         _pq_notice = "LOW_CONFIDENCE"
 
-    # ── Medical EMR gate — operational mode, medical_emr domain ─────────────
-    # In operational mode, medical EMR documents must meet a higher confidence
-    # bar than fire-ops documents.  A weak or rejected procedure extraction is
-    # refused outright rather than shown with a LOW_CONFIDENCE notice, because
-    # imprecise medical guidance can cause harm.
-    #
-    # When quality IS sufficient, an EMR disclaimer notice is added so the
-    # officer always sees the governance boundary (metadata-driven, not
-    # hardcoded to any specific document ID or title).
-    if mode == "operational" and _top_domain == "medical_emr":
-        if _pq["decision"] in ("reject", "weak") or _pq_notice in ("PROCEDURE_EXTRACT_REJECTED",):
+    # ── Policy gate A: operational + weak/rejected (non-medical) → LOW_CONFIDENCE
+    # Fire-ops and lrfd_protocol documents with weak procedure quality are refused
+    # in operational mode.  medical_emr is handled separately below.
+    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject"):
+        return {
+            "type": "refusal",
+            "reasonCode": "LOW_CONFIDENCE",
+            "title": "Low confidence — guidance withheld",
+            "message": (
+                "The system found a relevant document but could not extract "
+                "a high-confidence procedure. Operational use requires clear "
+                "procedure structure."
+            ),
+            "safeNextStep": "Consult your supervisor or training officer for the current procedure.",
+            "hiddenSource": False,
+        }, "refused", [], []
+
+    # ── Policy gate B: medical_emr domain requires medical_reference mode ────
+    # Any mode other than medical_reference that retrieves a medical_emr document
+    # is refused with MEDICAL_MODE_REQUIRED so the operator must explicitly
+    # opt in to the reference card path.
+    if _top_domain == "medical_emr" and mode != "medical_reference":
+        # Special case: operational + low-confidence medical → existing LOW_CONFIDENCE_MEDICAL code
+        if mode == "operational" and _pq["decision"] in ("reject", "weak"):
             return {
                 "type": "refusal",
                 "reasonCode": "LOW_CONFIDENCE_MEDICAL",
@@ -586,13 +599,92 @@ def _corpus_fts_retrieve(
                 ),
                 "hiddenSource": False,
             }, "refused", [], []
-        # High-confidence medical EMR result — add pilot disclaimer.
-        _emr_notice = (
-            "MEDICAL_EMR: EMR reference only. "
-            "Follow local protocol and medical direction. "
-            "Call medical control when required."
+        # All other non-medical_reference modes: require explicit mode selection.
+        return {
+            "type": "refusal",
+            "reasonCode": "MEDICAL_MODE_REQUIRED",
+            "title": "Medical Reference mode required",
+            "message": "Medical content requires Medical Reference mode.",
+            "safeNextStep": "Use approved medical protocols or medical control.",
+            "hiddenSource": False,
+        }, "refused", [], []
+
+    # ── Policy gate C: medical_reference mode → reference card ───────────────
+    # Returns type="reference" (not "approved") with a hard disclaimer.
+    # Steps/procedure card suppressed; only excerpt + key points shown.
+    if mode == "medical_reference":
+        if _top_domain != "medical_emr":
+            # medical_reference mode matched a non-EMR document — refuse.
+            return {
+                "type": "refusal",
+                "reasonCode": "NO_RELEVANT_PROCEDURE",
+                "title": "No medical reference document found",
+                "message": "No medical EMR document matched your question.",
+                "safeNextStep": "Use approved medical protocols or medical control.",
+                "hiddenSource": False,
+            }, "refused", [], []
+        _emr_disclaimer = (
+            "This is a reference excerpt only — NOT an approved operational protocol. "
+            "Follow your agency's standing orders and medical director guidance."
         )
-        _notice = _emr_notice if not _notice else f"{_emr_notice} | {_notice}"
+        top5 = reranked[:5]
+        ref_sources = [
+            {
+                "documentId": rel_path,
+                "title": title,
+                "status": "active",
+                "allowed": True,
+                "page": pg if pg is not None else chunk_idx,
+                "chunkIndex": chunk_idx,
+                "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
+                "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
+            }
+            for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
+        ]
+        ref_citations = [
+            {
+                "documentId": rel_path,
+                "chunkIndex": chunk_idx,
+                "page": pg,
+                "snippet": chunk_text_val[:300],
+            }
+            for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg, _dom in top5
+        ]
+        ref_guidance: dict = {
+            "type": "reference",
+            "notice": "MEDICAL_REFERENCE_NOT_PROTOCOL",
+            "disclaimer": _emr_disclaimer,
+            "summary": make_summary(_clean_top),
+            "excerpt": _clean_top[:800],
+            "keyPoints": _pq_warnings,
+            "document": {
+                "documentId": top_rel,
+                "title": top_title,
+                "section": f"page {top_page}" if top_page is not None else f"chunk {top_chunk}",
+                "page": _eff_page,
+                "chunkIndex": top_chunk,
+                "status": _status_ov if _status_ov else "active",
+                "effectiveDate": _eff_date,
+                "reviewDate": _rev_date,
+                "owner": _owner,
+                "available": _doc_available(top_rel),
+                "domain": _top_domain,
+            },
+            "confidence": {
+                "rerank_reason": "; ".join(_reason_parts),
+                "toc_filtered":  _toc_filtered,
+                "used_fallback": _used_fallback,
+            },
+            "procedure_quality": _pq,
+        }
+        return ref_guidance, "allowed", ref_sources, ref_citations
+
+    # ── Policy gate D: training + weak → reference type (not approved) ───────
+    # Weak quality in training mode returns type="reference" with LOW_CONFIDENCE
+    # notice so the operator sees the confidence level without a hard refusal.
+    _force_reference = mode == "training" and _pq["decision"] == "weak"
+    if _force_reference:
+        _pq_notice = "LOW_CONFIDENCE"
 
     # Merge notices: quality notice takes precedence; if both, combine.
     if _pq_notice and _notice:
@@ -602,8 +694,9 @@ def _corpus_fts_retrieve(
     else:
         _final_notice = _notice
 
+    _guidance_type = "reference" if _force_reference else "approved"
     guidance: dict = {
-        "type": "approved",
+        "type": _guidance_type,
         "summary": make_summary(_clean_top),
         "excerpt": _clean_top[:800],
         "document": {
@@ -621,11 +714,11 @@ def _corpus_fts_retrieve(
             "available": _doc_available(top_rel),
             "domain": _top_domain,
         },
-        # Top-level structured procedure fields (always present, may be empty lists)
-        "steps":           _pq_steps,
-        "warnings":        _pq_warnings,
-        "prereqs":         _pq_prereqs,
-        "troubleshooting": _pq_troubles,
+        # Procedure fields suppressed for reference type (weak quality)
+        "steps":           [] if _force_reference else _pq_steps,
+        "warnings":        [] if _force_reference else _pq_warnings,
+        "prereqs":         [] if _force_reference else _pq_prereqs,
+        "troubleshooting": [] if _force_reference else _pq_troubles,
         "confidence": {
             "rerank_reason": "; ".join(_reason_parts),
             "toc_filtered":  _toc_filtered,
@@ -921,6 +1014,13 @@ def submit_query(
     role = current_session.role
     role_level = _ROLE_LEVEL.get(role, 0)
 
+    # medical_reference mode always forces domain_filter to medical_emr only.
+    # This is a defense-in-depth guard — the FTS gate in _corpus_fts_retrieve
+    # also enforces this, but we set it here so it applies to all retrieval paths.
+    _effective_domain_filter: "list[str] | None" = req.domain_filter
+    if req.mode == "medical_reference":
+        _effective_domain_filter = ["medical_emr"]
+
     # Admin override: scenario_key short-circuits retrieval for demo purposes.
     # "restricted" is handled first (its template contains the member-refused fixture,
     # not the officer/admin approved guidance, so it needs ACL-aware handling).
@@ -974,11 +1074,11 @@ def submit_query(
             stored_scenario_key = req.scenario_key
         else:
             # Unknown scenario_key — fall through to retrieval
-            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=req.domain_filter)
+            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter)
             stored_scenario_key = _scenario_key_from_guidance(guidance)
     else:
         # Real retrieval — scenario_key ignored for non-admins
-        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=req.domain_filter)
+        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter)
         stored_scenario_key = _scenario_key_from_guidance(guidance)
 
     query_id = str(uuid.uuid4())
