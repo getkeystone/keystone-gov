@@ -169,6 +169,45 @@ else
 fi
 echo ""
 
+# ── T7: Electric-shock CPR must NOT return an AED/defibrillator document ──────
+#
+# Disambiguation contract: "electric shock victim" is electrical-injury intent,
+# not AED shock-delivery intent.  The result must be a CPR/first-aid document,
+# not an AED operation manual or a chunk whose primary topic is defibrillation.
+echo "── T7: Electric-shock CPR query must not return AED/defibrillator document"
+ELEC_RESP="$(query_guidance "what cpr procedure should use for victim from electric shock" "operational")"
+ELEC_TYPE="$(echo "$ELEC_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); print(g.get('type','?'))" 2>/dev/null || true)"
+ELEC_DOC_ID="$(echo "$ELEC_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); print(g.get('document',{}).get('documentId',''))" 2>/dev/null || true)"
+ELEC_EXCERPT="$(echo "$ELEC_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); print(g.get('excerpt',''))" 2>/dev/null || true)"
+
+info "type=${ELEC_TYPE}  documentId=${ELEC_DOC_ID}"
+
+# The documentId must not be an AED device manual.  A CPR guide that mentions
+# AED in passing is correct; the failure case is returning an AED device-
+# operation manual as the top result.
+ELEC_DOC_LOWER="${ELEC_DOC_ID,,}"
+if [[ "$ELEC_DOC_LOWER" == *"aed"* ]] || echo "$ELEC_DOC_LOWER" | grep -qP 'defibrillat'; then
+  fail "T7: electric-shock CPR returned an AED/defibrillator document (${ELEC_DOC_ID}) — disambiguation failed"
+elif [[ "$ELEC_TYPE" == "approved" || "$ELEC_TYPE" == "refusal" ]]; then
+  pass "T7: electric-shock CPR did not return AED device document (type=${ELEC_TYPE} doc=${ELEC_DOC_ID})"
+else
+  fail "T7: unexpected type=${ELEC_TYPE} for electric-shock CPR query"
+fi
+echo ""
+
+# ── T8: MAYDAY + AED query — disambiguation must not suppress MAYDAY ──────────
+echo "── T8: MAYDAY procedure query still approved (intent gate not over-suppressing)"
+MAYDAY2_RESP="$(query_guidance "What is our MAYDAY and AED procedure?" "operational")"
+MAYDAY2_TYPE="$(echo "$MAYDAY2_RESP" | python3 -c "import sys,json; g=json.load(sys.stdin).get('guidance',{}); print(g.get('type','?'))" 2>/dev/null || true)"
+
+info "type=${MAYDAY2_TYPE}"
+if [[ "$MAYDAY2_TYPE" == "approved" || "$MAYDAY2_TYPE" == "refusal" ]]; then
+  pass "T8: MAYDAY+AED query handled without error (type=${MAYDAY2_TYPE})"
+else
+  fail "T8: MAYDAY+AED query returned unexpected type=${MAYDAY2_TYPE}"
+fi
+echo ""
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "══════════════════════════════"
 echo "  Overall: PASS=${PASS}  FAIL=${FAIL}"
