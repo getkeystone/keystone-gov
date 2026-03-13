@@ -36,6 +36,7 @@ from schemas import (
     SourceResponse,
 )
 from procedure_parse import parse_procedure, procedure_quality
+from requirements_parse import make_requirements_summary, parse_requirements
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 
@@ -703,9 +704,11 @@ def _corpus_fts_retrieve(
             """),
             {"rel": top_rel, "lo": top_chunk - 2, "hi": top_chunk + 2},
         ).fetchall()
-        _combined = clean_lines("\n".join(r[0] for r in adj_rows))
+        _raw_adj = "\n".join(r[0] for r in adj_rows)
+        _combined = clean_lines(_raw_adj)
     except Exception:
         db.rollback()
+        _raw_adj = top_text
         _combined = _clean_top
     # ── Anchor-first procedure extraction ─────────────────────────────────────
     # Parse procedure steps from the cited (anchor) chunk only.  Adjacent
@@ -988,9 +991,26 @@ def _corpus_fts_retrieve(
         _final_notice = _notice
 
     _guidance_type = "reference" if _force_reference else "approved"
+
+    # ── Structured requirements extraction (requirements-intent queries) ──────
+    # Parse _combined (anchor ± 2 adjacent chunks) so that wiring context from
+    # neighbouring pages (e.g. chunk 29 "Power must be supplied directly from
+    # the apparatus battery") is captured alongside the spec table in chunk 30.
+    _req_data: dict | None = None
+    _req_summary: str | None = None
+    if _is_spec_answer or bool(_REQUIREMENTS_INTENT.search(question)):
+        # Use raw (uncleaned) adjacent text so that lines like
+        # "2002 or 2002HP 12 VDC requires 60 amps" (31% digit density) are
+        # not dropped by clean_lines before spec parsing can extract them.
+        _req_data = parse_requirements(_raw_adj)
+        if _req_data["items"] or _req_data["wiring_notes"]:
+            _req_summary = make_requirements_summary(
+                _req_data["items"], _req_data["wiring_notes"]
+            )
+
     guidance: dict = {
         "type": _guidance_type,
-        "summary": make_summary(_clean_top),
+        "summary": _req_summary if _req_summary else make_summary(_clean_top),
         "excerpt": _clean_top[:1500],
         "document": {
             "documentId": top_rel,
@@ -1019,6 +1039,10 @@ def _corpus_fts_retrieve(
         },
         "procedure_quality": _pq,
     }
+    # Attach structured requirements data when present (requirements-intent queries).
+    # Only emit when items or notes were extracted to keep the response lean.
+    if _req_data is not None and (_req_data["items"] or _req_data["wiring_notes"]):
+        guidance["requirements"] = _req_data
     if _final_notice is not None:
         guidance["notice"] = _final_notice
     # Return top 5 reranked candidates as sources/citations.
