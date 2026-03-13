@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query as QueryParam, Response
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, text
@@ -1371,3 +1372,294 @@ def _build_audit_dict(entry: AuditEntry) -> dict:
         "sourcesConsidered": entry.sources_considered_json,
         "citationsReturned": entry.citations_returned_json,
     }
+
+
+# ---------------------------------------------------------------------------
+# Document registry (requires auth)
+# ---------------------------------------------------------------------------
+
+_ALLOWED_STATUS_OVERRIDES = {"", "active", "superseded", "draft", "restricted"}
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class DocMetadataPatch(BaseModel):
+    status_override: str | None = None
+    owner: str | None = None
+    effective_date: str | None = None
+    review_date: str | None = None
+    title_override: str | None = None
+
+
+def _corpus_doc_to_dict(row: tuple, today: str) -> dict:
+    """Convert a corpus_documents SELECT row to API dict.
+
+    Expected columns (positional):
+      0  id
+      1  rel_path
+      2  sha256
+      3  size_bytes
+      4  title
+      5  owner
+      6  effective_date
+      7  review_date
+      8  status_override
+      9  created_utc
+    """
+    (_id, rel_path, sha256, _size, title,
+     owner, eff_date, rev_date, status_ov, created_utc) = row
+    status = status_ov if status_ov else "active"
+    review_overdue = bool(rev_date and rev_date < today)
+    return {
+        "documentId":       rel_path,
+        "title":            title or rel_path,
+        "rel_path":         rel_path,
+        "status":           status,
+        "owner":            owner or "",
+        "effectiveDate":    eff_date or "",
+        "reviewDate":       rev_date or "",
+        "reviewOverdue":    review_overdue,
+        "sha256":           sha256 or "",
+        "last_ingested_utc": created_utc.isoformat() if created_utc else "",
+    }
+
+
+_DOC_SELECT = """
+    SELECT id, rel_path, sha256, size_bytes, title, owner,
+           effective_date, review_date, status_override, created_utc
+    FROM corpus_documents
+"""
+
+
+@app.get("/documents")
+def list_documents(
+    q:           str | None = QueryParam(default=None),
+    status:      str | None = QueryParam(default=None),
+    owner:       str | None = QueryParam(default=None),
+    overdue_only: int        = QueryParam(default=0),
+    limit:       int         = QueryParam(default=50, ge=1, le=200),
+    offset:      int         = QueryParam(default=0, ge=0),
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
+    today = datetime.now(timezone.utc).date().isoformat()
+    filters: list[str] = []
+    params: dict = {}
+
+    if q:
+        filters.append("(rel_path ILIKE :q OR title ILIKE :q)")
+        params["q"] = f"%{q}%"
+    if status:
+        if status == "active":
+            filters.append("(status_override = '' OR status_override IS NULL)")
+        else:
+            filters.append("status_override = :status")
+            params["status"] = status
+    if owner:
+        filters.append("owner ILIKE :owner")
+        params["owner"] = f"%{owner}%"
+    if overdue_only:
+        filters.append("review_date != '' AND review_date < :today")
+        params["today"] = today
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+    try:
+        rows = db.execute(text(f"""
+            {_DOC_SELECT}
+            {where}
+            ORDER BY rel_path ASC
+            LIMIT :limit OFFSET :offset
+        """), {**params, "limit": limit, "offset": offset}).fetchall()
+        total_row = db.execute(
+            text(f"SELECT COUNT(*) FROM corpus_documents {where}"),
+            params,
+        ).fetchone()
+        total = total_row[0] if total_row else 0
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error listing documents: {exc}")
+
+    return {
+        "total":  total,
+        "offset": offset,
+        "limit":  limit,
+        "items":  [_corpus_doc_to_dict(r, today) for r in rows],
+    }
+
+
+@app.get("/documents/review-queue")
+def get_review_queue(
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        all_rows = db.execute(
+            text(f"{_DOC_SELECT} ORDER BY rel_path ASC")
+        ).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error fetching review queue: {exc}")
+
+    overdue_review: list[dict] = []
+    missing_owner: list[dict] = []
+    missing_review_date: list[dict] = []
+    draft_or_superseded: list[dict] = []
+
+    for row in all_rows:
+        d = _corpus_doc_to_dict(row, today)
+        if d["reviewOverdue"]:
+            overdue_review.append(d)
+        if not d["owner"]:
+            missing_owner.append(d)
+        if not d["reviewDate"]:
+            missing_review_date.append(d)
+        if d["status"] in ("draft", "superseded"):
+            draft_or_superseded.append(d)
+
+    return {
+        "overdue_review":      overdue_review,
+        "missing_owner":       missing_owner,
+        "missing_review_date": missing_review_date,
+        "draft_or_superseded": draft_or_superseded,
+        "counts": {
+            "overdue_review":      len(overdue_review),
+            "missing_owner":       len(missing_owner),
+            "missing_review_date": len(missing_review_date),
+            "draft_or_superseded": len(draft_or_superseded),
+        },
+    }
+
+
+@app.get("/documents/{document_id}")
+def get_document_registry(
+    document_id: str,
+    db: DBSession = Depends(get_db),
+    _session: Session = Depends(get_current_session),
+):
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        row = db.execute(
+            text(f"{_DOC_SELECT} WHERE rel_path = :rel"),
+            {"rel": document_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    d = _corpus_doc_to_dict(row, today)
+
+    try:
+        stats = db.execute(text("""
+            SELECT
+                COUNT(*)          AS chunk_count,
+                COUNT(cc.page)    AS pages_indexed,
+                COUNT(*) - COUNT(cc.page) AS pages_null,
+                MAX(cc.page)      AS max_page
+            FROM corpus_chunks cc
+            JOIN corpus_documents cd ON cd.id = cc.doc_id
+            WHERE cd.rel_path = :rel
+        """), {"rel": document_id}).fetchone()
+        d["chunk_count"]         = stats[0] if stats else 0
+        d["pages_indexed_count"] = stats[1] if stats else 0
+        d["pages_null_count"]    = stats[2] if stats else 0
+        d["max_page"]            = stats[3] if stats else None
+    except Exception:
+        db.rollback()
+        d["chunk_count"]         = None
+        d["pages_indexed_count"] = None
+        d["pages_null_count"]    = None
+        d["max_page"]            = None
+
+    return d
+
+
+@app.patch("/documents/{document_id}/metadata")
+def patch_document_metadata(
+    document_id: str,
+    patch: DocMetadataPatch,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    if current_session.role not in ("custodian", "admin"):
+        raise HTTPException(status_code=403, detail="custodian or admin role required")
+
+    if patch.status_override is not None:
+        if patch.status_override not in _ALLOWED_STATUS_OVERRIDES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status_override must be one of {sorted(_ALLOWED_STATUS_OVERRIDES)}",
+            )
+    for field_name, field_val in [
+        ("effective_date", patch.effective_date),
+        ("review_date",    patch.review_date),
+    ]:
+        if field_val is not None and field_val != "" and not _DATE_RE.match(field_val):
+            raise HTTPException(status_code=422, detail=f"{field_name} must be yyyy-mm-dd or empty")
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    try:
+        row = db.execute(
+            text(f"{_DOC_SELECT} WHERE rel_path = :rel"),
+            {"rel": document_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    before = _corpus_doc_to_dict(row, today)
+
+    updates: dict = {}
+    if patch.status_override is not None:
+        updates["status_override"] = patch.status_override
+    if patch.owner is not None:
+        updates["owner"] = patch.owner
+    if patch.effective_date is not None:
+        updates["effective_date"] = patch.effective_date
+    if patch.review_date is not None:
+        updates["review_date"] = patch.review_date
+    if patch.title_override is not None:
+        updates["title"] = patch.title_override
+
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+
+    try:
+        db.execute(
+            text(f"UPDATE corpus_documents SET {set_clause} WHERE rel_path = :rel"),
+            {**updates, "rel": document_id},
+        )
+        row_after = db.execute(
+            text(f"{_DOC_SELECT} WHERE rel_path = :rel"),
+            {"rel": document_id},
+        ).fetchone()
+        after = _corpus_doc_to_dict(row_after, today) if row_after else before
+
+        db.execute(text("""
+            INSERT INTO corpus_doc_events
+                (ts_utc, actor_username, actor_role, document_id, action, before_json, after_json)
+            VALUES
+                (now(), :uname, :role, :doc_id, 'metadata_patch',
+                 CAST(:before_j AS jsonb), CAST(:after_j AS jsonb))
+        """), {
+            "uname":    current_session.username,
+            "role":     current_session.role,
+            "doc_id":   document_id,
+            "before_j": json.dumps(before, sort_keys=True),
+            "after_j":  json.dumps(after,  sort_keys=True),
+        })
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error during update: {exc}")
+
+    return {"updated": True, "document": after}
