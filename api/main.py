@@ -162,8 +162,20 @@ _MAYDAY_CONTENT_MARKERS = re.compile(
 # safety-warning lists that happened to match on the word "require".
 
 # Triggers requirements intent detection on the query side.
+# Covers explicit requirement/specification vocabulary AND specific
+# electrical-unit terms (amps, VDC, voltage, minimum service) which appear
+# almost exclusively in electrical-requirements queries in this domain.
 _REQUIREMENTS_INTENT = re.compile(
-    r'\brequirement(?:s)?\b|\bspecification(?:s)?\b|\binstall(?:ation)?\s+req',
+    r'\b(?:electrical|power)\s+requirement(?:s)?\b'
+    r'|\brequirement(?:s)?\b'
+    r'|\bspecification(?:s)?\b'
+    r'|\binstall(?:ation)?\s+req'
+    r'|\belectrical\s+connections?\b'
+    r'|\bamp\s+draw\b'
+    r'|\bamps?\b'
+    r'|\bVDC\b'
+    r'|\bvoltage\b'
+    r'|\bminimum\s+service\b',
     re.IGNORECASE,
 )
 
@@ -189,6 +201,26 @@ _SAFETY_CAUTION_DENSE = re.compile(
 # (even if embedded inside CAUTION items) and should not be penalized.
 _SPEC_DATA_SIGNAL = re.compile(
     r'\b\d+\s*(?:VDC|VAC|V\b|amps?|A\b|psi|gpm|rpm|kPa|bar)\b',
+    re.IGNORECASE,
+)
+
+# Pointer language: chunk redirects to another section instead of giving data.
+# "Refer to Section 7", "See Section 4 for complete specifications", etc.
+_POINTER_SIGNAL = re.compile(
+    r'\b(?:refer(?:ence)?|see)\s+(?:to\s+)?(?:section|page)\s+\d'
+    r'|for\s+(?:complete|more|full|additional)\s+'
+    r'(?:information|details?|specifications?|requirements?)'
+    r'\s*,?\s*(?:refer|see)\b',
+    re.IGNORECASE,
+)
+
+# Explicit "requires N amps/VDC" pattern — distinguishes a spec section
+# that states requirements inline ("2001 12 VDC requires 41 amps;") from a
+# safety-caution section that embeds the same data in a table under CAUTION
+# text ("require a minimum current rating of at least: 2001 12 VDC 41").
+# The latter uses non-inline tabular format and produces zero matches here.
+_EXPLICIT_REQUIRES_SPEC = re.compile(
+    r'\b(?:requires?|rated\s+(?:at|for))\s+\d+\s*(?:amps?|amp|VDC|VAC|volts?)\b',
     re.IGNORECASE,
 )
 
@@ -239,6 +271,27 @@ def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     if _NUMBERED_STEP.search(text):
         score *= 1.50
 
+    return score
+
+
+def _rerank_score_no_digit_penalty(chunk_index: int, text: str, fts_rank: float) -> float:
+    """Like _rerank_score but omits digit-density and section-number-density
+    penalties.  Used for spec-data chunks under requirements intent: dense
+    numeric content in a spec list is evidence of value, not TOC noise.
+    """
+    score = float(fts_rank)
+    lower = text.lower()
+    if _TOC_SIGNAL.search(lower):
+        score *= 0.10
+    if _FRONT_MATTER_SIGNAL.search(text):
+        score *= 0.05
+    if chunk_index == 0:
+        score *= 0.50
+    n_proc = len(_PROCEDURAL.findall(text))
+    if n_proc > 0:
+        score *= 1.0 + min(n_proc * 0.25, 2.0)
+    if _NUMBERED_STEP.search(text):
+        score *= 1.50
     return score
 
 
@@ -467,30 +520,99 @@ def _corpus_fts_retrieve(
             if cpr_hits:
                 reranked = cpr_hits + [r for r in reranked if r not in cpr_hits]
 
-    # Requirements intent: apply a moderate boost to chunks with a recognised
-    # REQUIREMENTS/SPECIFICATIONS/CONNECTIONS section heading (×1.35) and a
-    # penalty (×0.45) to chunks that are dense CAUTION/WARNING numbered lists
-    # (4+ markers) without a section heading OR structured spec data.
+    # Requirements intent: detect and promote spec-data chunks; penalize
+    # pointer-only and caution-list chunks.
     #
-    # The boost is intentionally conservative so it does NOT override a
-    # caution-dense chunk that also contains embedded specification data
-    # (e.g. "CAUTION: must use 12 VDC / 41 amps") — those chunks are valuable
-    # and should keep their natural rerank score.  The penalty targets truly
-    # spec-less caution lists that matched only because they contain the word
-    # "require" in a warning sentence.
+    # Signals applied (cumulative):
+    #   HEADING + SPEC DATA   → ×2.0  (authoritative spec section w/ numeric data)
+    #   HEADING only          → ×1.35 (may be a safety-intro heading — mild boost)
+    #   SPEC DATA only        → ×1.50 + digit-density penalty bypassed
+    #   POINTER, no SPEC DATA → ×0.20 (chunk redirects; actual data is elsewhere)
+    #   CAUTION ≥2, no SPEC   → ×0.30 (pure warning list matched on "require")
+    #
+    # For SPEC DATA chunks the digit-density penalty in _rerank_score is
+    # intentionally skipped so that numeric spec lists (41 amps, 60 amps,
+    # 12 VDC …) are not demoted by the TOC/front-matter digit guard.
     if _REQUIREMENTS_INTENT.search(question):
         def _req_intent_score(row: tuple) -> float:
             _ri, _ti, ci, txt, rank, _pg, _dom = row
-            base = _rerank_score(ci, txt, rank)
-            has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
-            if has_heading:
-                base *= 1.35  # moderate boost for explicit section headings
-            caution_count = len(_SAFETY_CAUTION_DENSE.findall(txt))
             has_spec = bool(_SPEC_DATA_SIGNAL.search(txt))
-            if caution_count >= 4 and not has_heading and not has_spec:
-                base *= 0.45  # penalize spec-less caution lists
+            # Bypass digit-density penalty for chunks with actual spec numbers.
+            base = (
+                _rerank_score_no_digit_penalty(ci, txt, rank)
+                if has_spec
+                else _rerank_score(ci, txt, rank)
+            )
+            has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
+            if has_heading and has_spec:
+                base *= 1.70  # heading + spec: good signal but not stronger than
+                              # a spec-dense chunk where the REQUIREMENTS text IS
+                              # the content (not an intro section that contains a
+                              # spec table mid-chunk alongside other topics)
+            elif has_heading:
+                base *= 1.35  # heading alone (could be a safety-section title)
+            elif has_spec:
+                base *= 1.50  # numeric spec data without a heading still valuable
+            caution_count = len(_SAFETY_CAUTION_DENSE.findall(txt))
+            if caution_count >= 2 and not has_spec:
+                base *= 0.30  # penalize pure caution/warning lists
+            if _POINTER_SIGNAL.search(txt) and not has_spec:
+                base *= 0.20  # strongly penalize redirect-only chunks
+            # Strong boost for chunks where spec data is stated inline as
+            # "requires 41 amps" / "requires 60 amps" — the primary-purpose
+            # spec section format.  Chunks that embed a spec table inside a
+            # CAUTION block use tabular notation ("2001 12 VDC 41") and
+            # produce zero matches here, so they do NOT receive this boost.
+            n_explicit = len(_EXPLICIT_REQUIRES_SPEC.findall(txt))
+            if n_explicit > 0:
+                base *= 1.0 + min(n_explicit * 2.0, 8.0)
             return base
+
         reranked = sorted(reranked, key=_req_intent_score, reverse=True)
+
+        # Spec-data document fallback: if the top candidate has pointer
+        # language ("Refer to Section X") — regardless of whether it also has
+        # some embedded spec data — query the same matched documents for a
+        # chunk where spec data is the primary content.  Also triggers for
+        # spec-less, caution-dense top candidates.
+        # A pointer chunk always redirects; the real spec section is elsewhere.
+        _top_has_spec = bool(_SPEC_DATA_SIGNAL.search(reranked[0][3]))
+        _top_is_pointer = bool(_POINTER_SIGNAL.search(reranked[0][3]))
+        _top_cautions = len(_SAFETY_CAUTION_DENSE.findall(reranked[0][3]))
+        if _top_is_pointer or (not _top_has_spec and _top_cautions >= 2):
+            _req_docs = list({r[0] for r in reranked[:8]})
+            try:
+                _spec_rows = db.execute(
+                    text("""
+                        SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text,
+                               CAST(0.001 AS FLOAT) AS rank, cc.page, cd.domain
+                        FROM corpus_chunks cc
+                        JOIN corpus_documents cd ON cd.id = cc.doc_id
+                        WHERE cd.rel_path = ANY(:docs)
+                          AND (   cc.text ~* '[0-9]+[[:space:]]*(amps?|vdc|vac)'
+                               OR cc.text ~* 'minimum[[:space:]]+service'
+                               OR cc.text ~* 'requires?[[:space:]]+[0-9]+[[:space:]]*(amps?|vdc)')
+                        ORDER BY cd.rel_path, cc.chunk_index ASC
+                        LIMIT 80
+                    """),
+                    {"docs": _req_docs},
+                ).fetchall()
+            except Exception:
+                db.rollback()
+                _spec_rows = []
+            if _spec_rows:
+                _spec_reranked = sorted(
+                    _spec_rows,
+                    key=lambda r: _req_intent_score(r),
+                    reverse=True,
+                )
+                _existing_keys = {(r[0], r[2]) for r in reranked}
+                _new_spec = [
+                    r for r in _spec_reranked
+                    if (r[0], r[2]) not in _existing_keys
+                ]
+                if _new_spec:
+                    reranked = _new_spec + list(reranked)
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _toc_filtered = False
@@ -674,7 +796,16 @@ def _corpus_fts_retrieve(
     # ── Policy gate A: operational + weak/rejected (non-medical) → LOW_CONFIDENCE
     # Fire-ops and lrfd_protocol documents with weak procedure quality are refused
     # in operational mode.  medical_emr is handled separately below.
-    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject"):
+    #
+    # Exception: requirements/spec queries that retrieved a chunk with explicit
+    # inline spec data ("requires 41 amps") are allowed through even if the
+    # procedure parser returns weak quality — spec tables are not step-procedure
+    # content and should not be refused on procedural quality grounds.
+    _is_spec_answer = (
+        bool(_REQUIREMENTS_INTENT.search(question))
+        and bool(_EXPLICIT_REQUIRES_SPEC.search(top_text))
+    )
+    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject") and not _is_spec_answer:
         return {
             "type": "refusal",
             "reasonCode": "LOW_CONFIDENCE",
@@ -745,7 +876,7 @@ def _corpus_fts_retrieve(
             "notice": medref_notice,
             "disclaimer": _emr_disclaimer,
             "summary": make_summary(_clean_top),
-            "excerpt": _clean_top[:800],
+            "excerpt": _clean_top[:1500],
             "keyPoints": _pq_warnings,
             "document": {
                 "documentId": top_rel,
@@ -817,7 +948,7 @@ def _corpus_fts_retrieve(
             "notice": "MEDICAL_REFERENCE_NOT_PROTOCOL",
             "disclaimer": _emr_disclaimer,
             "summary": make_summary(_clean_top),
-            "excerpt": _clean_top[:800],
+            "excerpt": _clean_top[:1500],
             "keyPoints": _pq_warnings,
             "document": {
                 "documentId": top_rel,
@@ -860,7 +991,7 @@ def _corpus_fts_retrieve(
     guidance: dict = {
         "type": _guidance_type,
         "summary": make_summary(_clean_top),
-        "excerpt": _clean_top[:800],
+        "excerpt": _clean_top[:1500],
         "document": {
             "documentId": top_rel,
             "title": top_title,
