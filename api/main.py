@@ -504,6 +504,39 @@ def get_source(
     db: DBSession = Depends(get_db),
     current_session: Session = Depends(get_current_session),
 ):
+    # ── Corpus lookup: check corpus_documents first ────────────────────────
+    # document_id matches corpus_documents.rel_path; page is the chunk index.
+    try:
+        corpus_row = db.execute(
+            text("""
+                SELECT cd.rel_path, cd.title, cc.text
+                FROM corpus_documents cd
+                JOIN corpus_chunks cc ON cc.doc_id = cd.id
+                WHERE cd.rel_path = :rel AND cc.chunk_index = :idx
+            """),
+            {"rel": document_id, "idx": page},
+        ).fetchone()
+    except Exception:
+        db.rollback()
+        corpus_row = None
+
+    if corpus_row:
+        rel_path, title, chunk_text = corpus_row
+        return SourceResponse(
+            documentId=rel_path,
+            page=page,
+            title=title,
+            section=f"chunk {page}",
+            status="active",
+            effectiveDate="",
+            reviewDate="",
+            owner="",
+            excerpt=(chunk_text or "")[:800],
+            highlight="",
+            notes=[],
+        )
+
+    # ── Seeded fixture lookup (existing behavior) ──────────────────────────
     key = f"{document_id}:{page}"
     doc = db.query(Document).filter(Document.key == key).first()
     if not doc:

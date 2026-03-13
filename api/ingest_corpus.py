@@ -16,12 +16,16 @@ Writes:  corpus_documents + corpus_chunks tables (PostgreSQL)
          FAILS (no DB write) if extracted text length is 0.
 Stdout:  JSON summary (shell wrapper writes receipt files on host).
 
-Failure rules:
-  - EXTRACTION_ERROR  : extraction raised an exception
-  - NO_TEXT_EXTRACTED : all extractors ran without error but returned "" — this
-                        includes image-only PDFs. Previous good data is preserved.
-  In both cases: NO corpus_document row is inserted/updated and NO chunks are
-  written. The file will be retried on the next ingest run.
+Failure reasons (stable enums):
+  EXTRACTION_ERROR  : extraction raised an exception
+  NO_TEXT_EXTRACTED : supported type, all extractors ran without error but returned ""
+  UNSUPPORTED_TYPE  : mime type is not handled by any extractor
+
+Behavior rules:
+  - New doc, empty/error extract: failed_docs entry written, NO DB rows.
+  - Existing doc, sha changed, extract empty/error: skipped_keep_previous,
+    old DB rows preserved, kept_previous_docs entry written.
+  - Existing doc, sha changed, extract non-empty: replace chunks, update doc.
 """
 
 import hashlib
@@ -50,6 +54,19 @@ ACTIVE_DIR  = CORPUS_ROOT / "active"
 
 CHUNK_SIZE    = 1500   # target characters per chunk
 CHUNK_OVERLAP = 150    # overlap between consecutive chunks
+
+# ── Supported MIME types ───────────────────────────────────────────────────────
+
+_SUPPORTED_MIMES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+}
+
+
+def is_supported_mime(mime: str) -> bool:
+    """Return True if we have an extractor for this mime type."""
+    return mime in _SUPPORTED_MIMES or bool(mime and mime.startswith("text/"))
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
@@ -97,7 +114,22 @@ def extract_text(path: Path, mime: str) -> str:
     return ""
 
 
+_EXT_MIME_OVERRIDES: dict[str, str] = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".docm": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc":  "application/msword",
+    ".pdf":  "application/pdf",
+    ".txt":  "text/plain",
+    ".md":   "text/markdown",
+    ".rst":  "text/x-rst",
+}
+
+
 def mime_for(path: Path) -> str:
+    """Guess MIME type; use explicit extension fallbacks when stdlib mimetypes DB is incomplete."""
+    suffix = path.suffix.lower()
+    if suffix in _EXT_MIME_OVERRIDES:
+        return _EXT_MIME_OVERRIDES[suffix]
     mt, _ = mimetypes.guess_type(str(path))
     return mt or "application/octet-stream"
 
@@ -138,6 +170,8 @@ def main() -> None:
         "added": 0, "updated": 0, "skipped": 0,
         "skipped_keep_previous": 0, "failed": 0,
         "docs": [],
+        "failed_docs": [],
+        "kept_previous_docs": [],
     }
 
     files = sorted(
@@ -169,6 +203,31 @@ def main() -> None:
             doc_id = None
             action = "added"
 
+        # ── Unsupported mime type — no extractor available ────────────────────
+        if not is_supported_mime(mime):
+            reason = "UNSUPPORTED_TYPE"
+            detail = f"mime={mime}"
+            if action == "updated":
+                stats["skipped_keep_previous"] += 1
+                stats["docs"].append({
+                    "rel_path": rel,
+                    "action":   "skipped_keep_previous",
+                    "reason":   reason,
+                    "detail":   detail,
+                })
+                stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                print(
+                    f"  WARN [{rel}] UNSUPPORTED_TYPE (sha changed, mime={mime}) — "
+                    f"preserving previous DB version",
+                    file=sys.stderr,
+                )
+            else:
+                stats["failed"] += 1
+                stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason, "detail": detail})
+                stats["failed_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                print(f"  WARN [{rel}] UNSUPPORTED_TYPE mime={mime} — skipping DB write", file=sys.stderr)
+            continue
+
         # ── Extract text BEFORE touching the DB ───────────────────────────────
         # This guarantees that if extraction fails, the previous good version
         # in the DB is never touched.
@@ -176,30 +235,43 @@ def main() -> None:
         try:
             text = extract_text(fpath, mime)
         except Exception as exc:
-            stats["failed"] += 1
-            stats["docs"].append({
-                "rel_path": rel,
-                "action":   "failed",
-                "reason":   "EXTRACTION_ERROR",
-                "error":    str(exc),
-            })
-            print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
-            continue
-
-        if not text:
-            # Image-only PDF, encrypted doc, or unsupported format.
-            # Do NOT write placeholder chunks — that poisons FTS with noise.
+            reason = "EXTRACTION_ERROR"
+            detail = str(exc)
             if action == "updated":
-                # A previous good version exists in the DB. Keep it intact.
-                # Treat as skipped_keep_previous so the operator can see the warning
-                # without losing the old retrieval data.
                 stats["skipped_keep_previous"] += 1
                 stats["docs"].append({
                     "rel_path": rel,
                     "action":   "skipped_keep_previous",
-                    "reason":   "NO_TEXT_EXTRACTED",
+                    "reason":   reason,
+                    "detail":   detail,
+                })
+                stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                print(
+                    f"  WARN [{rel}] EXTRACTION_ERROR (sha changed) — "
+                    f"preserving previous DB version: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                stats["failed"] += 1
+                stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason, "detail": detail})
+                stats["failed_docs"].append({"rel_path": rel, "reason": reason, "detail": detail})
+                print(f"  WARN [{rel}] EXTRACTION_ERROR: {exc}", file=sys.stderr)
+            continue
+
+        if not text:
+            # Image-only PDF, encrypted doc, or supported format with no extractable content.
+            # Do NOT write placeholder chunks — that poisons FTS with noise.
+            reason = "NO_TEXT_EXTRACTED"
+            if action == "updated":
+                # A previous good version exists in the DB. Keep it intact.
+                stats["skipped_keep_previous"] += 1
+                stats["docs"].append({
+                    "rel_path": rel,
+                    "action":   "skipped_keep_previous",
+                    "reason":   reason,
                     "warning":  "file sha256 changed but new extraction returned empty; previous DB version preserved",
                 })
+                stats["kept_previous_docs"].append({"rel_path": rel, "reason": reason})
                 print(
                     f"  WARN [{rel}] NO_TEXT_EXTRACTED (sha changed) — "
                     f"preserving previous DB version",
@@ -208,11 +280,8 @@ def main() -> None:
             else:
                 # New doc, no text, nothing to fall back on.
                 stats["failed"] += 1
-                stats["docs"].append({
-                    "rel_path": rel,
-                    "action":   "failed",
-                    "reason":   "NO_TEXT_EXTRACTED",
-                })
+                stats["docs"].append({"rel_path": rel, "action": "failed", "reason": reason})
+                stats["failed_docs"].append({"rel_path": rel, "reason": reason})
                 print(f"  WARN [{rel}] NO_TEXT_EXTRACTED — skipping DB write", file=sys.stderr)
             continue
 
@@ -263,23 +332,23 @@ def main() -> None:
     conn.close()
 
     if stats["failed"] > 0:
-        failed_paths = [
+        failed_lines = [
             f'  {d["rel_path"]} ({d.get("reason","?")})'
-            for d in stats["docs"] if d.get("action") == "failed"
+            for d in stats["failed_docs"]
         ]
         print(
             f"  WARNING: {stats['failed']} new doc(s) produced no extractable text "
-            f"and were NOT ingested:\n" + "\n".join(failed_paths),
+            f"and were NOT ingested:\n" + "\n".join(failed_lines),
             file=sys.stderr,
         )
     if stats["skipped_keep_previous"] > 0:
-        skp_paths = [
+        skp_lines = [
             f'  {d["rel_path"]} ({d.get("reason","?")})'
-            for d in stats["docs"] if d.get("action") == "skipped_keep_previous"
+            for d in stats["kept_previous_docs"]
         ]
         print(
             f"  WARNING: {stats['skipped_keep_previous']} doc(s) had sha256 changes "
-            f"but empty extraction; previous DB version preserved:\n" + "\n".join(skp_paths),
+            f"but empty/errored extraction; previous DB version preserved:\n" + "\n".join(skp_lines),
             file=sys.stderr,
         )
 
