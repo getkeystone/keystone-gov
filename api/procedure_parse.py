@@ -7,6 +7,11 @@ parse_procedure(text: str) -> dict with keys:
   prereqs:         list[str]  — PPE/prepare/ensure/required lines    (max 6)
   troubleshooting: list[str]  — error/alarm/fault/troubleshooting    (max 6)
 
+procedure_quality(proc: dict, excerpt: str) -> dict with keys:
+  score:    int   — 0-100 quality score
+  signals:  dict  — raw signal counts/flags
+  decision: str   — "ok" | "weak" | "reject"
+
 All values are deduplicated (case-insensitive) and each entry ≤ 300 chars.
 Caller should concatenate the cited chunk with adjacent chunks (same doc,
 ±2 around the cited index) before calling, for broader context.
@@ -141,4 +146,101 @@ def parse_procedure(
         "warnings":        _dedup(warnings)[:max_warnings],
         "prereqs":         _dedup(prereqs)[:max_prereqs],
         "troubleshooting": _dedup(troubleshooting)[:max_troubleshooting],
+    }
+
+
+# ── Quality scoring ────────────────────────────────────────────────────────────
+
+# Front-matter signal (mirrors _FRONT_MATTER_SIGNAL in main.py)
+_FRONT_MATTER_QUALITY = re.compile(
+    r'rescueintellitech|katy[\s,]+tx|copyright|all\s+rights\s+reserved'
+    r'|user[\s\-_]*manual|www\.\S+\.\S+|https?://\S+',
+    re.IGNORECASE,
+)
+
+# TOC-like: contains "CONTENTS" or dotted leaders (.....5 or more dots)
+_TOC_CONTENTS = re.compile(r'\bcontents\b', re.IGNORECASE)
+_DOTTED_LEADER = re.compile(r'\.{5,}')
+
+# Imperative sentence: starts with a capitalized verb-like word (>=3 chars),
+# NOT starting with one of the excluded non-imperative openers.
+_IMPERATIVE_EXCLUDE = re.compile(
+    r'^(?:The|A|An|This|These|When|If)\b',
+)
+_CAPITALIZED_START = re.compile(r'^[A-Z][a-z]{2,}')
+
+
+def _count_imperatives(excerpt: str) -> int:
+    """Count sentences that start with a capitalized verb-like word."""
+    count = 0
+    for raw in excerpt.split('\n'):
+        line = raw.strip()
+        if not line:
+            continue
+        # Split into sentences naively on '. '
+        for sentence in re.split(r'(?<=[.!?])\s+', line):
+            s = sentence.strip()
+            if not s:
+                continue
+            if _IMPERATIVE_EXCLUDE.match(s):
+                continue
+            if _CAPITALIZED_START.match(s):
+                count += 1
+    return count
+
+
+def procedure_quality(proc: dict, excerpt: str) -> dict:
+    """
+    Score a parsed procedure + excerpt for extraction quality.
+
+    Returns:
+      {
+        "score": 0-100,
+        "signals": {
+          "numbered_steps": int,
+          "imperatives": int,
+          "warnings": int,
+          "toc_like": bool,
+          "front_matter": bool,
+        },
+        "decision": "ok" | "weak" | "reject",
+      }
+    """
+    numbered_steps = len(proc.get("steps", []))
+    warnings_count = len(proc.get("warnings", []))
+    prereqs_count  = len(proc.get("prereqs", []))
+
+    imperatives  = _count_imperatives(excerpt)
+    toc_like     = bool(_TOC_CONTENTS.search(excerpt) or _DOTTED_LEADER.search(excerpt))
+    front_matter = bool(_FRONT_MATTER_QUALITY.search(excerpt))
+
+    # Decision
+    if (toc_like or front_matter) and numbered_steps == 0 and imperatives < 2:
+        decision = "reject"
+    elif numbered_steps < 3 and warnings_count == 0 and prereqs_count == 0:
+        decision = "weak"
+    else:
+        decision = "ok"
+
+    # Score calculation
+    score = 0
+    score += min(numbered_steps * 10, 40)
+    score += min(imperatives * 5, 20)
+    score += min(warnings_count * 5, 15)
+    if toc_like:
+        score -= 30
+    if front_matter:
+        score -= 20
+    score = max(0, min(100, score))
+
+    return {
+        "score": score,
+        "signals": {
+            "numbered_steps": numbered_steps,
+            "imperatives":    imperatives,
+            "warnings":       warnings_count,
+            "toc_like":       toc_like,
+            "front_matter":   front_matter,
+        },
+        "decision": decision,
     }

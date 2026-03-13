@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -31,7 +32,7 @@ from schemas import (
     QueryResponse,
     SourceResponse,
 )
-from procedure_parse import parse_procedure
+from procedure_parse import parse_procedure, procedure_quality
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 
@@ -193,7 +194,7 @@ def _lexical_score(terms: set[str], doc: Document) -> int:
 
 
 def _corpus_fts_retrieve(
-    question: str, db: DBSession
+    question: str, mode: str, db: DBSession
 ) -> "tuple[dict, str, list, list] | None":
     """
     Postgres FTS retrieval from corpus_chunks.
@@ -344,6 +345,7 @@ def _corpus_fts_retrieve(
         db.rollback()
         _combined = _clean_top
     proc = parse_procedure(_combined)
+    _pq = procedure_quality(proc, _clean_top)
 
     # ── Fetch document-level metadata (owner/dates/status) ───────────────────
     try:
@@ -360,6 +362,29 @@ def _corpus_fts_retrieve(
     _rev_date  = (_meta[2] if _meta else "") or ""
     _status_ov = (_meta[3] if _meta else "") or ""
 
+    # ── Prompt 2: Metadata-driven policy (status_override / review_date) ─────
+    _today_str = datetime.now(timezone.utc).date().isoformat()
+    if mode == "operational":
+        if _status_ov in ("superseded", "draft"):
+            refusal = {
+                "type": "refusal",
+                "reasonCode": "NO_ACTIVE_PROCEDURE",
+                "title": "No active procedure found",
+                "message": "The matched document is not in active status.",
+                "safeNextStep": "Consult your training officer for the current version.",
+                "hiddenSource": False,
+            }
+            return refusal, "refused", [], []
+
+    # Notice accumulator for approved path
+    _notice: str | None = None
+    if mode == "operational":
+        if _rev_date and _rev_date < _today_str:
+            _notice = "REVIEW_OVERDUE: This document's review date has passed. Verify currency before acting."
+    else:  # training mode
+        if _status_ov in ("superseded", "draft"):
+            _notice = f"TRAINING_ONLY: document status is {_status_ov}"
+
     # ── Confidence metadata ───────────────────────────────────────────────────
     _rerank_val = _rerank_score(top_chunk, top_text, _fts_rank)
     _reason_parts = [f"chunk {top_chunk} page {top_page}"]
@@ -368,6 +393,29 @@ def _corpus_fts_retrieve(
     if _used_fallback:
         _reason_parts.append(f"document fallback (initial top was TOC-like)")
     _reason_parts.append(f"FTS rank {_fts_rank:.4f}; rerank {_rerank_val:.4f}")
+
+    # ── Prompt 3: Apply procedure quality decision ────────────────────────────
+    _pq_notice: str | None = None
+    _pq_steps    = proc["steps"]
+    _pq_warnings = proc["warnings"]
+    _pq_prereqs  = proc["prereqs"]
+    _pq_troubles = proc["troubleshooting"]
+    if _pq["decision"] == "reject":
+        _pq_steps = []
+        _pq_warnings = []
+        _pq_prereqs = []
+        _pq_troubles = []
+        _pq_notice = "PROCEDURE_EXTRACT_REJECTED"
+    elif _pq["decision"] == "weak":
+        _pq_notice = "LOW_CONFIDENCE"
+
+    # Merge notices: quality notice takes precedence; if both, combine.
+    if _pq_notice and _notice:
+        _final_notice: str | None = _pq_notice  # quality notice wins in text; both communicated
+    elif _pq_notice:
+        _final_notice = _pq_notice
+    else:
+        _final_notice = _notice
 
     guidance: dict = {
         "type": "approved",
@@ -385,16 +433,19 @@ def _corpus_fts_retrieve(
             "owner": _owner,
         },
         # Top-level structured procedure fields (always present, may be empty lists)
-        "steps":           proc["steps"],
-        "warnings":        proc["warnings"],
-        "prereqs":         proc["prereqs"],
-        "troubleshooting": proc["troubleshooting"],
+        "steps":           _pq_steps,
+        "warnings":        _pq_warnings,
+        "prereqs":         _pq_prereqs,
+        "troubleshooting": _pq_troubles,
         "confidence": {
             "rerank_reason": "; ".join(_reason_parts),
             "toc_filtered":  _toc_filtered,
             "used_fallback": _used_fallback,
         },
+        "procedure_quality": _pq,
     }
+    if _final_notice is not None:
+        guidance["notice"] = _final_notice
     # Return top 5 reranked candidates as sources/citations.
     top5 = reranked[:5]
     sources = [
@@ -432,7 +483,7 @@ def _retrieve(
     Fail-closed in both paths: INSUFFICIENT_EVIDENCE if nothing matches.
     """
     # FTS path — active whenever corpus has been ingested.
-    fts_result = _corpus_fts_retrieve(question, db)
+    fts_result = _corpus_fts_retrieve(question, mode, db)
     if fts_result is not None:
         return fts_result
 
@@ -987,27 +1038,32 @@ def verify_audit(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/evidence/{query_id}.zip")
-def get_evidence_zip(
-    query_id: str,
-    db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
-):
+_ZIP_DATE = (1980, 1, 1, 0, 0, 0)  # deterministic ZipInfo date_time
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _zip_writestr_det(zf: zipfile.ZipFile, name: str, data: "bytes | str") -> bytes:
+    """Write a file into zf with deterministic date_time; return the raw bytes written."""
+    raw = data.encode() if isinstance(data, str) else data
+    info = zipfile.ZipInfo(filename=name, date_time=_ZIP_DATE)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zf.writestr(info, raw)
+    return raw
+
+
+def _build_evidence_data(
+    query_id: str, db: DBSession
+) -> "tuple[dict, dict, dict, str, bytes | None, bool, dict | None]":
     """
-    Build and return a ZIP bundle for a single query (admin only).
+    Gather all evidence data for a query.
 
-    Bundle contents:
-      guidance.json           — stored guidance_json for the query
-      audit.json              — audit receipt fields
-      verify.json             — HMAC chain verification result
-      cited_source_excerpt.txt — full text of the cited corpus chunk
-      cited_page_<N>.pdf      — single-page PDF extract (if PDF + page known)
-
-    Intended for post-incident evidence packaging and chain-of-custody review.
+    Returns:
+      (guidance, audit_dict, verify_dict, excerpt_text,
+       cited_page_pdf, pdf_included, corpus_doc_meta)
     """
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin token required")
-
     q = db.query(Query).filter(Query.id == query_id).first()
     if not q:
         raise HTTPException(status_code=404, detail="Query not found")
@@ -1015,7 +1071,6 @@ def get_evidence_zip(
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     audit_dict = _build_audit_dict(entry) if entry else {}
 
-    # Compute HMAC verify inline
     if entry:
         _valid = verify_entry(
             query_id=query_id,
@@ -1035,10 +1090,9 @@ def get_evidence_zip(
         verify_dict = {"queryId": query_id, "valid": False, "detail": "Audit entry not found"}
 
     guidance = q.guidance_json or {}
-
-    # Locate the cited chunk text and document
     excerpt_text = guidance.get("excerpt", "")
     cited_page_pdf: bytes | None = None
+    corpus_doc_meta: dict | None = None
 
     if guidance.get("type") == "approved":
         doc = guidance.get("document", {})
@@ -1046,7 +1100,7 @@ def get_evidence_zip(
         chunk_idx = doc.get("chunkIndex")
         page_num  = doc.get("page")
 
-        # Full chunk text from DB (more complete than the 800-char excerpt)
+        # Full chunk text from DB
         if doc_id and chunk_idx is not None:
             try:
                 _chunk_row = db.execute(
@@ -1059,6 +1113,27 @@ def get_evidence_zip(
                 ).fetchone()
                 if _chunk_row:
                     excerpt_text = _chunk_row[0] or excerpt_text
+            except Exception:
+                db.rollback()
+
+        # Corpus provenance
+        if doc_id:
+            try:
+                _corp_row = db.execute(
+                    text("""
+                        SELECT rel_path, sha256, status_override, effective_date, review_date
+                        FROM corpus_documents WHERE rel_path = :rel
+                    """),
+                    {"rel": doc_id},
+                ).fetchone()
+                if _corp_row:
+                    corpus_doc_meta = {
+                        "rel_path":        _corp_row[0],
+                        "sha256":          _corp_row[1],
+                        "status_override": _corp_row[2],
+                        "effective_date":  _corp_row[3],
+                        "review_date":     _corp_row[4],
+                    }
             except Exception:
                 db.rollback()
 
@@ -1076,18 +1151,152 @@ def get_evidence_zip(
                         _writer.write(_pdf_buf)
                         cited_page_pdf = _pdf_buf.getvalue()
                 except Exception:
-                    pass  # non-fatal; bundle proceeds without the PDF page
+                    pass
 
-    # Assemble ZIP in memory
+    pdf_included = cited_page_pdf is not None
+    return guidance, audit_dict, verify_dict, excerpt_text, cited_page_pdf, pdf_included, corpus_doc_meta
+
+
+def _build_manifest(
+    query_id: str,
+    generated_utc: str,
+    file_entries: list[dict],
+    pdf_deterministic: bool,
+    corpus_doc_meta: "dict | None",
+) -> dict:
+    return {
+        "schema": "evidence-manifest/v1",
+        "query_id": query_id,
+        "generated_utc": generated_utc,
+        "git": {
+            "repo": "keystone-gov",
+            "commit": _VERSION,
+            "dirty": False,
+        },
+        "pdf_deterministic": pdf_deterministic,
+        "files": file_entries,
+        "corpus_document": corpus_doc_meta,
+    }
+
+
+@app.get("/evidence/{query_id}/manifest")
+def get_evidence_manifest(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    """Return the evidence manifest JSON for a query (any authenticated role)."""
+    guidance, audit_dict, verify_dict, excerpt_text, cited_page_pdf, pdf_included, corpus_doc_meta = \
+        _build_evidence_data(query_id, db)
+
+    # Build the same file list as the ZIP would contain, in sorted order.
+    _files: list[tuple[str, bytes]] = []
+    _guidance_bytes  = json.dumps(guidance,    sort_keys=True, indent=2).encode()
+    _audit_bytes     = json.dumps(audit_dict,  sort_keys=True, indent=2).encode()
+    _verify_bytes    = json.dumps(verify_dict, sort_keys=True, indent=2).encode()
+    _excerpt_bytes   = excerpt_text.encode() if isinstance(excerpt_text, str) else excerpt_text
+
+    _files.append(("audit.json",               _audit_bytes))
+    _files.append(("cited_source_excerpt.txt", _excerpt_bytes))
+    _files.append(("guidance.json",            _guidance_bytes))
+    _files.append(("verify.json",              _verify_bytes))
+
+    if cited_page_pdf is not None:
+        page_label = guidance.get("document", {}).get("page", "0")
+        _files.append((f"cited_page_{page_label}.pdf", cited_page_pdf))
+
+    _files.sort(key=lambda x: x[0])
+
+    file_entries = [
+        {
+            "name":   name,
+            "sha256": _sha256_hex(data),
+            "bytes":  len(data),
+        }
+        for name, data in _files
+    ]
+
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    manifest = _build_manifest(
+        query_id=query_id,
+        generated_utc=generated_utc,
+        file_entries=file_entries,
+        pdf_deterministic=not pdf_included,
+        corpus_doc_meta=corpus_doc_meta,
+    )
+    return manifest
+
+
+@app.get("/evidence/{query_id}.zip")
+def get_evidence_zip(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    """
+    Build and return a deterministic ZIP bundle for a single query (admin only).
+
+    Bundle contents (written in sorted alphabetical order):
+      audit.json              — audit receipt fields
+      cited_source_excerpt.txt — full text of the cited corpus chunk
+      cited_page_<N>.pdf      — single-page PDF extract (if PDF + page known)
+      guidance.json           — stored guidance_json for the query
+      verify.json             — HMAC chain verification result
+      manifest.json           — sha256 of all above files (written last)
+
+    All ZipInfo entries use date_time=(1980,1,1,0,0,0) for determinism.
+    JSON files use sort_keys=True for canonical form.
+    """
+    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+    guidance, audit_dict, verify_dict, excerpt_text, cited_page_pdf, pdf_included, corpus_doc_meta = \
+        _build_evidence_data(query_id, db)
+
+    # Collect all non-manifest files as (name, bytes) then sort alphabetically.
+    _guidance_bytes  = json.dumps(guidance,    sort_keys=True, indent=2).encode()
+    _audit_bytes     = json.dumps(audit_dict,  sort_keys=True, indent=2).encode()
+    _verify_bytes    = json.dumps(verify_dict, sort_keys=True, indent=2).encode()
+    _excerpt_bytes   = excerpt_text.encode() if isinstance(excerpt_text, str) else excerpt_text
+
+    _files: list[tuple[str, bytes]] = [
+        ("audit.json",               _audit_bytes),
+        ("cited_source_excerpt.txt", _excerpt_bytes),
+        ("guidance.json",            _guidance_bytes),
+        ("verify.json",              _verify_bytes),
+    ]
+
+    if cited_page_pdf is not None:
+        page_label = guidance.get("document", {}).get("page", "0")
+        _files.append((f"cited_page_{page_label}.pdf", cited_page_pdf))
+
+    _files.sort(key=lambda x: x[0])
+
+    # Build manifest using sha256 of each file's bytes.
+    file_entries = [
+        {
+            "name":   name,
+            "sha256": _sha256_hex(data),
+            "bytes":  len(data),
+        }
+        for name, data in _files
+    ]
+    generated_utc = datetime.now(timezone.utc).isoformat()
+    manifest = _build_manifest(
+        query_id=query_id,
+        generated_utc=generated_utc,
+        file_entries=file_entries,
+        pdf_deterministic=not pdf_included,
+        corpus_doc_meta=corpus_doc_meta,
+    )
+    manifest_bytes = json.dumps(manifest, sort_keys=True, indent=2).encode()
+
+    # Assemble ZIP in memory — sorted files first, manifest last.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("guidance.json",             json.dumps(guidance,    indent=2))
-        zf.writestr("audit.json",                json.dumps(audit_dict,  indent=2))
-        zf.writestr("verify.json",               json.dumps(verify_dict, indent=2))
-        zf.writestr("cited_source_excerpt.txt",  excerpt_text)
-        if cited_page_pdf is not None:
-            page_label = guidance.get("document", {}).get("page", "0")
-            zf.writestr(f"cited_page_{page_label}.pdf", cited_page_pdf)
+        for name, data in _files:
+            _zip_writestr_det(zf, name, data)
+        _zip_writestr_det(zf, "manifest.json", manifest_bytes)
 
     filename = f"evidence-{query_id[:8]}.zip"
     return Response(
