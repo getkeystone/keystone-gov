@@ -479,10 +479,29 @@ def _corpus_fts_retrieve(
         }
         return guidance, "refused", [], []
 
+    # Fetch content_kind for all matched documents in one query.
+    # Used by intent-aware rerankers to apply kind-specific multipliers
+    # without changing the row tuple structure.
+    _matched_rels = list({r[0] for r in rows})
+    try:
+        _ck_rows = db.execute(
+            text("SELECT rel_path, content_kind FROM corpus_documents"
+                 " WHERE rel_path = ANY(:rels)"),
+            {"rels": _matched_rels},
+        ).fetchall()
+        _content_kind_map: dict[str, str] = {r[0]: r[1] for r in _ck_rows}
+    except Exception:
+        db.rollback()
+        _content_kind_map = {}
+
     # Rerank: penalize TOC/front-matter chunks, boost procedural content.
+    # Procedure-kind docs receive a mild ×1.15 boost on the default path
+    # (before any intent-specific secondary sort overrides this ranking).
     reranked = sorted(
         rows,
-        key=lambda r: _rerank_score(r[2], r[3], r[4]),
+        key=lambda r: _rerank_score(r[2], r[3], r[4]) * (
+            1.15 if _content_kind_map.get(r[0], "procedure") == "procedure" else 1.0
+        ),
         reverse=True,
     )
 
@@ -567,6 +586,11 @@ def _corpus_fts_retrieve(
             n_explicit = len(_EXPLICIT_REQUIRES_SPEC.findall(txt))
             if n_explicit > 0:
                 base *= 1.0 + min(n_explicit * 2.0, 8.0)
+            # content_kind boost: docs tagged 'requirements' in corpus metadata
+            # receive a ×1.35 multiplier to prefer authoritative spec sections
+            # when the operator has explicitly labelled the document.
+            if _content_kind_map.get(_ri, "procedure") == "requirements":
+                base *= 1.35
             return base
 
         reranked = sorted(reranked, key=_req_intent_score, reverse=True)
@@ -1040,8 +1064,12 @@ def _corpus_fts_retrieve(
         "procedure_quality": _pq,
     }
     # Attach structured requirements data when present (requirements-intent queries).
-    # Only emit when items or notes were extracted to keep the response lean.
-    if _req_data is not None and (_req_data["items"] or _req_data["wiring_notes"]):
+    # Emit when items were extracted (notes may be empty after hygiene filter).
+    if _req_data is not None and (
+        _req_data["items"]
+        or _req_data["wiring_notes"]
+        or _req_data["grounding_notes"]
+    ):
         guidance["requirements"] = _req_data
     if _final_notice is not None:
         guidance["notice"] = _final_notice

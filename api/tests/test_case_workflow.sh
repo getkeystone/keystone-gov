@@ -19,11 +19,11 @@
 #
 # Usage:
 #   bash api/tests/test_case_workflow.sh [BASE_URL]
-#   BASE_URL defaults to http://127.0.0.1:5174/api
+#   BASE_URL defaults to http://127.0.0.1:8080/api
 
 set -euo pipefail
 
-BASE="${1:-http://127.0.0.1:5174/api}"
+BASE="${1:-http://127.0.0.1:8080/api}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFIER="$(cd "$SCRIPT_DIR/../../.." && pwd)/keystone-deploy/tools/verify_case_pack.py"
 PASS=0

@@ -12,13 +12,13 @@
 #   4. Set one doc to 'superseded', run a query in training mode → expect
 #      approved (training mode allows superseded).
 #
-# Requires: a running API at BASE_URL (default http://127.0.0.1:5174/api).
+# Requires: a running API at BASE_URL (default http://127.0.0.1:8080/api).
 # Auth: admin/admin (override with ADMIN_USER / ADMIN_PASS).
 # DB:   docker exec on PG_CONTAINER (superuser keystone), or local psql.
 
 set -euo pipefail
 
-BASE="${1:-http://127.0.0.1:5174/api}"
+BASE="${1:-http://127.0.0.1:8080/api}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:-admin}"
 DATABASE_URL="${DATABASE_URL:-postgresql://keystone_app:keystone_app_pw@localhost:5432/keystone}"
