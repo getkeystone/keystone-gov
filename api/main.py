@@ -1,14 +1,17 @@
+import io
+import json
 import os
 import re
 import subprocess
 import sys
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query as QueryParam
+from fastapi import Depends, FastAPI, Header, HTTPException, Query as QueryParam, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, text
@@ -28,6 +31,7 @@ from schemas import (
     QueryResponse,
     SourceResponse,
 )
+from procedure_parse import parse_procedure
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 
@@ -301,6 +305,42 @@ def _corpus_fts_retrieve(
 
     _clean_top = clean_lines(top_text)
     _eff_page = top_page if top_page is not None else top_chunk
+
+    # ── Fetch adjacent chunks for structured procedure parsing ────────────────
+    # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
+    try:
+        adj_rows = db.execute(
+            text("""
+                SELECT cc.text
+                FROM corpus_chunks cc
+                JOIN corpus_documents cd ON cd.id = cc.doc_id
+                WHERE cd.rel_path = :rel
+                  AND cc.chunk_index BETWEEN :lo AND :hi
+                ORDER BY cc.chunk_index
+            """),
+            {"rel": top_rel, "lo": top_chunk - 2, "hi": top_chunk + 2},
+        ).fetchall()
+        _combined = "\n".join(r[0] for r in adj_rows)
+    except Exception:
+        db.rollback()
+        _combined = top_text
+    procedure = parse_procedure(_combined)
+
+    # ── Fetch document-level metadata (owner/dates/status) ───────────────────
+    try:
+        _meta = db.execute(
+            text("SELECT owner, effective_date, review_date, status_override"
+                 " FROM corpus_documents WHERE rel_path = :rel"),
+            {"rel": top_rel},
+        ).fetchone()
+    except Exception:
+        db.rollback()
+        _meta = None
+    _owner      = (_meta[0] if _meta else "") or ""
+    _eff_date   = (_meta[1] if _meta else "") or ""
+    _rev_date   = (_meta[2] if _meta else "") or ""
+    _status_ov  = (_meta[3] if _meta else "") or ""
+
     guidance = {
         "type": "approved",
         "summary": make_summary(_clean_top),
@@ -311,12 +351,15 @@ def _corpus_fts_retrieve(
             "section": f"page {top_page}" if top_page is not None else f"chunk {top_chunk}",
             "page": _eff_page,
             "chunkIndex": top_chunk,
-            "status": "active",
-            "effectiveDate": "",
-            "reviewDate": "",
-            "owner": "",
+            "status": _status_ov if _status_ov else "active",
+            "effectiveDate": _eff_date,
+            "reviewDate": _rev_date,
+            "owner": _owner,
         },
     }
+    # Only include procedure when it has meaningful content.
+    if any(procedure[k] for k in ("steps", "warnings", "prereqs", "codes")):
+        guidance["procedure"] = procedure
     # Return top 5 reranked candidates as sources/citations.
     top5 = reranked[:5]
     sources = [
@@ -901,6 +944,121 @@ def verify_audit(
         queryId=query_id,
         valid=valid,
         detail="HMAC matches" if valid else "HMAC mismatch — record may have been tampered",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Evidence bundle export (admin only)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/evidence/{query_id}.zip")
+def get_evidence_zip(
+    query_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: Session = Depends(get_current_session),
+):
+    """
+    Build and return a ZIP bundle for a single query (admin only).
+
+    Bundle contents:
+      guidance.json           — stored guidance_json for the query
+      audit.json              — audit receipt fields
+      verify.json             — HMAC chain verification result
+      cited_source_excerpt.txt — full text of the cited corpus chunk
+      cited_page_<N>.pdf      — single-page PDF extract (if PDF + page known)
+
+    Intended for post-incident evidence packaging and chain-of-custody review.
+    """
+    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+    q = db.query(Query).filter(Query.id == query_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
+    audit_dict = _build_audit_dict(entry) if entry else {}
+
+    # Compute HMAC verify inline
+    if entry:
+        _valid = verify_entry(
+            query_id=query_id,
+            timestamp=entry.timestamp,
+            role_used=entry.role_used,
+            mode_used=entry.mode_used,
+            policy_outcome=entry.policy_outcome,
+            prev_hash=entry.prev_hash,
+            stored_hash=entry.entry_hash,
+        )
+        verify_dict = {
+            "queryId": query_id,
+            "valid": _valid,
+            "detail": "HMAC matches" if _valid else "HMAC mismatch — record may have been tampered",
+        }
+    else:
+        verify_dict = {"queryId": query_id, "valid": False, "detail": "Audit entry not found"}
+
+    guidance = q.guidance_json or {}
+
+    # Locate the cited chunk text and document
+    excerpt_text = guidance.get("excerpt", "")
+    cited_page_pdf: bytes | None = None
+
+    if guidance.get("type") == "approved":
+        doc = guidance.get("document", {})
+        doc_id    = doc.get("documentId", "")
+        chunk_idx = doc.get("chunkIndex")
+        page_num  = doc.get("page")
+
+        # Full chunk text from DB (more complete than the 800-char excerpt)
+        if doc_id and chunk_idx is not None:
+            try:
+                _chunk_row = db.execute(
+                    text("""
+                        SELECT cc.text FROM corpus_chunks cc
+                        JOIN corpus_documents cd ON cd.id = cc.doc_id
+                        WHERE cd.rel_path = :rel AND cc.chunk_index = :idx
+                    """),
+                    {"rel": doc_id, "idx": chunk_idx},
+                ).fetchone()
+                if _chunk_row:
+                    excerpt_text = _chunk_row[0] or excerpt_text
+            except Exception:
+                db.rollback()
+
+        # Single-page PDF extract
+        if doc_id and isinstance(page_num, int):
+            _doc_path = (_CORPUS_ROOT / "active" / doc_id).resolve()
+            if _doc_path.exists() and _doc_path.suffix.lower() == ".pdf":
+                try:
+                    from pypdf import PdfReader, PdfWriter
+                    _reader = PdfReader(str(_doc_path))
+                    if 1 <= page_num <= len(_reader.pages):
+                        _writer = PdfWriter()
+                        _writer.add_page(_reader.pages[page_num - 1])
+                        _pdf_buf = io.BytesIO()
+                        _writer.write(_pdf_buf)
+                        cited_page_pdf = _pdf_buf.getvalue()
+                except Exception:
+                    pass  # non-fatal; bundle proceeds without the PDF page
+
+    # Assemble ZIP in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("guidance.json",             json.dumps(guidance,    indent=2))
+        zf.writestr("audit.json",                json.dumps(audit_dict,  indent=2))
+        zf.writestr("verify.json",               json.dumps(verify_dict, indent=2))
+        zf.writestr("cited_source_excerpt.txt",  excerpt_text)
+        if cited_page_pdf is not None:
+            page_label = guidance.get("document", {}).get("page", "0")
+            zf.writestr(f"cited_page_{page_label}.pdf", cited_page_pdf)
+
+    filename = f"evidence-{query_id[:8]}.zip"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

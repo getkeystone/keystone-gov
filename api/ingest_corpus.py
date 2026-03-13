@@ -197,6 +197,10 @@ def main() -> None:
     )
 
     for fpath in files:
+        # Skip metadata sidecar files — they are read as part of the parent doc.
+        if fpath.name.endswith(".metadata.json"):
+            continue
+
         rel   = str(fpath.relative_to(ACTIVE_DIR))
         mime  = mime_for(fpath)
         sha   = sha256_file(fpath)
@@ -204,6 +208,23 @@ def main() -> None:
         size  = stat.st_size
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
         title = fpath.stem.replace("_", " ").replace("-", " ")
+
+        # ── Read optional metadata sidecar ────────────────────────────────────
+        # Convention: <filename>.metadata.json  (e.g. report.pdf.metadata.json)
+        meta_owner: str = ""
+        meta_eff:   str = ""
+        meta_rev:   str = ""
+        meta_status: str = ""
+        meta_path = Path(str(fpath) + ".metadata.json")
+        if meta_path.exists():
+            try:
+                _meta = json.loads(meta_path.read_text())
+                meta_owner  = str(_meta.get("owner",        "") or "")
+                meta_eff    = str(_meta.get("effectiveDate", "") or "")
+                meta_rev    = str(_meta.get("reviewDate",    "") or "")
+                meta_status = str(_meta.get("status",        "") or "")
+            except Exception as _exc:
+                print(f"  WARN [{rel}] metadata parse error: {_exc}", file=sys.stderr)
 
         # ── Check existing record ──────────────────────────────────────────────
         cur.execute("SELECT id, sha256 FROM corpus_documents WHERE rel_path = %s", (rel,))
@@ -350,15 +371,20 @@ def main() -> None:
             cur.execute("DELETE FROM corpus_chunks WHERE doc_id = %s", (doc_id,))
             cur.execute(
                 """UPDATE corpus_documents
-                      SET sha256=%s, size_bytes=%s, mtime_utc=%s, mime=%s, title=%s
+                      SET sha256=%s, size_bytes=%s, mtime_utc=%s, mime=%s, title=%s,
+                          owner=%s, effective_date=%s, review_date=%s, status_override=%s
                     WHERE id=%s""",
-                (sha, size, mtime, mime, title, doc_id),
+                (sha, size, mtime, mime, title,
+                 meta_owner, meta_eff, meta_rev, meta_status, doc_id),
             )
         else:
             cur.execute(
-                """INSERT INTO corpus_documents (rel_path, sha256, size_bytes, mtime_utc, mime, title)
-                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-                (rel, sha, size, mtime, mime, title),
+                """INSERT INTO corpus_documents
+                       (rel_path, sha256, size_bytes, mtime_utc, mime, title,
+                        owner, effective_date, review_date, status_override)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (rel, sha, size, mtime, mime, title,
+                 meta_owner, meta_eff, meta_rev, meta_status),
             )
             doc_id = cur.fetchone()[0]
 
