@@ -285,7 +285,8 @@ def _lexical_score(terms: set[str], doc: Document) -> int:
 
 
 def _corpus_fts_retrieve(
-    question: str, mode: str, db: DBSession
+    question: str, mode: str, db: DBSession,
+    domain_filter: "list[str] | None" = None,
 ) -> "tuple[dict, str, list, list] | None":
     """
     Postgres FTS retrieval from corpus_chunks.
@@ -293,6 +294,9 @@ def _corpus_fts_retrieve(
     Returns None if corpus is empty — caller falls through to lexical fixtures.
     Returns a refusal tuple if corpus is non-empty but no FTS hits are found.
     All corpus docs are treated as role-0 (no per-doc ACL on corpus yet).
+
+    domain_filter: when provided, only match documents whose domain is in
+    the list.  None (default) = no domain restriction.
     """
     try:
         count = db.execute(text("SELECT COUNT(*) FROM corpus_chunks LIMIT 1")).scalar()
@@ -306,22 +310,28 @@ def _corpus_fts_retrieve(
     if not count:
         return None  # corpus not yet ingested — fall through to lexical fixtures
 
-    _FTS_SQL = """
+    _domain_clause = "AND cd.domain = ANY(:domains)" if domain_filter else ""
+    _domain_params: dict = {"domains": domain_filter} if domain_filter else {}
+
+    _FTS_SQL = f"""
         SELECT
             cd.rel_path,
             cd.title,
             cc.chunk_index,
             cc.text,
             ts_rank_cd(cc.tsv, query) AS rank,
-            cc.page
+            cc.page,
+            cd.domain
         FROM corpus_chunks cc
         JOIN corpus_documents cd ON cd.id = cc.doc_id
         CROSS JOIN websearch_to_tsquery('english', :q) query
         WHERE cc.tsv @@ query
+          {_domain_clause}
         ORDER BY rank DESC
         LIMIT 50
     """
-    rows = db.execute(text(_FTS_SQL), {"q": question}).fetchall()
+    _fts_params = {"q": question, **_domain_params}
+    rows = db.execute(text(_FTS_SQL), _fts_params).fetchall()
 
     # OR-expansion fallback: when AND-FTS returns nothing, retry with any matching term.
     # This handles equipment questions where brand/type keywords only appear in the
@@ -333,7 +343,7 @@ def _corpus_fts_retrieve(
         if tokens:
             or_question = " OR ".join(tokens[:8])
             try:
-                rows = db.execute(text(_FTS_SQL), {"q": or_question}).fetchall()
+                rows = db.execute(text(_FTS_SQL), {"q": or_question, **_domain_params}).fetchall()
                 _used_or_fts = bool(rows)
             except Exception:
                 db.rollback()
@@ -362,7 +372,7 @@ def _corpus_fts_retrieve(
     # CPR/first-aid content ranks above AED-operation content.
     if _ELECTRICAL_INJURY_INTENT.search(question):
         def _intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg = row
+            _ri, _ti, ci, txt, rank, _pg, _dom = row
             base = _rerank_score(ci, txt, rank)
             if _AED_DELIVERY_MARKERS.search(txt):
                 base *= 0.25  # penalize AED shock-delivery content
@@ -371,7 +381,7 @@ def _corpus_fts_retrieve(
             return base
         reranked = sorted(rows, key=_intent_score, reverse=True)
 
-    top_rel, top_title, top_chunk, top_text, _fts_rank, top_page = reranked[0]
+    top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _toc_filtered = False
     _used_fallback = False
 
@@ -406,6 +416,15 @@ def _corpus_fts_retrieve(
                 top_rel, top_title, top_chunk, top_text, top_page = (
                     fb_rel, fb_title, fb_chunk, fb_text, fb_page
                 )
+                # Re-look up domain for the fallback document.
+                try:
+                    _top_domain = db.execute(
+                        text("SELECT domain FROM corpus_documents WHERE rel_path = :rel"),
+                        {"rel": top_rel},
+                    ).scalar() or "fire_ops"
+                except Exception:
+                    db.rollback()
+                    _top_domain = "fire_ops"
                 _used_fallback = True
                 _fts_rank = _BASE
                 break
@@ -541,6 +560,40 @@ def _corpus_fts_retrieve(
     elif _pq["decision"] == "weak":
         _pq_notice = "LOW_CONFIDENCE"
 
+    # ── Medical EMR gate — operational mode, medical_emr domain ─────────────
+    # In operational mode, medical EMR documents must meet a higher confidence
+    # bar than fire-ops documents.  A weak or rejected procedure extraction is
+    # refused outright rather than shown with a LOW_CONFIDENCE notice, because
+    # imprecise medical guidance can cause harm.
+    #
+    # When quality IS sufficient, an EMR disclaimer notice is added so the
+    # officer always sees the governance boundary (metadata-driven, not
+    # hardcoded to any specific document ID or title).
+    if mode == "operational" and _top_domain == "medical_emr":
+        if _pq["decision"] in ("reject", "weak") or _pq_notice in ("PROCEDURE_EXTRACT_REJECTED",):
+            return {
+                "type": "refusal",
+                "reasonCode": "LOW_CONFIDENCE_MEDICAL",
+                "title": "Medical guidance refused — low confidence",
+                "message": (
+                    "The system found a potentially relevant medical/EMR document but "
+                    "could not extract a high-confidence procedure. "
+                    "Providing imprecise medical guidance could cause harm."
+                ),
+                "safeNextStep": (
+                    "Contact medical control or your Medical Director for guidance. "
+                    "Do not act on unverified medical information."
+                ),
+                "hiddenSource": False,
+            }, "refused", [], []
+        # High-confidence medical EMR result — add pilot disclaimer.
+        _emr_notice = (
+            "MEDICAL_EMR: EMR reference only. "
+            "Follow local protocol and medical direction. "
+            "Call medical control when required."
+        )
+        _notice = _emr_notice if not _notice else f"{_emr_notice} | {_notice}"
+
     # Merge notices: quality notice takes precedence; if both, combine.
     if _pq_notice and _notice:
         _final_notice: str | None = _pq_notice  # quality notice wins in text; both communicated
@@ -566,6 +619,7 @@ def _corpus_fts_retrieve(
             # True iff file exists on disk with supported extension.
             # Console uses this to gate the "Open document" button.
             "available": _doc_available(top_rel),
+            "domain": _top_domain,
         },
         # Top-level structured procedure fields (always present, may be empty lists)
         "steps":           _pq_steps,
@@ -594,7 +648,7 @@ def _corpus_fts_retrieve(
             "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
             "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
         }
-        for rel_path, title, chunk_idx, _text, rank, pg in top5
+        for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
     ]
     citations = [
         {
@@ -603,13 +657,14 @@ def _corpus_fts_retrieve(
             "page": pg,
             "snippet": chunk_text_val[:300],
         }
-        for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg in top5
+        for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg, _dom in top5
     ]
     return guidance, "allowed", sources, citations
 
 
 def _retrieve(
-    question: str, mode: str, role_level: int, db: DBSession
+    question: str, mode: str, role_level: int, db: DBSession,
+    domain_filter: "list[str] | None" = None,
 ) -> tuple[dict, str, list, list]:
     """
     Primary retrieval dispatcher:
@@ -618,7 +673,7 @@ def _retrieve(
     Fail-closed in both paths: INSUFFICIENT_EVIDENCE if nothing matches.
     """
     # FTS path — active whenever corpus has been ingested.
-    fts_result = _corpus_fts_retrieve(question, mode, db)
+    fts_result = _corpus_fts_retrieve(question, mode, db, domain_filter=domain_filter)
     if fts_result is not None:
         return fts_result
 
@@ -919,11 +974,11 @@ def submit_query(
             stored_scenario_key = req.scenario_key
         else:
             # Unknown scenario_key — fall through to retrieval
-            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db)
+            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=req.domain_filter)
             stored_scenario_key = _scenario_key_from_guidance(guidance)
     else:
         # Real retrieval — scenario_key ignored for non-admins
-        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db)
+        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=req.domain_filter)
         stored_scenario_key = _scenario_key_from_guidance(guidance)
 
     query_id = str(uuid.uuid4())

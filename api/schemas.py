@@ -20,6 +20,8 @@ class QueryRequest(BaseModel):
     role: Optional[str] = None
     # scenario_key is an admin-only override; ignored for non-admin sessions
     scenario_key: Optional[str] = None
+    # domain_filter restricts FTS to specific corpus domains (e.g. ["fire_ops"])
+    domain_filter: Optional[list[str]] = None
 
 
 class QueryResponse(BaseModel):
