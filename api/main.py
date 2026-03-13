@@ -152,6 +152,46 @@ _MAYDAY_CONTENT_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
+# ── Requirements / specifications intent ──────────────────────────────────────
+# When a query asks about requirements or specifications, boost chunks that
+# carry a heading-like REQUIREMENTS/SPECIFICATIONS/CONNECTIONS line and
+# penalize chunks that are dense safety-caution lists without such a heading
+# AND without structured specification data (voltage/amperage/pressure tables).
+# This avoids over-penalizing chunks that embed spec data inside CAUTION items
+# (e.g. "CAUTION: Must use 12 VDC / 41 amps") while still demoting pure
+# safety-warning lists that happened to match on the word "require".
+
+# Triggers requirements intent detection on the query side.
+_REQUIREMENTS_INTENT = re.compile(
+    r'\brequirement(?:s)?\b|\bspecification(?:s)?\b|\binstall(?:ation)?\s+req',
+    re.IGNORECASE,
+)
+
+# Heading-like signal: a line on its own whose text IS a requirements/
+# specifications/connections section title.  The trailing \s*(?:\n|$) prevents
+# false matches on mid-sentence constructs like "TO POSITIVE BATTERY CONNECTION,".
+_REQUIREMENTS_HEADING_SIGNAL = re.compile(
+    r'(?:^|\n)\s*'
+    r'(?:ELECTRICAL|POWER|SYSTEM|INSTALLATION|MINIMUM)?\s*'
+    r'(?:REQUIREMENTS?|SPECIFICATIONS?|ELECTRICAL\s+CONNECTIONS?)'
+    r'\s*(?:\n|$)',
+    re.MULTILINE,
+)
+
+# Dense safety-caution marker.
+_SAFETY_CAUTION_DENSE = re.compile(
+    r'\b(?:CAUTION|WARNING|DANGER)\s*:',
+    re.IGNORECASE,
+)
+
+# Structured specification data pattern: numbered values with electrical/
+# pressure/flow units.  Presence indicates the chunk carries actual spec data
+# (even if embedded inside CAUTION items) and should not be penalized.
+_SPEC_DATA_SIGNAL = re.compile(
+    r'\b\d+\s*(?:VDC|VAC|V\b|amps?|A\b|psi|gpm|rpm|kPa|bar)\b',
+    re.IGNORECASE,
+)
+
 
 def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     """
@@ -426,6 +466,31 @@ def _corpus_fts_retrieve(
             cpr_hits = [r for r in reranked if _CPR_PROCEDURE_MARKERS.search(r[3])]
             if cpr_hits:
                 reranked = cpr_hits + [r for r in reranked if r not in cpr_hits]
+
+    # Requirements intent: apply a moderate boost to chunks with a recognised
+    # REQUIREMENTS/SPECIFICATIONS/CONNECTIONS section heading (×1.35) and a
+    # penalty (×0.45) to chunks that are dense CAUTION/WARNING numbered lists
+    # (4+ markers) without a section heading OR structured spec data.
+    #
+    # The boost is intentionally conservative so it does NOT override a
+    # caution-dense chunk that also contains embedded specification data
+    # (e.g. "CAUTION: must use 12 VDC / 41 amps") — those chunks are valuable
+    # and should keep their natural rerank score.  The penalty targets truly
+    # spec-less caution lists that matched only because they contain the word
+    # "require" in a warning sentence.
+    if _REQUIREMENTS_INTENT.search(question):
+        def _req_intent_score(row: tuple) -> float:
+            _ri, _ti, ci, txt, rank, _pg, _dom = row
+            base = _rerank_score(ci, txt, rank)
+            has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
+            if has_heading:
+                base *= 1.35  # moderate boost for explicit section headings
+            caution_count = len(_SAFETY_CAUTION_DENSE.findall(txt))
+            has_spec = bool(_SPEC_DATA_SIGNAL.search(txt))
+            if caution_count >= 4 and not has_heading and not has_spec:
+                base *= 0.45  # penalize spec-less caution lists
+            return base
+        reranked = sorted(reranked, key=_req_intent_score, reverse=True)
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _toc_filtered = False
