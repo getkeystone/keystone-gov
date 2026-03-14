@@ -72,6 +72,7 @@ class AuditEntry(Base):
     user_email = Column(String, nullable=True)
     user_display_name = Column(String, nullable=True)
     auth_source = Column(String, nullable=True)
+    simulated_role_used = Column(String, nullable=True)  # set when sim_role was active
 
 
 class Session(Base):

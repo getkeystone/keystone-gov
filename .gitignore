@@ -188,6 +188,9 @@ cython_debug/
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 
+# Keystone runtime config (real user role file — never commit)
+api/config/lrfd_user_roles.yaml
+
 # Ruff stuff:
 .ruff_cache/
 

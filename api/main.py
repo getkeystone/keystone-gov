@@ -1308,6 +1308,9 @@ _EVIDENCE_APPROVAL_TTL_SECS  = int(os.environ.get("EVIDENCE_APPROVAL_TTL_SECONDS
 #     POST /decisions/* (controlled by PUBLIC_ALLOW_DECISIONS).
 _PUBLIC_DEMO_MODE     = int(os.environ.get("PUBLIC_DEMO_MODE", "0"))
 _PUBLIC_ALLOW_DECISIONS = int(os.environ.get("PUBLIC_ALLOW_DECISIONS", "1"))
+# Reset endpoint secret — empty string disables the endpoint entirely.
+_PUBLIC_DEMO_RESET_TOKEN: str = os.environ.get("PUBLIC_DEMO_RESET_TOKEN", "").strip()
+_PUBLIC_DEMO_RETENTION_HOURS: int = int(os.environ.get("PUBLIC_DEMO_RETENTION_HOURS", "24"))
 
 
 # ---------------------------------------------------------------------------
@@ -1420,6 +1423,10 @@ async def public_demo_guard(request: Request, call_next):
         if method == "POST" and path in ("/query", "/auth/login"):
             return await call_next(request)
 
+        # Reset endpoint — token-guarded, always allowed through middleware.
+        if method == "POST" and path == "/public/reset":
+            return await call_next(request)
+
         # Optional: allow recording operator decisions in demo.
         if _PUBLIC_ALLOW_DECISIONS and method == "POST" and path.startswith("/decisions/"):
             return await call_next(request)
@@ -1469,6 +1476,88 @@ def health():
         "version": _VERSION,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public demo reset
+# ---------------------------------------------------------------------------
+#
+# POST /public/reset
+# Header: X-Reset-Token: <token>
+#
+# Deletes all transient demo data (decisions, cases, evidence requests, doc
+# change requests, doc events) and audit/query rows older than
+# PUBLIC_DEMO_RETENTION_HOURS.  Corpus tables (corpus_documents,
+# corpus_chunks) are never touched.
+#
+# Returns 404 when PUBLIC_DEMO_RESET_TOKEN is not configured (endpoint does
+# not exist in that deployment).  Returns 403 on wrong token.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/public/reset")
+def public_reset(request: Request):
+    # If the token is not configured, behave as if the endpoint does not exist.
+    if not _PUBLIC_DEMO_RESET_TOKEN:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Validate token from header.
+    provided = (request.headers.get("x-reset-token") or "").strip()
+    if not provided or provided != _PUBLIC_DEMO_RESET_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail={"message": "Invalid or missing X-Reset-Token.", "reasonCode": "RESET_TOKEN_INVALID"},
+        )
+
+    # Use DB owner credentials — keystone_app lacks DELETE on these tables.
+    owner_url = os.environ.get("TAMPER_DATABASE_URL", "")
+    if not owner_url:
+        raise HTTPException(status_code=500, detail="TAMPER_DATABASE_URL not configured")
+
+    from datetime import timedelta as _timedelta
+    # queries.created_at is a timezone-naive DateTime column.
+    cutoff_naive = datetime.utcnow() - _timedelta(hours=_PUBLIC_DEMO_RETENTION_HOURS)
+    # audit_log.timestamp is a String column storing ISO-8601 UTC strings.
+    cutoff_iso   = (datetime.now(timezone.utc) - _timedelta(hours=_PUBLIC_DEMO_RETENTION_HOURS)).isoformat()
+
+    counts: dict[str, int] = {}
+    owner_engine = create_engine(owner_url)
+    try:
+        with owner_engine.begin() as conn:
+            # Delete transient operational tables (always wipe, no retention window).
+            for tbl in (
+                "evidence_export_requests",
+                "corpus_doc_change_requests",
+                "corpus_doc_events",
+                "operator_decisions",
+                "incident_cases",
+            ):
+                r = conn.execute(text(f"DELETE FROM {tbl}"))
+                counts[tbl] = r.rowcount
+
+            # Delete old queries.
+            r = conn.execute(
+                text("DELETE FROM queries WHERE created_at < :cutoff"),
+                {"cutoff": cutoff_naive},
+            )
+            counts["queries"] = r.rowcount
+
+            # Delete old audit log entries (timestamp is a String in ISO format).
+            r = conn.execute(
+                text("DELETE FROM audit_log WHERE timestamp < :cutoff"),
+                {"cutoff": cutoff_iso},
+            )
+            counts["audit_log"] = r.rowcount
+    finally:
+        owner_engine.dispose()
+
+    print(f"[public_reset] reset complete — deleted: {counts}", flush=True)
+
+    return {
+        "reset": True,
+        "deleted": counts,
+        "retention_hours": _PUBLIC_DEMO_RETENTION_HOURS,
     }
 
 
@@ -1643,6 +1732,7 @@ def submit_query(
         user_email=current_user.email,
         user_display_name=current_user.display_name,
         auth_source=current_user.auth_source,
+        simulated_role_used=current_user.sim_role,
     ))
     db.commit()
 
@@ -3465,6 +3555,8 @@ def _build_audit_dict(entry: AuditEntry) -> dict:
         d["userEmail"] = entry.user_email
         d["userDisplayName"] = entry.user_display_name
         d["authSource"] = entry.auth_source
+        if entry.simulated_role_used:
+            d["simulatedRoleUsed"] = entry.simulated_role_used
     return d
 
 
