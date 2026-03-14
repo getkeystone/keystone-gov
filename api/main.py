@@ -2440,10 +2440,18 @@ def create_operator_decision(
 @app.get("/decisions/{query_id}")
 def get_operator_decision(
     query_id: str,
+    nullable: int = 0,
     db: DBSession = Depends(get_db),
     _session: Session = Depends(get_current_session),
 ):
-    """Return the operator decision for a query (any authenticated role)."""
+    """Return the operator decision for a query (any authenticated role).
+
+    nullable=0 (default): 404 when no decision exists (legacy behaviour).
+    nullable=1: always 200; body is {"exists": false, "decision": null} when
+                no decision has been recorded, or {"exists": true, "decision":
+                <full decision object>} when one exists.
+    Auth is enforced identically in both modes.
+    """
     try:
         row = db.execute(text("""
             SELECT id, query_id, created_at_utc, created_by_username, created_by_role,
@@ -2455,7 +2463,11 @@ def get_operator_decision(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error: {exc}")
     if not row:
+        if nullable:
+            return {"exists": False, "decision": None}
         raise HTTPException(status_code=404, detail="No decision recorded for this query")
+    if nullable:
+        return {"exists": True, "decision": _decision_to_dict(row)}
     return _decision_to_dict(row)
 
 
