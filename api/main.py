@@ -35,6 +35,13 @@ from schemas import (
     QueryResponse,
     SourceResponse,
 )
+from cf_identity import (
+    AppUser,
+    get_current_user,
+    get_cf_enabled,
+    get_demo_sim_enabled,
+    init_role_config,
+)
 from procedure_parse import parse_procedure, procedure_quality
 from requirements_parse import make_requirements_summary, parse_requirements
 from seed import DEMO_QUERIES, seed_demo_data
@@ -1364,6 +1371,7 @@ async def lifespan(app: FastAPI):
         print("[startup] API will serve /health as degraded until DB is available.",
               file=sys.stderr, flush=True)
     _load_signing_key()
+    init_role_config()
     yield
 
 
@@ -1471,6 +1479,15 @@ def health():
 
 @app.post("/auth/login", response_model=LoginResponse)
 def login(req: LoginRequest, db: DBSession = Depends(get_db)):
+    # Login endpoint is only available when CF Access is disabled or demo simulation is enabled.
+    if get_cf_enabled() and not get_demo_sim_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Password login is disabled — authenticate via Cloudflare Access.",
+                "reasonCode": "CF_AUTH_REQUIRED",
+            },
+        )
     # In public demo mode, admin login is disabled regardless of credentials.
     if _PUBLIC_DEMO_MODE:
         user_row = db.query(User).filter(User.username == req.username).first()
@@ -1492,6 +1509,22 @@ def login(req: LoginRequest, db: DBSession = Depends(get_db)):
     return LoginResponse(token=token, username=user.username, role=user.role)
 
 
+@app.get("/auth/me")
+def get_me(current_user: AppUser = Depends(get_current_user)):
+    from schemas import MeResponse
+    return MeResponse(
+        user_id=current_user.user_id,
+        email=current_user.email,
+        display_name=current_user.display_name,
+        assigned_role=current_user.assigned_role,
+        effective_role=current_user.role,
+        auth_source=current_user.auth_source,
+        cf_enabled=get_cf_enabled(),
+        sim_role=current_user.sim_role,
+        sim_enabled=get_demo_sim_enabled(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Query (requires auth; role from token only)
 # ---------------------------------------------------------------------------
@@ -1501,10 +1534,10 @@ def login(req: LoginRequest, db: DBSession = Depends(get_db)):
 def submit_query(
     req: QueryRequest,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_user: AppUser = Depends(get_current_user),
 ):
     # Role is ALWAYS derived from the authenticated session — request body value ignored.
-    role = current_session.role
+    role = current_user.role
     role_level = _ROLE_LEVEL.get(role, 0)
 
     # medical_reference mode always forces domain_filter to medical_emr only.
@@ -1606,6 +1639,10 @@ def submit_query(
         citations_returned_json=citations,
         prev_hash=prev_hash,
         entry_hash=entry_hash,
+        user_id=current_user.user_id,
+        user_email=current_user.email,
+        user_display_name=current_user.display_name,
+        auth_source=current_user.auth_source,
     ))
     db.commit()
 
@@ -1621,7 +1658,7 @@ def submit_query(
 def get_guidance(
     query_id: str,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     q = db.query(Query).filter(Query.id == query_id).first()
     if not q:
@@ -1652,7 +1689,7 @@ def get_source(
     document_id: str,
     page: int,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     # ── Corpus lookup: check corpus_documents first ────────────────────────
     # document_id matches corpus_documents.rel_path; page is the chunk index.
@@ -1721,7 +1758,7 @@ def get_source_chunk(
     document_id: str,
     chunk_index: int,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     """Fetch a corpus source page by chunk_index instead of PDF page number.
     Used by the UI when guidance.document.chunkIndex is known but page is null.
@@ -1774,7 +1811,7 @@ def get_document(
     document_id: str,
     mode: str = QueryParam(default="operational", pattern="^(operational|training)$"),
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """
     Serve a corpus document file from CORPUS_ROOT/active/<document_id>.
@@ -1843,7 +1880,7 @@ def get_document(
 def get_audit(
     query_id: str,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     if not entry:
@@ -1857,7 +1894,7 @@ def get_audit(
 def verify_audit(
     query_id: str,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
     if not entry:
@@ -2075,7 +2112,7 @@ def _build_evidence_files(
 def get_evidence_manifest(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Return the evidence manifest JSON for a query (any authenticated role)."""
     _require_signing_key()
@@ -2111,7 +2148,7 @@ def get_evidence_manifest(
 def get_evidence_zip(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """
     Build and return a deterministic ZIP bundle for a single query (admin only).
@@ -2294,7 +2331,7 @@ def create_export_request(
     query_id: str,
     body: ExportRequestBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -2326,7 +2363,7 @@ def create_export_request(
 def get_export_requests_for_query(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -2350,7 +2387,7 @@ def approve_export_request(
     req_id: str,
     body: DecisionBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -2391,7 +2428,7 @@ def reject_export_request(
     req_id: str,
     body: DecisionBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -2455,7 +2492,7 @@ def create_operator_decision(
     query_id: str,
     body: OperatorDecisionBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Record an operator decision for a query (member/officer/admin)."""
     if body.decision not in _DECISION_VALUES:
@@ -2513,7 +2550,7 @@ def get_operator_decision(
     query_id: str,
     nullable: int = 0,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     """Return the operator decision for a query (any authenticated role).
 
@@ -2547,7 +2584,7 @@ def review_operator_decision(
     query_id: str,
     body: ReviewBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Supervisor review sign-off (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -2624,7 +2661,7 @@ def _build_incident_files(
 def get_incident_manifest(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Return the incident pack manifest JSON (officer/admin)."""
     _require_signing_key()
@@ -2762,7 +2799,7 @@ def _build_incident_pack_zip(query_id: str, db: DBSession) -> bytes:
 def get_incident_pack(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Build and return a signed incident pack ZIP (officer/admin)."""
     _require_signing_key()
@@ -2810,7 +2847,7 @@ def get_supervisor_review_queue(
     decision: "str | None" = QueryParam(default=None),
     unreviewed_only: int = QueryParam(default=0),
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """
     List queries that have an operator decision, optionally filtered to
@@ -2885,7 +2922,7 @@ def get_supervisor_review_queue(
 def create_case(
     body: CreateCaseBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Create a new incident case (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -2930,7 +2967,7 @@ def list_cases(
     limit: int = QueryParam(default=25, ge=1, le=200),
     offset: int = QueryParam(default=0, ge=0),
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """List incident cases with optional filters (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -2979,7 +3016,7 @@ def list_cases(
 def get_case_timeline(
     case_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Return a merged, time-sorted timeline of events for a case (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -3085,7 +3122,7 @@ def get_case_timeline(
 def get_case_pack(
     case_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """
     Build and return a deterministic signed case pack ZIP (officer/admin).
@@ -3209,7 +3246,7 @@ def get_case_pack(
 def get_case(
     case_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Return case detail including linked query list (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -3249,7 +3286,7 @@ def patch_case(
     case_id: str,
     body: PatchCaseBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Update case fields (officer/admin). Setting status=closed sets closed_at_utc."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -3307,7 +3344,7 @@ def add_query_to_case(
     case_id: str,
     body: AddQueryBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Add a query to a case (officer/admin)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
@@ -3341,7 +3378,7 @@ def remove_query_from_case(
     case_id: str,
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """Remove a query from a case (admin only)."""
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
@@ -3367,7 +3404,7 @@ def remove_query_from_case(
 def tamper_audit_entry(
     query_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     """
     Demo-only endpoint. Corrupts the stored policy_outcome for a given query,
@@ -3414,7 +3451,7 @@ def tamper_audit_entry(
 
 
 def _build_audit_dict(entry: AuditEntry) -> dict:
-    return {
+    d = {
         "receiptId": entry.receipt_id,
         "timestamp": entry.timestamp,
         "roleUsed": entry.role_used,
@@ -3423,6 +3460,12 @@ def _build_audit_dict(entry: AuditEntry) -> dict:
         "sourcesConsidered": entry.sources_considered_json,
         "citationsReturned": entry.citations_returned_json,
     }
+    if entry.user_email:
+        d["userId"] = entry.user_id
+        d["userEmail"] = entry.user_email
+        d["userDisplayName"] = entry.user_display_name
+        d["authSource"] = entry.auth_source
+    return d
 
 
 def _change_req_to_dict(row: tuple) -> dict:
@@ -3525,7 +3568,7 @@ def list_documents(
     limit:        int         = QueryParam(default=50, ge=1, le=200),
     offset:       int         = QueryParam(default=0, ge=0),
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     today = datetime.now(timezone.utc).date().isoformat()
     filters: list[str] = []
@@ -3582,7 +3625,7 @@ def list_documents(
 @app.get("/documents/review-queue")
 def get_review_queue(
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     today = datetime.now(timezone.utc).date().isoformat()
     try:
@@ -3630,7 +3673,7 @@ def list_change_requests(
     limit:    int          = QueryParam(default=50, ge=1, le=200),
     offset:   int          = QueryParam(default=0, ge=0),
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -3667,7 +3710,7 @@ def list_change_requests(
 def get_change_request(
     req_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -3690,7 +3733,7 @@ def get_change_request(
 def get_document_registry(
     document_id: str,
     db: DBSession = Depends(get_db),
-    _session: Session = Depends(get_current_session),
+    _session: AppUser = Depends(get_current_user),
 ):
     today = datetime.now(timezone.utc).date().isoformat()
     try:
@@ -3737,7 +3780,7 @@ def patch_document_metadata(
     document_id: str,
     patch: DocMetadataPatch,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if current_session.role not in ("custodian", "admin"):
         raise HTTPException(status_code=403, detail="custodian or admin role required")
@@ -3847,7 +3890,7 @@ def create_change_request(
     document_id: str,
     body: ChangeRequestBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if current_session.role not in ("custodian", "admin"):
         raise HTTPException(status_code=403, detail="custodian or admin role required")
@@ -3902,7 +3945,7 @@ def approve_change_request(
     req_id: str,
     body: DecisionBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -3938,7 +3981,7 @@ def reject_change_request(
     req_id: str,
     body: DecisionBody,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -3973,7 +4016,7 @@ def reject_change_request(
 def apply_change_request(
     req_id: str,
     db: DBSession = Depends(get_db),
-    current_session: Session = Depends(get_current_session),
+    current_session: AppUser = Depends(get_current_user),
 ):
     if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
         raise HTTPException(status_code=403, detail="Admin role required")

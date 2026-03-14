@@ -11,6 +11,20 @@ class User(Base):
     password_hash = Column(String, nullable=False)
 
 
+class CFUser(Base):
+    """User provisioned from Cloudflare Access identity + role config."""
+    __tablename__ = "cf_users"
+    id = Column(String, primary_key=True)           # UUID
+    email = Column(String, unique=True, nullable=False)  # lowercase
+    display_name = Column(String, nullable=False)
+    assigned_role = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    source = Column(String, nullable=False, default="cloudflare_access")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Document(Base):
     """One row per (document_id, page) pair."""
     __tablename__ = "documents"
@@ -53,6 +67,11 @@ class AuditEntry(Base):
     citations_returned_json = Column(JSON, nullable=False, default=list)
     prev_hash = Column(String, nullable=False, default="")
     entry_hash = Column(String, nullable=False)
+    # Identity columns (nullable for backward compat with existing records)
+    user_id = Column(String, nullable=True)
+    user_email = Column(String, nullable=True)
+    user_display_name = Column(String, nullable=True)
+    auth_source = Column(String, nullable=True)
 
 
 class Session(Base):
