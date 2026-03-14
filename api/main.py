@@ -376,7 +376,7 @@ _EVIDENCE_THRESHOLD = 1
 _CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "/srv/keystone-corpus"))
 
 # Extensions that the /document endpoint can actually serve.
-_SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx"})
+_SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 
 # ---------------------------------------------------------------------------
 # Relevance gate — deterministic token-overlap check applied before returning
@@ -1970,6 +1970,7 @@ def get_source_chunk(
 _DOC_MEDIA_TYPES: dict[str, str] = {
     ".pdf":  "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt":  "text/plain; charset=utf-8",
 }
 
 
@@ -1993,7 +1994,7 @@ def get_document(
 
     Security:
       - Path is resolved and checked to be under CORPUS_ROOT/active/ (no traversal).
-      - Only .pdf and .docx are served; others return 415.
+      - Only .pdf, .docx, and .txt are served; others return 415.
       - File must exist in corpus_documents table (existence not guessable).
     """
     # Validate document exists in DB (prevents guessing arbitrary filenames).
@@ -2024,8 +2025,8 @@ def get_document(
     if not media_type:
         raise HTTPException(status_code=415, detail=f"Unsupported document type: {suffix}")
 
-    # PDFs: inline so browser renders in-tab; DOCX: attachment for download.
-    disposition = "inline" if suffix == ".pdf" else "attachment"
+    # PDFs and TXT: inline so browser renders in-tab; DOCX: attachment for download.
+    disposition = "inline" if suffix in (".pdf", ".txt") else "attachment"
     filename = target.name
 
     return FileResponse(
