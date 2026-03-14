@@ -3370,6 +3370,8 @@ def _change_req_to_dict(row: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_STATUS_OVERRIDES = {"", "active", "superseded", "draft", "restricted"}
+_ALLOWED_DOMAINS        = {"fire_ops", "medical_emr", "lrfd_protocol"}
+_ALLOWED_CONTENT_KINDS  = {"procedure", "requirements", "reference"}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -3379,6 +3381,8 @@ class DocMetadataPatch(BaseModel):
     effective_date: str | None = None
     review_date: str | None = None
     title_override: str | None = None
+    domain: str | None = None
+    content_kind: str | None = None
 
 
 def _corpus_doc_to_dict(row: tuple, today: str) -> dict:
@@ -3395,9 +3399,12 @@ def _corpus_doc_to_dict(row: tuple, today: str) -> dict:
       7  review_date
       8  status_override
       9  created_utc
+      10 domain
+      11 content_kind
     """
     (_id, rel_path, sha256, _size, title,
-     owner, eff_date, rev_date, status_ov, created_utc) = row
+     owner, eff_date, rev_date, status_ov, created_utc,
+     domain, content_kind) = row
     status = status_ov if status_ov else "active"
     review_overdue = bool(rev_date and rev_date < today)
     return {
@@ -3411,24 +3418,29 @@ def _corpus_doc_to_dict(row: tuple, today: str) -> dict:
         "reviewOverdue":    review_overdue,
         "sha256":           sha256 or "",
         "last_ingested_utc": created_utc.isoformat() if created_utc else "",
+        "domain":           domain or "fire_ops",
+        "content_kind":     content_kind or "procedure",
     }
 
 
 _DOC_SELECT = """
     SELECT id, rel_path, sha256, size_bytes, title, owner,
-           effective_date, review_date, status_override, created_utc
+           effective_date, review_date, status_override, created_utc,
+           domain, content_kind
     FROM corpus_documents
 """
 
 
 @app.get("/documents")
 def list_documents(
-    q:           str | None = QueryParam(default=None),
-    status:      str | None = QueryParam(default=None),
-    owner:       str | None = QueryParam(default=None),
-    overdue_only: int        = QueryParam(default=0),
-    limit:       int         = QueryParam(default=50, ge=1, le=200),
-    offset:      int         = QueryParam(default=0, ge=0),
+    q:            str | None = QueryParam(default=None),
+    status:       str | None = QueryParam(default=None),
+    owner:        str | None = QueryParam(default=None),
+    domain:       str | None = QueryParam(default=None),
+    content_kind: str | None = QueryParam(default=None),
+    overdue_only: int         = QueryParam(default=0),
+    limit:        int         = QueryParam(default=50, ge=1, le=200),
+    offset:       int         = QueryParam(default=0, ge=0),
     db: DBSession = Depends(get_db),
     _session: Session = Depends(get_current_session),
 ):
@@ -3448,6 +3460,12 @@ def list_documents(
     if owner:
         filters.append("owner ILIKE :owner")
         params["owner"] = f"%{owner}%"
+    if domain:
+        filters.append("domain = :domain")
+        params["domain"] = domain
+    if content_kind:
+        filters.append("content_kind = :content_kind")
+        params["content_kind"] = content_kind
     if overdue_only:
         filters.append("review_date != '' AND review_date < :today")
         params["today"] = today
@@ -3653,6 +3671,18 @@ def patch_document_metadata(
                 status_code=422,
                 detail=f"status_override must be one of {sorted(_ALLOWED_STATUS_OVERRIDES)}",
             )
+    if patch.domain is not None:
+        if patch.domain not in _ALLOWED_DOMAINS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"domain must be one of {sorted(_ALLOWED_DOMAINS)}",
+            )
+    if patch.content_kind is not None:
+        if patch.content_kind not in _ALLOWED_CONTENT_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"content_kind must be one of {sorted(_ALLOWED_CONTENT_KINDS)}",
+            )
     for field_name, field_val in [
         ("effective_date", patch.effective_date),
         ("review_date",    patch.review_date),
@@ -3687,6 +3717,10 @@ def patch_document_metadata(
         updates["review_date"] = patch.review_date
     if patch.title_override is not None:
         updates["title"] = patch.title_override
+    if patch.domain is not None:
+        updates["domain"] = patch.domain
+    if patch.content_kind is not None:
+        updates["content_kind"] = patch.content_kind
 
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
@@ -3736,7 +3770,8 @@ def create_change_request(
         raise HTTPException(status_code=403, detail="custodian or admin role required")
 
     # Validate patch fields
-    allowed_keys = {"owner", "status_override", "effective_date", "review_date", "title_override"}
+    allowed_keys = {"owner", "status_override", "effective_date", "review_date", "title_override",
+                    "domain", "content_kind"}
     bad = set(body.patch.keys()) - allowed_keys
     if bad:
         raise HTTPException(status_code=422, detail=f"Unknown patch fields: {bad}")
