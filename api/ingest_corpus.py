@@ -218,8 +218,8 @@ def main() -> None:
     cur  = conn.cursor()
 
     stats: dict = {
-        "added": 0, "updated": 0, "skipped": 0,
-        "skipped_keep_previous": 0, "failed": 0,
+        "added": 0, "updated": 0, "updated_metadata": 0,
+        "skipped": 0, "skipped_keep_previous": 0, "failed": 0,
         "docs": [],
         "failed_docs": [],
         "kept_previous_docs": [],
@@ -283,28 +283,45 @@ def main() -> None:
         if row:
             doc_id, stored_sha = row
             if stored_sha == sha:
-                # SHA unchanged — update domain and/or content_kind if sidecar changed them.
+                # SHA unchanged — check all sidecar-managed fields for changes.
+                # Update any that differ so that a metadata-only edit is applied
+                # without re-extracting or re-chunking the document.
                 cur.execute(
-                    "SELECT domain, content_kind FROM corpus_documents WHERE id = %s", (doc_id,)
+                    "SELECT domain, content_kind, owner, effective_date, "
+                    "review_date, status_override FROM corpus_documents WHERE id = %s",
+                    (doc_id,),
                 )
-                _stored = cur.fetchone() or ("fire_ops", "procedure")
-                stored_domain, stored_content_kind = _stored[0], _stored[1]
+                _sr = cur.fetchone() or ("fire_ops", "procedure", "", "", "", "")
+                _s_domain  = _sr[0] or ""
+                _s_ck      = _sr[1] or ""
+                _s_owner   = _sr[2] or ""
+                _s_eff     = _sr[3] or ""
+                _s_rev     = _sr[4] or ""
+                _s_status  = _sr[5] or ""
                 _updates: list[str] = []
-                _update_vals: list = []
-                if stored_domain != domain:
-                    _updates.append("domain=%s")
-                    _update_vals.append(domain)
-                if stored_content_kind != content_kind:
-                    _updates.append("content_kind=%s")
-                    _update_vals.append(content_kind)
+                _update_vals: list  = []
+                if _s_domain != domain:
+                    _updates.append("domain=%s");          _update_vals.append(domain)
+                if _s_ck != content_kind:
+                    _updates.append("content_kind=%s");    _update_vals.append(content_kind)
+                if _s_owner != meta_owner:
+                    _updates.append("owner=%s");           _update_vals.append(meta_owner)
+                if _s_eff != meta_eff:
+                    _updates.append("effective_date=%s");  _update_vals.append(meta_eff)
+                if _s_rev != meta_rev:
+                    _updates.append("review_date=%s");     _update_vals.append(meta_rev)
+                if _s_status != meta_status:
+                    _updates.append("status_override=%s"); _update_vals.append(meta_status)
                 if _updates:
                     _update_vals.append(doc_id)
                     cur.execute(
                         f"UPDATE corpus_documents SET {', '.join(_updates)} WHERE id=%s",
                         tuple(_update_vals),
                     )
+                    conn.commit()
+                    stats["updated_metadata"] += 1
                     stats["docs"].append({
-                        "rel_path": rel, "action": "metadata_updated",
+                        "rel_path": rel, "action": "updated_metadata",
                         "domain": domain, "content_kind": content_kind,
                     })
                 else:
