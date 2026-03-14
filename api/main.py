@@ -1294,6 +1294,14 @@ _REQUIRE_EVIDENCE_APPROVAL   = int(os.environ.get("REQUIRE_EVIDENCE_APPROVAL", "
 _TWO_PERSON_CONTROL          = int(os.environ.get("TWO_PERSON_CONTROL", "0"))
 _EVIDENCE_APPROVAL_TTL_SECS  = int(os.environ.get("EVIDENCE_APPROVAL_TTL_SECONDS", "3600"))
 
+# Public demo hardening (default: off).
+# When enabled:
+#   - Admin login is refused (403 PUBLIC_ADMIN_DISABLED).
+#   - All write endpoints are blocked except POST /query and optionally
+#     POST /decisions/* (controlled by PUBLIC_ALLOW_DECISIONS).
+_PUBLIC_DEMO_MODE     = int(os.environ.get("PUBLIC_DEMO_MODE", "0"))
+_PUBLIC_ALLOW_DECISIONS = int(os.environ.get("PUBLIC_ALLOW_DECISIONS", "1"))
+
 
 # ---------------------------------------------------------------------------
 # Evidence signing (Ed25519) — loaded once at startup
@@ -1371,6 +1379,57 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Public demo guard middleware
+# ---------------------------------------------------------------------------
+#
+# In PUBLIC_DEMO_MODE=1 all non-read, non-core requests are rejected before
+# they reach route handlers.  This is defence-in-depth on top of the per-
+# route role checks: even a valid officer/admin token cannot mutate state.
+#
+# Allowed in public demo mode:
+#   - Any GET / HEAD / OPTIONS
+#   - POST /query            (core demo flow)
+#   - POST /auth/login       (handled by login endpoint; admin blocked there)
+#   - POST /decisions/*      (if PUBLIC_ALLOW_DECISIONS=1, default)
+#
+# Everything else (PATCH, DELETE, other POSTs) → 403 PUBLIC_DEMO_READ_ONLY.
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+@app.middleware("http")
+async def public_demo_guard(request: Request, call_next):
+    if _PUBLIC_DEMO_MODE:
+        method = request.method.upper()
+        path   = request.url.path
+
+        # Always allow reads and CORS pre-flight.
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return await call_next(request)
+
+        # Core demo write: POST /query and POST /auth/login pass through.
+        if method == "POST" and path in ("/query", "/auth/login"):
+            return await call_next(request)
+
+        # Optional: allow recording operator decisions in demo.
+        if _PUBLIC_ALLOW_DECISIONS and method == "POST" and path.startswith("/decisions/"):
+            return await call_next(request)
+
+        # Block all other writes.
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": {
+                    "message": "Write operations are disabled in public demo mode.",
+                    "reasonCode": "PUBLIC_DEMO_READ_ONLY",
+                }
+            },
+        )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
 
@@ -1401,6 +1460,7 @@ def health():
         "db": _db_ready,
         "version": _VERSION,
         "time_utc": datetime.now(timezone.utc).isoformat(),
+        "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
     }
 
 
@@ -1411,6 +1471,17 @@ def health():
 
 @app.post("/auth/login", response_model=LoginResponse)
 def login(req: LoginRequest, db: DBSession = Depends(get_db)):
+    # In public demo mode, admin login is disabled regardless of credentials.
+    if _PUBLIC_DEMO_MODE:
+        user_row = db.query(User).filter(User.username == req.username).first()
+        if user_row and user_row.role == "admin":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Admin login is disabled in public demo mode.",
+                    "reasonCode": "PUBLIC_ADMIN_DISABLED",
+                },
+            )
     user = db.query(User).filter(User.username == req.username).first()
     if not user or not verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
