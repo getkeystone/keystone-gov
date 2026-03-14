@@ -2084,6 +2084,74 @@ def verify_audit(
     )
 
 
+@app.get("/audit")
+def list_audit(
+    limit: int = 50,
+    offset: int = 0,
+    outcome: str | None = None,
+    user_email: str | None = None,
+    since: str | None = None,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """List audit log entries — officer/admin only."""
+    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
+        raise HTTPException(status_code=403, detail="Officer or admin role required")
+
+    where_clauses: list[str] = []
+    params: dict = {"limit": min(limit, 200), "offset": offset}
+
+    if outcome:
+        where_clauses.append("al.policy_outcome = :outcome")
+        params["outcome"] = outcome
+    if user_email:
+        where_clauses.append("al.user_email ILIKE :user_email")
+        params["user_email"] = f"%{user_email}%"
+    if since:
+        where_clauses.append("al.timestamp >= :since")
+        params["since"] = since
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    try:
+        rows = db.execute(text(f"""
+            SELECT al.query_id, al.receipt_id, al.timestamp,
+                   al.role_used, al.mode_used, al.policy_outcome,
+                   al.user_email, al.user_display_name,
+                   q.question
+            FROM audit_log al
+            LEFT JOIN queries q ON q.id = al.query_id
+            {where_sql}
+            ORDER BY al.timestamp DESC
+            LIMIT :limit OFFSET :offset
+        """), params).fetchall()
+
+        count_row = db.execute(text(f"""
+            SELECT COUNT(*) FROM audit_log al
+            {where_sql}
+        """), {k: v for k, v in params.items() if k not in ("limit", "offset")}).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    total = count_row[0] if count_row else 0
+    items = []
+    for r in rows:
+        items.append({
+            "query_id":         r[0],
+            "receipt_id":       r[1],
+            "timestamp":        r[2],
+            "role_used":        r[3],
+            "mode_used":        r[4],
+            "policy_outcome":   r[5],
+            "user_email":       r[6],
+            "user_display_name": r[7],
+            "question":         r[8] or "",
+        })
+
+    return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+
 # ---------------------------------------------------------------------------
 # Evidence bundle export (admin only)
 # ---------------------------------------------------------------------------
