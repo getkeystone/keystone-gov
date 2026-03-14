@@ -223,6 +223,7 @@ def main() -> None:
         "docs": [],
         "failed_docs": [],
         "kept_previous_docs": [],
+        "sidecars_scanned": 0,
         "orphans": [],
     }
 
@@ -231,15 +232,47 @@ def main() -> None:
         if p.is_file() and not p.name.startswith(".")
     )
 
-    # Detect orphan sidecars: *.metadata.json with no corresponding document.
-    for fpath in files:
-        if not fpath.name.endswith(".metadata.json"):
-            continue
+    # Detect orphan sidecars in two passes:
+    #
+    # Pass 1 — sidecars at corpus ROOT (not under active/).
+    #   These are misplaced: the operator put the sidecar next to the corpus
+    #   root instead of next to the active/ file.  Ingest would silently ignore
+    #   them, leaving the document without its metadata.
+    #
+    # Pass 2 — sidecars inside active/ with no corresponding document.
+    #   These are stale (document removed but sidecar left behind).
+
+    root_sidecars = sorted(
+        p for p in CORPUS_ROOT.glob("*.metadata.json")
+        if p.is_file()
+    )
+    stats["sidecars_scanned"] += len(root_sidecars)
+    for fpath in root_sidecars:
+        # Derive the expected active path from the sidecar name:
+        #   <corpus_root>/foo.pdf.metadata.json  →  active/foo.pdf
+        doc_name = fpath.name[: -len(".metadata.json")]
+        correct = ACTIVE_DIR / doc_name
+        rel_root = str(fpath.relative_to(CORPUS_ROOT))
+        stats["orphans"].append(rel_root)
+        print(
+            f"  WARN orphan sidecar at corpus root (wrong location): {rel_root}\n"
+            f"       Sidecar must live beside the active file.\n"
+            f"       Move it to: active/{doc_name}.metadata.json\n"
+            f"       (Correct path: {correct}.metadata.json)",
+            file=sys.stderr,
+        )
+
+    # Count sidecars inside active/ for the summary.
+    active_sidecars = [f for f in files if f.name.endswith(".metadata.json")]
+    stats["sidecars_scanned"] += len(active_sidecars)
+
+    for fpath in active_sidecars:
         target = Path(str(fpath)[: -len(".metadata.json")])
         if not target.exists():
             rel = str(fpath.relative_to(ACTIVE_DIR))
             stats["orphans"].append(rel)
             print(f"  WARN orphan sidecar (no document): {rel}", file=sys.stderr)
+
     stats["orphans"].sort()
 
     for fpath in files:
