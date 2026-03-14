@@ -1615,6 +1615,57 @@ def get_me(current_user: AppUser = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# Temporary CF header diagnostic (only active when CLOUDFLARE_ACCESS_ENABLED=true)
+# Returns header presence/length only — never logs or returns the JWT value.
+# Remove after CF auth path is confirmed working.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/debug/cf-check")
+def debug_cf_check(request: Request):
+    """Diagnostic: confirms whether the CF Access JWT header reaches the API.
+
+    Only available when CLOUDFLARE_ACCESS_ENABLED=true.
+    Returns header metadata (presence, length) — never the JWT value.
+    """
+    if not get_cf_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    jwt_val = request.headers.get("cf-access-jwt-assertion")
+    # Collect CF-related header names only (no values) for proxy debugging.
+    cf_names = [k for k in request.headers.keys() if "cf-" in k.lower() or k.lower().startswith("x-forwarded")]
+
+    result: dict = {
+        "cf_access_enabled": True,
+        "cf_jwt_present": jwt_val is not None,
+        "cf_jwt_len": len(jwt_val) if jwt_val else 0,
+        "cf_related_header_names": sorted(cf_names),
+    }
+
+    # If JWT is present, attempt validation and report outcome (not the JWT).
+    if jwt_val:
+        try:
+            from cf_identity import _validate_cf_jwt_inner
+            email = _validate_cf_jwt_inner(jwt_val)
+            result["jwt_valid"] = True
+            result["jwt_email"] = email
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"reasonCode": str(exc.detail)}
+            result["jwt_valid"] = False
+            result["jwt_error_code"] = detail.get("reasonCode", "UNKNOWN")
+            result["jwt_error_msg"] = detail.get("message", str(exc.detail))
+        except Exception as exc:
+            result["jwt_valid"] = False
+            result["jwt_error_code"] = "EXCEPTION"
+            result["jwt_error_msg"] = str(exc)[:200]
+    else:
+        result["jwt_valid"] = False
+        result["jwt_error_code"] = "HEADER_ABSENT"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Query (requires auth; role from token only)
 # ---------------------------------------------------------------------------
 
