@@ -912,6 +912,49 @@ def _corpus_fts_retrieve(
             "hiddenSource": False,
         }, "refused", [], []
 
+    # ── Policy gate A2: operational scope guard ───────────────────────────────
+    # Enforce that operational queries retrieve the correct content_kind.
+    #
+    # Case 1: requirements-intent question but top doc is NOT content_kind=requirements
+    #         → refuse; user should check requirements corpus.
+    # Case 2: top doc IS content_kind=requirements but question has NO requirements
+    #         intent → refuse with hint to rephrase using requirements wording.
+    #
+    # Neither check fires for medical_emr (Gate B handles that path) or spec
+    # answers where the text itself contains spec data despite content_kind.
+    _has_req_intent = bool(_REQUIREMENTS_INTENT.search(question))
+    if mode == "operational" and _top_domain != "medical_emr":
+        if _has_req_intent and _top_content_kind != "requirements" and not _is_spec_answer:
+            return {
+                "type": "refusal",
+                "reasonCode": "NO_REQUIREMENTS_FOUND",
+                "title": "No requirements document found",
+                "message": (
+                    "Your question asks for specifications or requirements, but no "
+                    "requirements document matched. The closest match is a procedure "
+                    "document which may not contain the data you need."
+                ),
+                "safeNextStep": (
+                    "Check the requirements section of the corpus or consult the "
+                    "apparatus manufacturer documentation."
+                ),
+                "hiddenSource": False,
+            }, "refused", [], []
+        if not _has_req_intent and _top_content_kind == "requirements" and not _is_spec_answer:
+            return {
+                "type": "refusal",
+                "reasonCode": "LOW_CONFIDENCE",
+                "title": "Low confidence — guidance withheld",
+                "message": (
+                    "The best matching document is a requirements/specifications sheet, "
+                    "not an operational procedure. If you need electrical or installation "
+                    "requirements, try rephrasing with requirements wording "
+                    "(e.g. 'What are the electrical requirements for …')."
+                ),
+                "safeNextStep": "Consult your supervisor or training officer for the current procedure.",
+                "hiddenSource": False,
+            }, "refused", [], []
+
     # ── Policy gate B: medical_emr domain → medical_reference card ──────────
     # Operational/training queries that retrieve medical_emr documents are
     # allowed during the pilot but must never show as "Approved Guidance".
@@ -1101,6 +1144,27 @@ def _corpus_fts_retrieve(
             _req_summary = make_requirements_summary(
                 _req_data["items"], _req_data["wiring_notes"]
             )
+
+    # ── CLARIFY_MODEL notice ──────────────────────────────────────────────────
+    # If requirements items reference multiple distinct models and the question
+    # does not mention any of them, inject a CLARIFY_MODEL notice so the console
+    # can offer one-click chips to re-run with a specific model appended.
+    if _req_data is not None and len(_req_data.get("items", [])) > 0:
+        _item_models = sorted({
+            item["model"] for item in _req_data["items"]
+            if item.get("model") and item["model"].strip()
+        })
+        if len(_item_models) > 1:
+            _q_lower = question.lower()
+            _named = any(m.lower() in _q_lower for m in _item_models)
+            if not _named:
+                _clarify_notice = "CLARIFY_MODEL: Models available: " + ", ".join(_item_models)
+                # Merge into _final_notice; CLARIFY_MODEL is additive — append
+                # after any existing quality notice rather than replacing it.
+                if _final_notice:
+                    _final_notice = _final_notice + "|" + _clarify_notice
+                else:
+                    _final_notice = _clarify_notice
 
     guidance: dict = {
         "type": _guidance_type,
