@@ -416,6 +416,10 @@ def get_current_user(
     """
     # ── Path 1: Cloudflare Access JWT ──────────────────────────────────────────
     if cf_access_jwt_assertion:
+        print(
+            f"[cf_identity] CF JWT received (len={len(cf_access_jwt_assertion)})",
+            flush=True,
+        )
         email = _validate_cf_jwt_inner(cf_access_jwt_assertion)
         cf_user = provision_cf_user(email, db)
         real_role = cf_user.assigned_role
@@ -447,6 +451,10 @@ def get_current_user(
 
     # ── Path 2: CF enabled but no JWT → deny ──────────────────────────────────
     if _CF_ENABLED:
+        print(
+            "[cf_identity] CF_ASSERTION_MISSING — CF enabled but no JWT header received",
+            flush=True,
+        )
         raise HTTPException(
             status_code=401,
             detail={
