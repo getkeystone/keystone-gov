@@ -640,6 +640,7 @@ def _corpus_fts_retrieve(
                     reranked = _new_spec + list(reranked)
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
+    _top_content_kind: str = _content_kind_map.get(top_rel, "procedure")
     _toc_filtered = False
     _used_fallback = False
 
@@ -683,6 +684,7 @@ def _corpus_fts_retrieve(
                 except Exception:
                     db.rollback()
                     _top_domain = "fire_ops"
+                _top_content_kind = _content_kind_map.get(top_rel, "procedure")
                 _used_fallback = True
                 _fts_rank = _BASE
                 break
@@ -885,6 +887,7 @@ def _corpus_fts_retrieve(
                 "chunkIndex": chunk_idx,
                 "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
                 "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
+                "content_kind": _content_kind_map.get(rel_path, "procedure"),
             }
             for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
         ]
@@ -917,6 +920,7 @@ def _corpus_fts_retrieve(
                 "owner": _owner,
                 "available": _doc_available(top_rel),
                 "domain": _top_domain,
+                "content_kind": _top_content_kind,
             },
             "steps": _pq_steps if _pq["decision"] == "ok" else [],
             "warnings": _pq_warnings,
@@ -958,6 +962,7 @@ def _corpus_fts_retrieve(
                 "chunkIndex": chunk_idx,
                 "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
                 "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
+                "content_kind": _content_kind_map.get(rel_path, "procedure"),
             }
             for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
         ]
@@ -989,6 +994,7 @@ def _corpus_fts_retrieve(
                 "owner": _owner,
                 "available": _doc_available(top_rel),
                 "domain": _top_domain,
+                "content_kind": _top_content_kind,
             },
             "confidence": {
                 "rerank_reason": "; ".join(_reason_parts),
@@ -1050,6 +1056,7 @@ def _corpus_fts_retrieve(
             # Console uses this to gate the "Open document" button.
             "available": _doc_available(top_rel),
             "domain": _top_domain,
+            "content_kind": _top_content_kind,
         },
         # Procedure fields suppressed for reference type (weak quality)
         "steps":           [] if _force_reference else _pq_steps,
@@ -1085,6 +1092,7 @@ def _corpus_fts_retrieve(
             "chunkIndex": chunk_idx,
             "section": f"page {pg}" if pg is not None else f"chunk {chunk_idx}",
             "note": f"FTS rank {rank:.4f}  rerank {_rerank_score(chunk_idx, _text, rank):.4f}",
+            "content_kind": _content_kind_map.get(rel_path, "procedure"),
         }
         for rel_path, title, chunk_idx, _text, rank, pg, _dom in top5
     ]
