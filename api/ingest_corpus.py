@@ -223,12 +223,24 @@ def main() -> None:
         "docs": [],
         "failed_docs": [],
         "kept_previous_docs": [],
+        "orphans": [],
     }
 
     files = sorted(
         p for p in ACTIVE_DIR.rglob("*")
         if p.is_file() and not p.name.startswith(".")
     )
+
+    # Detect orphan sidecars: *.metadata.json with no corresponding document.
+    for fpath in files:
+        if not fpath.name.endswith(".metadata.json"):
+            continue
+        target = Path(str(fpath)[: -len(".metadata.json")])
+        if not target.exists():
+            rel = str(fpath.relative_to(ACTIVE_DIR))
+            stats["orphans"].append(rel)
+            print(f"  WARN orphan sidecar (no document): {rel}", file=sys.stderr)
+    stats["orphans"].sort()
 
     for fpath in files:
         # Skip metadata sidecar files — they are read as part of the parent doc.
