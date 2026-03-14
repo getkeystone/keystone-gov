@@ -284,3 +284,62 @@ def test_app_user_username_is_email():
         auth_source="cloudflare_access",
     )
     assert user.username == "alice@lrfd.ca"
+
+
+# ---------------------------------------------------------------------------
+# T12 — both pilot admin accounts load correctly; idempotency (no duplicates)
+# ---------------------------------------------------------------------------
+
+DUAL_ADMIN_YAML = """
+version: 1
+users:
+  - email: testuser@example.com
+    display_name: Arnaldo Sepulveda
+    role: admin
+    status: active
+  - email: arnaldo@getkeystone.ai
+    display_name: Arnaldo
+    role: admin
+    status: active
+"""
+
+
+def test_both_admin_emails_load():
+    """Both testuser@example.com and arnaldo@getkeystone.ai must be present."""
+    path = _yaml_file(DUAL_ADMIN_YAML)
+    result = load_role_config(path)
+
+    assert "testuser@example.com" in result
+    e1 = result["testuser@example.com"]
+    assert e1.role == "admin"
+    assert e1.display_name == "Arnaldo Sepulveda"
+    assert e1.status == "active"
+
+    assert "arnaldo@getkeystone.ai" in result
+    e2 = result["arnaldo@getkeystone.ai"]
+    assert e2.role == "admin"
+    assert e2.display_name == "Arnaldo"
+    assert e2.status == "active"
+
+    # Exactly 2 users — no duplicates, no phantom entries
+    assert len(result) == 2
+
+
+def test_both_admin_emails_idempotent():
+    """Loading the same config twice must yield identical results (no mutation)."""
+    path = _yaml_file(DUAL_ADMIN_YAML)
+    first  = load_role_config(path)
+    second = load_role_config(path)
+    assert set(first.keys()) == set(second.keys())
+    for email in first:
+        assert first[email].role         == second[email].role
+        assert first[email].display_name == second[email].display_name
+        assert first[email].status       == second[email].status
+
+
+def test_getkeystone_email_not_treated_as_duplicate_of_lrfd():
+    """arnaldo@getkeystone.ai and testuser@example.com are distinct emails."""
+    path = _yaml_file(DUAL_ADMIN_YAML)
+    result = load_role_config(path)
+    # If they were treated as duplicates, load_role_config would have raised.
+    assert len(result) == 2
