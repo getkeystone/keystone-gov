@@ -317,6 +317,40 @@ print('smoke corpus cleaned up')
     && pass "document: 401 without auth token" \
     || fail "document: expected 401 without auth, got $DOC_UNAUTH"
 
+  # TXT document: HTTP 200 and content-type=text/plain.
+  echo "--- 14e-txt. /document: TXT content-type ---"
+  TXT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/lrfd-001-roof-load-assessment.txt?mode=operational")
+  [ "$TXT_STATUS" = "200" ] \
+    && pass "document: HTTP 200 for known TXT" \
+    || fail "document: expected 200 for TXT, got $TXT_STATUS"
+
+  TXT_CT=$(curl -sI -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/lrfd-001-roof-load-assessment.txt?mode=operational" \
+    | tr -d '\r' | grep -i '^content-type:' | awk '{print $2}')
+  echo "$TXT_CT" | grep -q '^text/plain' \
+    && pass "document: content-type=text/plain for TXT" \
+    || fail "document: wrong content-type for TXT: $TXT_CT"
+
+  # DOCX document: HTTP 200 and correct content-type.
+  echo "--- 14e-docx. /document: DOCX content-type ---"
+  DOCX_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/COVER%202010.DOC.docx?mode=operational")
+  [ "$DOCX_STATUS" = "200" ] \
+    && pass "document: HTTP 200 for known DOCX" \
+    || fail "document: expected 200 for DOCX, got $DOCX_STATUS"
+
+  DOCX_CT=$(curl -sI -G \
+    -H "$(auth_header "$TOKEN")" \
+    "${BASE}/document/COVER%202010.DOC.docx?mode=operational" \
+    | tr -d '\r' | grep -i '^content-type:' | awk '{print $2}')
+  echo "$DOCX_CT" | grep -q '^application/vnd.openxmlformats' \
+    && pass "document: content-type=application/vnd.openxmlformats for DOCX" \
+    || fail "document: wrong content-type for DOCX: $DOCX_CT"
+
   # 14f. Reranker: decon question must not return TOC/front-matter chunk.
   echo "--- 14f. Reranker: decon question skips TOC and front-matter ---"
   DECON_Q=$(curl -sf -X POST "$BASE/query" \

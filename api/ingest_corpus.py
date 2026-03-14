@@ -290,22 +290,27 @@ def main() -> None:
 
         # ── Read optional metadata sidecar ────────────────────────────────────
         # Convention: <filename>.metadata.json  (e.g. report.pdf.metadata.json)
+        # Keys accepted in both camelCase (legacy) and snake_case (LRFD sidecars).
         meta_owner:        str = ""
         meta_eff:          str = ""
         meta_rev:          str = ""
         meta_status:       str = ""
         meta_domain:       str = ""
         meta_content_kind: str = ""
+        meta_title:        str = ""
         meta_path = Path(str(fpath) + ".metadata.json")
         if meta_path.exists():
             try:
                 _meta = json.loads(meta_path.read_text())
-                meta_owner        = str(_meta.get("owner",        "") or "")
-                meta_eff          = str(_meta.get("effectiveDate", "") or "")
-                meta_rev          = str(_meta.get("reviewDate",    "") or "")
-                meta_status       = str(_meta.get("status",        "") or "")
-                meta_domain       = str(_meta.get("domain",        "") or "")
-                meta_content_kind = str(_meta.get("content_kind",  "") or "")
+                def _ms(primary: str, fallback: str = "") -> str:
+                    return str(_meta.get(primary, "") or _meta.get(fallback, "") or "")
+                meta_owner        = _ms("owner")
+                meta_eff          = _ms("effectiveDate", "effective_date")
+                meta_rev          = _ms("reviewDate",    "review_date")
+                meta_status       = _ms("status",        "status_override")
+                meta_domain       = _ms("domain")
+                meta_content_kind = _ms("content_kind")
+                meta_title        = _ms("title")
                 if meta_domain not in _VALID_DOMAINS:
                     if meta_domain:
                         print(f"  WARN [{rel}] unknown domain '{meta_domain}' — inferring", file=sys.stderr)
@@ -316,6 +321,10 @@ def main() -> None:
                     meta_content_kind = ""
             except Exception as _exc:
                 print(f"  WARN [{rel}] metadata parse error: {_exc}", file=sys.stderr)
+
+        # Override filename-derived title with sidecar title when present.
+        if meta_title:
+            title = meta_title
 
         # Fall back to filename-based domain detection when sidecar omits it.
         domain       = meta_domain or _infer_domain(rel, title)
@@ -333,16 +342,17 @@ def main() -> None:
                 # without re-extracting or re-chunking the document.
                 cur.execute(
                     "SELECT domain, content_kind, owner, effective_date, "
-                    "review_date, status_override FROM corpus_documents WHERE id = %s",
+                    "review_date, status_override, title FROM corpus_documents WHERE id = %s",
                     (doc_id,),
                 )
-                _sr = cur.fetchone() or ("fire_ops", "procedure", "", "", "", "")
+                _sr = cur.fetchone() or ("fire_ops", "procedure", "", "", "", "", "")
                 _s_domain  = _sr[0] or ""
                 _s_ck      = _sr[1] or ""
                 _s_owner   = _sr[2] or ""
                 _s_eff     = _sr[3] or ""
                 _s_rev     = _sr[4] or ""
                 _s_status  = _sr[5] or ""
+                _s_title   = _sr[6] or ""
                 _updates: list[str] = []
                 _update_vals: list  = []
                 if _s_domain != domain:
@@ -357,6 +367,8 @@ def main() -> None:
                     _updates.append("review_date=%s");     _update_vals.append(meta_rev)
                 if _s_status != meta_status:
                     _updates.append("status_override=%s"); _update_vals.append(meta_status)
+                if _s_title != title:
+                    _updates.append("title=%s");           _update_vals.append(title)
                 if _updates:
                     _update_vals.append(doc_id)
                     cur.execute(
