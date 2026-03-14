@@ -62,9 +62,26 @@ class AuditResponse(BaseModel):
     policyOutcome: str
     sourcesConsidered: Any
     citationsReturned: Any
+    # Identity fields (present when CF Access or demo identity is available)
+    userId: Optional[str] = None
+    userEmail: Optional[str] = None
+    userDisplayName: Optional[str] = None
+    authSource: Optional[str] = None
 
 
 class AuditVerifyResponse(BaseModel):
     queryId: str
     valid: bool
     detail: str
+
+
+class MeResponse(BaseModel):
+    user_id: str
+    email: str
+    display_name: str
+    assigned_role: str
+    effective_role: str
+    auth_source: str
+    cf_enabled: bool
+    sim_role: Optional[str] = None
+    sim_enabled: bool = False
