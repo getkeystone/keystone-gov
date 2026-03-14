@@ -343,3 +343,73 @@ def test_getkeystone_email_not_treated_as_duplicate_of_lrfd():
     result = load_role_config(path)
     # If they were treated as duplicates, load_role_config would have raised.
     assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# T15-T17 — demo users (gmail member + protonmail officer)
+# ---------------------------------------------------------------------------
+
+DEMO_USERS_YAML = """
+version: 1
+users:
+  - email: arnaldosepulveda@lrfd.ca
+    display_name: Arnaldo Sepulveda
+    role: admin
+    status: active
+  - email: arnaldo@getkeystone.ai
+    display_name: Arnaldo
+    role: admin
+    status: active
+  - email: arnaldosepulveda@gmail.com
+    display_name: Arnaldo Demo
+    role: member
+    status: active
+  - email: natureuplift@protonmail.com
+    display_name: Nature Uplift
+    role: officer
+    status: active
+"""
+
+
+def test_demo_users_load():
+    """All four seed users load with correct roles and display names."""
+    path = _yaml_file(DEMO_USERS_YAML)
+    result = load_role_config(path)
+
+    expected = {
+        "arnaldosepulveda@lrfd.ca":    ("admin",   "Arnaldo Sepulveda"),
+        "arnaldo@getkeystone.ai":       ("admin",   "Arnaldo"),
+        "arnaldosepulveda@gmail.com":   ("member",  "Arnaldo Demo"),
+        "natureuplift@protonmail.com":  ("officer", "Nature Uplift"),
+    }
+    assert len(result) == len(expected), (
+        f"Expected {len(expected)} users, got {len(result)}: {set(result)}"
+    )
+    for email, (role, dn) in expected.items():
+        assert email in result, f"Missing user: {email}"
+        assert result[email].role         == role, f"{email}: wrong role {result[email].role!r}"
+        assert result[email].display_name == dn,   f"{email}: wrong display_name {result[email].display_name!r}"
+        assert result[email].status       == "active", f"{email}: not active"
+
+
+def test_demo_users_idempotent():
+    """Loading the config twice yields identical results — no state mutation."""
+    path = _yaml_file(DEMO_USERS_YAML)
+    first  = load_role_config(path)
+    second = load_role_config(path)
+    assert set(first.keys()) == set(second.keys())
+    for email in first:
+        assert first[email].role   == second[email].role
+        assert first[email].status == second[email].status
+
+
+def test_demo_users_cross_domain_no_duplicate():
+    """Same local-part across different domains must not be treated as duplicate."""
+    # arnaldosepulveda@lrfd.ca and arnaldosepulveda@gmail.com must coexist.
+    path = _yaml_file(DEMO_USERS_YAML)
+    result = load_role_config(path)
+    assert "arnaldosepulveda@lrfd.ca"  in result
+    assert "arnaldosepulveda@gmail.com" in result
+    # Roles must differ — confirms they're separate entries
+    assert result["arnaldosepulveda@lrfd.ca"].role  == "admin"
+    assert result["arnaldosepulveda@gmail.com"].role == "member"
