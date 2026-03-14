@@ -176,7 +176,12 @@ _REQUIREMENTS_INTENT = re.compile(
     r'|\bamps?\b'
     r'|\bVDC\b'
     r'|\bvoltage\b'
-    r'|\bminimum\s+service\b',
+    r'|\bminimum\s+service\b'
+    r'|\bpsi\b'
+    r'|\bgpm\b'
+    r'|\bflow\s+rate\b'
+    r'|\bwater\s+(?:pressure|supply|connection)\b'
+    r'|\bpressure\s+requirement',
     re.IGNORECASE,
 )
 
@@ -185,8 +190,8 @@ _REQUIREMENTS_INTENT = re.compile(
 # false matches on mid-sentence constructs like "TO POSITIVE BATTERY CONNECTION,".
 _REQUIREMENTS_HEADING_SIGNAL = re.compile(
     r'(?:^|\n)\s*'
-    r'(?:ELECTRICAL|POWER|SYSTEM|INSTALLATION|MINIMUM)?\s*'
-    r'(?:REQUIREMENTS?|SPECIFICATIONS?|ELECTRICAL\s+CONNECTIONS?)'
+    r'(?:ELECTRICAL|POWER|SYSTEM|INSTALLATION|MINIMUM|WATER|HYDRAULIC|PLUMBING|SERVICE)?\s*'
+    r'(?:REQUIREMENTS?|SPECIFICATIONS?|ELECTRICAL\s+CONNECTIONS?|CONNECTIONS?|SUPPLY\s+REQUIREMENTS?)'
     r'\s*(?:\n|$)',
     re.MULTILINE,
 )
@@ -221,7 +226,8 @@ _POINTER_SIGNAL = re.compile(
 # text ("require a minimum current rating of at least: 2001 12 VDC 41").
 # The latter uses non-inline tabular format and produces zero matches here.
 _EXPLICIT_REQUIRES_SPEC = re.compile(
-    r'\b(?:requires?|rated\s+(?:at|for))\s+\d+\s*(?:amps?|amp|VDC|VAC|volts?)\b',
+    r'\b(?:requires?|rated\s+(?:at|for)|minimum\s+(?:of\s+)?)\s*\d+\s*'
+    r'(?:amps?|amp|VDC|VAC|volts?|psi|gpm|rpm|kPa)\b',
     re.IGNORECASE,
 )
 
@@ -286,6 +292,29 @@ def _rerank_score_no_digit_penalty(chunk_index: int, text: str, fts_rank: float)
         score *= 0.10
     if _FRONT_MATTER_SIGNAL.search(text):
         score *= 0.05
+    if chunk_index == 0:
+        score *= 0.50
+    n_proc = len(_PROCEDURAL.findall(text))
+    if n_proc > 0:
+        score *= 1.0 + min(n_proc * 0.25, 2.0)
+    if _NUMBERED_STEP.search(text):
+        score *= 1.50
+    return score
+
+
+def _rerank_score_spec_table(chunk_index: int, text: str, fts_rank: float) -> float:
+    """Like _rerank_score but also skips the front-matter and digit-density
+    penalties.  Used when a chunk is identified as a spec table (≥3 lines
+    containing spec-unit data).  Technical spec tables from device manuals
+    often include the vendor address on the same page; the address text must
+    not suppress the actual specification data.
+    """
+    score = float(fts_rank)
+    lower = text.lower()
+    # Only TOC keyword is still penalised — a spec table inside a TOC is
+    # unlikely but that would be a true false-positive and worth suppressing.
+    if _TOC_SIGNAL.search(lower):
+        score *= 0.10
     if chunk_index == 0:
         score *= 0.50
     n_proc = len(_PROCEDURAL.findall(text))
@@ -557,12 +586,19 @@ def _corpus_fts_retrieve(
         def _req_intent_score(row: tuple) -> float:
             _ri, _ti, ci, txt, rank, _pg, _dom = row
             has_spec = bool(_SPEC_DATA_SIGNAL.search(txt))
-            # Bypass digit-density penalty for chunks with actual spec numbers.
-            base = (
-                _rerank_score_no_digit_penalty(ci, txt, rank)
-                if has_spec
-                else _rerank_score(ci, txt, rank)
-            )
+            # Count spec-data lines to detect a spec table.
+            n_spec_lines = len([l for l in txt.split("\n") if _SPEC_DATA_SIGNAL.search(l)])
+            spec_table = n_spec_lines >= 3
+            # Score selection:
+            #   spec table  → skip front-matter AND digit-density penalties
+            #   spec data   → skip digit-density penalty only
+            #   plain chunk → standard scorer
+            if spec_table:
+                base = _rerank_score_spec_table(ci, txt, rank)
+            elif has_spec:
+                base = _rerank_score_no_digit_penalty(ci, txt, rank)
+            else:
+                base = _rerank_score(ci, txt, rank)
             has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
             if has_heading and has_spec:
                 base *= 1.70  # heading + spec: good signal but not stronger than
@@ -614,9 +650,9 @@ def _corpus_fts_retrieve(
                         FROM corpus_chunks cc
                         JOIN corpus_documents cd ON cd.id = cc.doc_id
                         WHERE cd.rel_path = ANY(:docs)
-                          AND (   cc.text ~* '[0-9]+[[:space:]]*(amps?|vdc|vac)'
-                               OR cc.text ~* 'minimum[[:space:]]+service'
-                               OR cc.text ~* 'requires?[[:space:]]+[0-9]+[[:space:]]*(amps?|vdc)')
+                          AND (   cc.text ~* '[0-9]+[[:space:]]*(amps?|vdc|vac|psi|gpm|kPa)'
+                               OR cc.text ~* 'minimum[[:space:]]+(?:service|flow|pressure)'
+                               OR cc.text ~* 'requires?[[:space:]]+[0-9]+[[:space:]]*(amps?|vdc|psi|gpm)')
                         ORDER BY cd.rel_path, cc.chunk_index ASC
                         LIMIT 80
                     """),
@@ -830,9 +866,30 @@ def _corpus_fts_retrieve(
     # inline spec data ("requires 41 amps") are allowed through even if the
     # procedure parser returns weak quality — spec tables are not step-procedure
     # content and should not be refused on procedural quality grounds.
+    # ── Requirements evidence (KDAT-015) ─────────────────────────────────────
+    # Compute per-chunk signals for the selected top chunk.  Attached to
+    # guidance JSON for debugging; also drives _is_spec_answer bypass below.
+    _req_evidence: dict | None = None
+    if bool(_REQUIREMENTS_INTENT.search(question)):
+        _re_n_explicit = len(_EXPLICIT_REQUIRES_SPEC.findall(top_text))
+        _re_heading    = bool(_REQUIREMENTS_HEADING_SIGNAL.search(top_text))
+        _re_has_spec   = bool(_SPEC_DATA_SIGNAL.search(top_text))
+        _re_is_ptr     = bool(_POINTER_SIGNAL.search(top_text))
+        _re_spec_lines = [l for l in top_text.split("\n") if _SPEC_DATA_SIGNAL.search(l)]
+        _spec_table_like = len(_re_spec_lines) >= 3
+        _req_evidence = {
+            "heading_hit":        _re_heading,
+            "explicit_spec_lines": _re_n_explicit,
+            "pointer_only":       _re_is_ptr and not _re_has_spec,
+            "spec_table_like":    _spec_table_like,
+        }
+
     _is_spec_answer = (
         bool(_REQUIREMENTS_INTENT.search(question))
-        and bool(_EXPLICIT_REQUIRES_SPEC.search(top_text))
+        and (
+            bool(_EXPLICIT_REQUIRES_SPEC.search(top_text))
+            or (_req_evidence is not None and _req_evidence["spec_table_like"])
+        )
     )
     if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject") and not _is_spec_answer:
         return {
@@ -1078,6 +1135,8 @@ def _corpus_fts_retrieve(
         or _req_data["grounding_notes"]
     ):
         guidance["requirements"] = _req_data
+    if _req_evidence is not None:
+        guidance["requirements_evidence"] = _req_evidence
     if _final_notice is not None:
         guidance["notice"] = _final_notice
     # Return top 5 reranked candidates as sources/citations.
