@@ -413,4 +413,67 @@ print('  procedural keyword found:', found[0])
 fi
 
 echo ""
+echo "========================================================"
+echo "Section 15 — Pilot readiness assertions"
+echo "========================================================"
+
+# 15a. Health: public_demo_mode must be false (0)
+S15_HEALTH=$(curl -sf "$BASE/health")
+S15_DEMO=$(echo "$S15_HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('public_demo_mode', True))")
+[ "$S15_DEMO" = "False" ] || [ "$S15_DEMO" = "false" ] || [ "$S15_DEMO" = "0" ] \
+  && pass "pilot: public_demo_mode is false" \
+  || fail "pilot: public_demo_mode=$S15_DEMO — should be false in production"
+
+# 15b. Health: db must be true
+S15_DB=$(echo "$S15_HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('db', False))")
+[ "$S15_DB" = "True" ] || [ "$S15_DB" = "true" ] \
+  && pass "pilot: health.db=true" \
+  || fail "pilot: health.db=$S15_DB — database connectivity problem"
+
+# 15c. /debug/cf-check must NOT exist (removed diagnostic endpoint)
+S15_CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/debug/cf-check")
+[ "$S15_CF_STATUS" = "404" ] \
+  && pass "pilot: /debug/cf-check returns 404 (removed)" \
+  || fail "pilot: /debug/cf-check returned $S15_CF_STATUS — diagnostic endpoint still present"
+
+# 15d. Unauthenticated /auth/me returns 401
+S15_ME_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/me")
+[ "$S15_ME_STATUS" = "401" ] \
+  && pass "pilot: unauthenticated /auth/me → 401" \
+  || fail "pilot: /auth/me returned $S15_ME_STATUS (expected 401)"
+
+# 15e. Operator decision recording — POST /decisions/{query_id} (password-auth path only)
+if [ -z "$SKIP_PASSWORD_AUTH" ]; then
+  # Get a fresh query to record a decision on
+  S15_TOK=$(curl -sf -X POST "$BASE/auth/login" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"admin"}' \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+  S15_QID=$(curl -sf -X POST "$BASE/query" \
+    -H "Authorization: Bearer $S15_TOK" \
+    -H "Content-Type: application/json" \
+    -d '{"query":"decon unit inspection procedure","mode":"operational","role":"admin"}' \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['query_id'])")
+  S15_DEC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST "$BASE/decisions/$S15_QID" \
+    -H "Authorization: Bearer $S15_TOK" \
+    -H "Content-Type: application/json" \
+    -d '{"outcome":"followed","notes":"smoke test decision"}')
+  [ "$S15_DEC_STATUS" = "200" ] || [ "$S15_DEC_STATUS" = "201" ] \
+    && pass "pilot: operator decision POST /decisions/$S15_QID → $S15_DEC_STATUS" \
+    || fail "pilot: operator decision returned $S15_DEC_STATUS (expected 200/201)"
+
+  # Verify decision appears on audit receipt
+  S15_AUDIT=$(curl -sf "$BASE/audit/$S15_QID" \
+    -H "Authorization: Bearer $S15_TOK")
+  S15_OUTCOME=$(echo "$S15_AUDIT" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('decision',{}).get('outcome','MISSING'))" 2>/dev/null || echo "MISSING")
+  [ "$S15_OUTCOME" = "followed" ] \
+    && pass "pilot: decision outcome readable on audit receipt" \
+    || fail "pilot: decision outcome on receipt=$S15_OUTCOME (expected 'followed')"
+else
+  echo "  (15e skipped — SKIP_PASSWORD_AUTH set; CF-auth deployments skip decision recording via password)"
+fi
+
+echo ""
 echo "All smoke tests passed."
