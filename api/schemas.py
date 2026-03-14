@@ -67,6 +67,7 @@ class AuditResponse(BaseModel):
     userEmail: Optional[str] = None
     userDisplayName: Optional[str] = None
     authSource: Optional[str] = None
+    simulatedRoleUsed: Optional[str] = None
 
 
 class AuditVerifyResponse(BaseModel):

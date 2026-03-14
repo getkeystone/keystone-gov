@@ -1,115 +1,14 @@
-# LRFD Pilot — email-to-role mapping
-# Each production user has exactly one assigned role.
-# Roles: member, officer, admin
-# Status: active, disabled
-# Rules:
-#   - Duplicate emails cause startup failure
-#   - Invalid roles cause startup failure
-#   - Emails are normalized to lowercase
+# THIS FILE IS NOT TRACKED BY GIT (see .gitignore).
+#
+# Place the real LRFD user role mapping here on the host at:
+#   ~/.config/keystone/lrfd_user_roles.yaml
+#
+# Then either:
+#   a) set LRFD_ROLE_CONFIG_PATH=/run/keystone-config/lrfd_user_roles.yaml
+#      (file is already mounted from ~/.config/keystone via docker-compose.yml)
+#   b) or copy it here if you prefer the config/ volume mount
+#
+# See api/config/lrfd_user_roles.example.yaml for schema documentation.
 
 version: 1
-users:
-  - email: arnaldosepulveda@lrfd.ca
-    display_name: Arnaldo Sepulveda
-    role: admin
-    status: active
-  - email: chief@lrfd.ca
-    display_name: Randy Gowlett
-    role: admin
-    status: active
-  - email: darrenwhite@lrfd.ca
-    display_name: Darren White
-    role: admin
-    status: active
-  - email: sarahgowlett@lrfd.ca
-    display_name: Sarah Gowlett
-    role: admin
-    status: active
-  - email: troykeirstead@lrfd.ca
-    display_name: Troy Keirstead
-    role: admin
-    status: active
-  - email: benflann@lrfd.ca
-    display_name: Ben Flann
-    role: officer
-    status: active
-  - email: brandondocksteader@lrfd.ca
-    display_name: Brandon Docksteader
-    role: officer
-    status: active
-  - email: brandonchappel@lrfd.ca
-    display_name: Brandon Chappel
-    role: officer
-    status: active
-  - email: daniel_fudge@lrfd.ca
-    display_name: Daniel Fudge
-    role: officer
-    status: active
-  - email: lukeflann@lrfd.ca
-    display_name: Luke Flann
-    role: officer
-    status: active
-  - email: benwhite@lrfd.ca
-    display_name: Ben White
-    role: member
-    status: active
-  - email: curtishamilton@lrfd.ca
-    display_name: Curtis Hamilton
-    role: member
-    status: active
-  - email: cerastark@lrfd.ca
-    display_name: Cera Stark
-    role: member
-    status: active
-  - email: ethanturnbull@lrfd.ca
-    display_name: Ethan Turnbull
-    role: member
-    status: active
-  - email: garypitt@lrfd.ca
-    display_name: Gary Pitt
-    role: member
-    status: active
-  - email: chrisgallant@lrfd.ca
-    display_name: Chris Gallant
-    role: member
-    status: active
-  - email: isaacwillett@lrfd.ca
-    display_name: Isaac Willett
-    role: member
-    status: active
-  - email: isaac.jones@lrfd.ca
-    display_name: Isaac Jones
-    role: member
-    status: active
-  - email: jackfitzpatrick@lrfd.ca
-    display_name: Jack Fitzpatrick
-    role: member
-    status: active
-  - email: jackwhite@lrfd.ca
-    display_name: Jack White
-    role: member
-    status: active
-  - email: joelwillett@lrfd.ca
-    display_name: Joel Willett
-    role: member
-    status: active
-  - email: johncodling@lrfd.ca
-    display_name: John Codling
-    role: member
-    status: active
-  - email: kyledavenport@lrfd.ca
-    display_name: Kyle Davenport
-    role: member
-    status: active
-  - email: michalkaczkowski@lrfd.ca
-    display_name: Michal Kaczkowski
-    role: member
-    status: active
-  - email: matthewjones@lrfd.ca
-    display_name: Matthew Jones
-    role: member
-    status: active
-  - email: michaelbuckley@lrfd.ca
-    display_name: Michael Buckley
-    role: member
-    status: active
+users: []

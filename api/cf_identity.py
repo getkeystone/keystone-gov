@@ -70,7 +70,8 @@ _VALID_ROLES: set[str] = {"member", "officer", "custodian", "admin"}
 # Role config
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "lrfd_user_roles.yaml")
+_CONFIG_PATH_DEFAULT = os.path.join(os.path.dirname(__file__), "config", "lrfd_user_roles.yaml")
+_CONFIG_PATH: str = os.environ.get("LRFD_ROLE_CONFIG_PATH", "") or _CONFIG_PATH_DEFAULT
 
 
 @dataclass
@@ -122,24 +123,57 @@ def load_role_config(path: str = _CONFIG_PATH) -> dict[str, RoleEntry]:
 
 
 def init_role_config() -> None:
-    """Load and cache the role map. Call once at application startup."""
+    """Load and cache the role map. Call once at application startup.
+
+    Behaviour:
+      - If LRFD_ROLE_CONFIG_PATH is set, that path is authoritative; missing → FATAL.
+      - If the default config path exists, load it.
+      - If neither exists: FATAL when CF is enabled; warning only when CF is disabled
+        (demo/dev path doesn't require a role file).
+      - An empty users list when CF is enabled is also a FATAL error.
+    """
     global _role_map
-    if not os.path.exists(_CONFIG_PATH):
-        print(
-            f"[cf_identity] WARNING: role config not found at {_CONFIG_PATH}. "
-            "CF identity provisioning will deny all users until config is present.",
-            flush=True,
-        )
-        return
+
+    env_override = os.environ.get("LRFD_ROLE_CONFIG_PATH", "").strip()
+
+    if env_override:
+        # Operator explicitly set a path — it must exist and be valid.
+        if not os.path.exists(env_override):
+            raise SystemExit(
+                f"[cf_identity] FATAL: LRFD_ROLE_CONFIG_PATH={env_override!r} does not exist. "
+                "Provision the role config file before starting the API."
+            )
+        path = env_override
+    else:
+        path = _CONFIG_PATH_DEFAULT
+        if not os.path.exists(path):
+            if _CF_ENABLED:
+                raise SystemExit(
+                    f"[cf_identity] FATAL: CLOUDFLARE_ACCESS_ENABLED=true but no role config "
+                    f"found at {path}. Set LRFD_ROLE_CONFIG_PATH or place the file at that path."
+                )
+            print(
+                f"[cf_identity] WARNING: role config not found at {path}. "
+                "CF identity provisioning will deny all users until config is present.",
+                flush=True,
+            )
+            return
+
     try:
-        _role_map = load_role_config()
-        print(
-            f"[cf_identity] loaded {len(_role_map)} users from role config",
-            flush=True,
-        )
+        _role_map = load_role_config(path)
     except ValueError as exc:
-        # Fail fast — bad config is a deployment error
         raise SystemExit(f"[cf_identity] FATAL: role config error: {exc}") from exc
+
+    if len(_role_map) == 0 and _CF_ENABLED:
+        raise SystemExit(
+            f"[cf_identity] FATAL: role config at {path!r} has no users. "
+            "Populate the role config before starting with CLOUDFLARE_ACCESS_ENABLED=true."
+        )
+
+    print(
+        f"[cf_identity] loaded {len(_role_map)} users from {path}",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------

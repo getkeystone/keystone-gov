@@ -1,0 +1,35 @@
+# lrfd_user_roles.example.yaml — Example role configuration for Keystone CF Access identity.
+#
+# IMPORTANT: This file contains FAKE users for development and documentation only.
+#            Do NOT put real user emails in this file.
+#
+# In production, set LRFD_ROLE_CONFIG_PATH to the path of your real role file
+# (e.g. /run/keystone-config/lrfd_user_roles.yaml, mounted from
+# ~/.config/keystone/lrfd_user_roles.yaml on the host).
+#
+# Schema rules (enforced at startup):
+#   - 'email' is required and must be unique (case-insensitive comparison)
+#   - 'role' must be one of: member, officer, custodian, admin
+#   - 'status' defaults to 'active'; set to 'disabled' to block without removing
+#   - 'display_name' is optional; if absent, derived from email local-part
+#
+# Example: email "john.smith@lrfd.ca" → display_name "John Smith"
+
+version: 1
+users:
+  - email: alice.example@lrfd.ca
+    display_name: Alice Example
+    role: admin
+    status: active
+  - email: bob.example@lrfd.ca
+    display_name: Bob Example
+    role: officer
+    status: active
+  - email: carol.example@lrfd.ca
+    display_name: Carol Example
+    role: member
+    status: active
+  - email: dave.example@lrfd.ca
+    display_name: Dave Example
+    role: member
+    status: disabled
