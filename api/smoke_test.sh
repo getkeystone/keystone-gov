@@ -476,4 +476,45 @@ else
 fi
 
 echo ""
+echo "========================================================"
+echo "Section 16 — Corpus document availability"
+echo "========================================================"
+# Gate: set RUN_CORPUS_INTEGRITY_TEST=1 to enable (requires DB access inside container)
+# In CI or plain API smoke runs, skip silently.
+
+if [ -n "${RUN_CORPUS_INTEGRITY_TEST:-}" ]; then
+  PSQL="docker exec -i keystone-deploy-postgres-1 psql -U keystone -d keystone -t -A"
+
+  # 16a. At least one corpus document indexed
+  S16_DOC_COUNT=$(${PSQL} -c "SELECT count(*) FROM corpus_documents;" 2>/dev/null | tr -d ' ' || echo "0")
+  [ "$S16_DOC_COUNT" -ge 1 ] \
+    && pass "corpus: $S16_DOC_COUNT documents indexed in corpus_documents" \
+    || fail "corpus: corpus_documents is empty — run ingest_corpus.py"
+
+  # 16b. At least one LRFD document present
+  S16_LRFD_COUNT=$(${PSQL} -c "SELECT count(*) FROM corpus_documents WHERE domain='lrfd_protocol';" 2>/dev/null | tr -d ' ' || echo "0")
+  [ "$S16_LRFD_COUNT" -ge 1 ] \
+    && pass "corpus: $S16_LRFD_COUNT lrfd_protocol documents indexed" \
+    || fail "corpus: no lrfd_protocol documents — LRFD content is missing"
+
+  # 16c. No documents without chunks (broken ingest)
+  S16_EMPTY=$(${PSQL} -c "SELECT count(*) FROM corpus_documents d LEFT JOIN corpus_chunks c ON d.id=c.doc_id WHERE c.doc_id IS NULL;" 2>/dev/null | tr -d ' ' || echo "?")
+  [ "$S16_EMPTY" = "0" ] \
+    && pass "corpus: all documents have chunks (no empty ingest)" \
+    || fail "corpus: $S16_EMPTY document(s) have no chunks — re-run ingest"
+
+  # 16d. Each corpus file has a resolvable path on disk
+  # Reads rel_path from DB and checks the active corpus directory
+  S16_MISSING=$(${PSQL} -c "SELECT rel_path FROM corpus_documents;" 2>/dev/null | while IFS= read -r rp; do
+    target="/srv/keystone-corpus/active/${rp}"
+    [ ! -f "$target" ] && echo "$rp"
+  done | wc -l | tr -d ' ')
+  [ "$S16_MISSING" = "0" ] \
+    && pass "corpus: all $S16_DOC_COUNT document files exist on disk" \
+    || fail "corpus: $S16_MISSING document(s) in DB have no matching file on disk"
+else
+  echo "  (Section 16 skipped — set RUN_CORPUS_INTEGRITY_TEST=1 to enable)"
+fi
+
+echo ""
 echo "All smoke tests passed."
