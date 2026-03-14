@@ -417,7 +417,8 @@ def get_current_user(
     # ── Path 1: Cloudflare Access JWT ──────────────────────────────────────────
     if cf_access_jwt_assertion:
         print(
-            f"[cf_identity] CF JWT received (len={len(cf_access_jwt_assertion)})",
+            f"[cf_identity] CF JWT received (len={len(cf_access_jwt_assertion)}"
+            f" prefix={cf_access_jwt_assertion[:20]!r})",
             flush=True,
         )
         email = _validate_cf_jwt_inner(cf_access_jwt_assertion)
