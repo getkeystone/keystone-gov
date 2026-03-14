@@ -1626,41 +1626,67 @@ def debug_cf_check(request: Request):
     """Diagnostic: confirms whether the CF Access JWT header reaches the API.
 
     Only available when CLOUDFLARE_ACCESS_ENABLED=true.
-    Returns header metadata (presence, length) — never the JWT value.
+    Returns header metadata (presence, length, structure) — never the JWT value.
     """
     if not get_cf_enabled():
         raise HTTPException(status_code=404, detail="Not found")
 
     jwt_val = request.headers.get("cf-access-jwt-assertion")
-    # Collect CF-related header names only (no values) for proxy debugging.
-    cf_names = [k for k in request.headers.keys() if "cf-" in k.lower() or k.lower().startswith("x-forwarded")]
+    # Collect CF/forwarding header names only (no values).
+    cf_names = [
+        k for k in request.headers.keys()
+        if "cf-" in k.lower() or k.lower().startswith("x-forwarded")
+    ]
+    # Report cookie names only — never cookie values.
+    cookie_hdr = request.headers.get("cookie", "")
+    cf_cookie_names = [
+        part.split("=")[0].strip()
+        for part in cookie_hdr.split(";")
+        if "CF_Authorization" in part or "cf_" in part.lower()
+    ]
 
     result: dict = {
         "cf_access_enabled": True,
         "cf_jwt_present": jwt_val is not None,
-        "cf_jwt_len": len(jwt_val) if jwt_val else 0,
         "cf_related_header_names": sorted(cf_names),
+        "cf_cookie_names_present": sorted(set(cf_cookie_names)),
     }
 
-    # If JWT is present, attempt validation and report outcome (not the JWT).
     if jwt_val:
-        try:
-            from cf_identity import _validate_cf_jwt_inner
-            email = _validate_cf_jwt_inner(jwt_val)
-            result["jwt_valid"] = True
-            result["jwt_email"] = email
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {"reasonCode": str(exc.detail)}
+        dots = jwt_val.count(".")
+        result["header_length"] = len(jwt_val)
+        result["dot_count"] = dots
+        result["prefix_20"] = jwt_val[:20]
+        # Structural pre-check before full validation.
+        if dots != 2:
             result["jwt_valid"] = False
-            result["jwt_error_code"] = detail.get("reasonCode", "UNKNOWN")
-            result["jwt_error_msg"] = detail.get("message", str(exc.detail))
-        except Exception as exc:
-            result["jwt_valid"] = False
-            result["jwt_error_code"] = "EXCEPTION"
-            result["jwt_error_msg"] = str(exc)[:200]
+            result["jwt_error_code"] = "MALFORMED_WRONG_DOT_COUNT"
+            result["jwt_error_message"] = (
+                f"Expected 2 dots (3 segments), got {dots}. "
+                f"Value is likely not a JWT — check proxy/transform rules."
+            )
+        else:
+            try:
+                from cf_identity import _validate_cf_jwt_inner
+                email = _validate_cf_jwt_inner(jwt_val)
+                result["jwt_valid"] = True
+                result["jwt_email"] = email
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {"reasonCode": str(exc.detail)}
+                result["jwt_valid"] = False
+                result["jwt_error_code"] = detail.get("reasonCode", "UNKNOWN")
+                result["jwt_error_message"] = detail.get("message", str(exc.detail))
+            except Exception as exc:
+                result["jwt_valid"] = False
+                result["jwt_error_code"] = "EXCEPTION"
+                result["jwt_error_message"] = str(exc)[:200]
     else:
+        result["header_length"] = 0
+        result["dot_count"] = 0
+        result["prefix_20"] = ""
         result["jwt_valid"] = False
         result["jwt_error_code"] = "HEADER_ABSENT"
+        result["jwt_error_message"] = "cf-access-jwt-assertion header not present"
 
     return result
 
