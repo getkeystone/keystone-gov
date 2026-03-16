@@ -519,9 +519,11 @@ _QUERY_SYNONYMS: dict[str, list[str]] = {
     # FoamPro brand name does not always stem predictably; expand to generic terms.
     'foampro':     ['foam', 'foampro', 'proportioning'],
     'foam':        ['foam', 'foampro', 'proportioning'],
-    # Decontamination short forms.
-    'decon':       ['decon', 'decontamination'],
-    'decontamination': ['decontamination', 'decon'],
+    # Decontamination short forms + equipment.
+    'decon':       ['decon', 'decontamination', 'decontaminate'],
+    'decontamination': ['decontamination', 'decon', 'decontaminate'],
+    # Decon washer equipment — operation section uses "wash" not "washer".
+    'washer':      ['washer', 'wash'],
     # ── Structural ─────────────────────────────────────────────────────────────
     'collapse':    ['collapse', 'zone', 'structural'],
     'structural':  ['structural', 'triage', 'collapse'],
