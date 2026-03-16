@@ -614,8 +614,29 @@ def _doc_available(doc_id: str) -> bool:
     return target.exists() and target.suffix.lower() in _SUPPORTED_DOC_EXTENSIONS
 
 
+_STEM_SUFFIXES = (
+    'ations', 'ating', 'ation', 'ated', 'ting', 'tion',
+    'ment', 'ness', 'ance', 'ence', 'ing', 'ize', 'ise',
+    'ate', 'ed', 'er', 'es', 's',
+)
+
+
+def _stem(word: str) -> str:
+    """Minimal suffix stripping for relevance gate token matching.
+
+    Approximates common Porter reductions without any external dependency.
+    Ensures the query-side tokenizer aligns with Postgres's built-in English
+    stemmer so that e.g. "decontaminate" matches a chunk containing
+    "decontamination".  Minimum stem length: 4 characters.
+    """
+    for sfx in _STEM_SUFFIXES:
+        if word.endswith(sfx) and len(word) - len(sfx) >= 4:
+            return word[:-len(sfx)]
+    return word
+
+
 def _tokenize(text: str) -> set[str]:
-    return {t for t in re.split(r'\W+', text.lower()) if t not in _STOP_WORDS and len(t) > 2}
+    return {_stem(t) for t in re.split(r'\W+', text.lower()) if t not in _STOP_WORDS and len(t) > 2}
 
 
 def _lexical_score(terms: set[str], doc: Document) -> int:
