@@ -453,6 +453,33 @@ _OR_EXPANSION_STOP = _STOP_WORDS | {
     'patient', 'patients',
 }
 
+# Medical vocabulary gate — RC1b fix.
+# Gate B uses this to distinguish genuine medical queries (AND-matched EMR
+# result is plausibly on-topic) from coincidental word collisions like
+# "chief" → "chief complaint" or "incident command" → ICS sections in EMR.
+# If none of the query tokens appear here, Gate B refuses rather than
+# returning EMR content to a non-medical_reference mode caller.
+_MEDICAL_QUERY_TOKENS = frozenset({
+    'cardiac', 'heart', 'pulse', 'cpr', 'resuscitation', 'resuscitate',
+    'defibrillation', 'defibrillator', 'aed',
+    'hemorrhage', 'haemorrhage', 'tourniquet', 'laceration',
+    'bleed', 'bleeding',
+    'airway', 'choking', 'asphyxia', 'asphyxiation',
+    'fracture', 'fractures', 'splint', 'sprain',
+    'burn', 'burns', 'scald',
+    'seizure', 'seizures', 'convulsion', 'convulsions',
+    'stroke', 'concussion', 'unconscious', 'unresponsive',
+    'poison', 'poisoning', 'overdose', 'monoxide', 'narcotic',
+    'anaphylaxis', 'anaphylactic', 'allergy', 'allergic', 'epinephrine',
+    'hypothermia', 'frostbite', 'heatstroke', 'hyperthermia',
+    'hypoperfusion', 'shock',
+    'symptom', 'symptoms', 'nausea', 'vomiting', 'vital', 'vitals',
+    'nosebleed', 'epistaxis', 'diabetes', 'diabetic', 'insulin', 'asthma',
+    'chest', 'wound', 'wounds',
+    'medical', 'medication', 'medicine', 'patient', 'patients',
+    'triage', 'ems', 'paramedic', 'ambulance',
+})
+
 # Synonym expansion applied during OR-expansion fallback.
 # Maps a normalised token to a list of equivalent FTS terms.
 # Used so queries using lay or clinical language find the same chunks.
@@ -1306,6 +1333,11 @@ def _corpus_fts_retrieve(
         # Only OR-expanded hits are refused here — OR expansion already signals
         # no AND match existed, so routing to EMR is cross-domain noise.
         if _used_or_fts:
+            return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
+        # RC1b: AND-matched EMR in non-medical mode requires medical vocabulary
+        # in the question. Single-word coincidences ("chief" → "chief complaint",
+        # "incident command" → ICS sections in EMR) must not route to EMR content.
+        if not any(t in _MEDICAL_QUERY_TOKENS for t in _tokenize(question)):
             return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
         if mode == "operational" and _pq["decision"] == "reject":
             return {
