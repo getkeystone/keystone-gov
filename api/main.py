@@ -1300,6 +1300,13 @@ def _corpus_fts_retrieve(
     # they contain directly relevant medical guidance.  The relevance gate
     # (above) already ensures off-topic content is withheld.
     if _top_domain == "medical_emr" and mode != "medical_reference":
+        # RC1 fix: OR expansion in non-medical modes is off-domain leakage.
+        # AND-matched EMR content in training/operational is still allowed through
+        # (e.g. a fire-ops query that genuinely AND-matches an EMR document).
+        # Only OR-expanded hits are refused here — OR expansion already signals
+        # no AND match existed, so routing to EMR is cross-domain noise.
+        if _used_or_fts:
+            return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
         if mode == "operational" and _pq["decision"] == "reject":
             return {
                 "type": "refusal",
