@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query as QueryParam, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query as QueryParam, Response, UploadFile
 from pydantic import BaseModel
 from cryptography.hazmat.primitives import serialization as _crypto_ser
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -21,10 +21,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session as DBSession
 
-from audit import compute_entry_hash, verify_entry
+from audit import compute_entry_hash, verify_entry, validate_hmac_key
 from auth import verify_password
 from database import Base, SessionLocal, engine, get_db
-from models import AuditEntry, Document, Query, Session, User
+from models import AuditEntry, Document, ManagedUser, Query, Session, User, UserManagementEvent
 from schemas import (
     AuditResponse,
     AuditVerifyResponse,
@@ -41,6 +41,17 @@ from cf_identity import (
     get_cf_enabled,
     get_demo_sim_enabled,
     init_role_config,
+    seed_managed_users,
+)
+from ingest_lib import (
+    VALID_DOMAINS as _INGEST_VALID_DOMAINS,
+    VALID_CONTENT_KINDS as _INGEST_VALID_CONTENT_KINDS,
+    infer_domain as _ingest_infer_domain,
+    mime_for as _ingest_mime_for,
+    is_supported_mime as _ingest_is_supported_mime,
+    build_chunks_pdf as _ingest_build_chunks_pdf,
+    build_chunks_other as _ingest_build_chunks_other,
+    sha256_file as _ingest_sha256_file,
 )
 from procedure_parse import parse_procedure, procedure_quality
 from requirements_parse import make_requirements_summary, parse_requirements
@@ -61,8 +72,34 @@ _ROLE_LEVEL: dict[str, int] = {
     "member": 0,
     "custodian": 0,
     "officer": 1,
-    "admin": 2,
+    "authority": 2,
 }
+_ROLE_PERMISSIONS: dict[str, frozenset] = {
+    "member": frozenset({
+        "query", "view_own_history", "view_own_audit", "view_documents",
+    }),
+    "officer": frozenset({
+        "query", "view_own_history", "view_own_audit", "view_documents",
+        "access_officer_restricted",
+    }),
+    "custodian": frozenset({
+        "query", "view_own_history", "view_own_audit", "view_documents",
+        "upload_to_staging", "edit_corpus_metadata", "system_health",
+        "backup_restore", "view_all_audit", "view_staging_queue",
+    }),
+    "authority": frozenset({
+        "query", "view_own_history", "view_own_audit", "view_documents",
+        "access_officer_restricted", "promote_document", "reject_document",
+        "decision_review", "audit_export_governance", "view_all_audit",
+        "view_all_user_activity", "approve_role_assignments",
+        "case_management", "view_staging_queue", "edit_corpus_metadata",
+    }),
+}
+
+
+def _has_perm(user: "AppUser", perm: str) -> bool:
+    """Return True if user's role grants the specified permission. Fail-closed."""
+    return perm in _ROLE_PERMISSIONS.get(user.role, frozenset())
 
 # Fail-closed refusal used when role is denied by ACL.
 _ACL_REFUSAL_GUIDANCE = {
@@ -275,7 +312,10 @@ def _rerank_score(chunk_index: int, text: str, fts_rank: float) -> float:
     if n_section_nums / n_words > 0.12:
         score *= 0.20
 
-    if chunk_index == 0:
+    # Penalize first chunk only when it truly looks like TOC/front-matter.
+    # Short LRFD protocol files start procedural content in chunk 0 and must
+    # NOT be penalised here — the _is_toc_like check gates this correctly.
+    if chunk_index == 0 and not _PROCEDURAL.search(text):
         score *= 0.50
 
     n_proc = len(_PROCEDURAL.findall(text))
@@ -299,7 +339,7 @@ def _rerank_score_no_digit_penalty(chunk_index: int, text: str, fts_rank: float)
         score *= 0.10
     if _FRONT_MATTER_SIGNAL.search(text):
         score *= 0.05
-    if chunk_index == 0:
+    if chunk_index == 0 and not _PROCEDURAL.search(text):
         score *= 0.50
     n_proc = len(_PROCEDURAL.findall(text))
     if n_proc > 0:
@@ -322,7 +362,7 @@ def _rerank_score_spec_table(chunk_index: int, text: str, fts_rank: float) -> fl
     # unlikely but that would be a true false-positive and worth suppressing.
     if _TOC_SIGNAL.search(lower):
         score *= 0.10
-    if chunk_index == 0:
+    if chunk_index == 0 and not _PROCEDURAL.search(text):
         score *= 0.50
     n_proc = len(_PROCEDURAL.findall(text))
     if n_proc > 0:
@@ -367,7 +407,107 @@ _STOP_WORDS = {
     'on', 'if', 'no', 'not', 'so', 'as', 'we', 'you', 'they', 'their',
 }
 
+# High-frequency domain-generic terms that appear in nearly every document.
+# Excluded from OR-expansion fallback queries so they don't pollute ranking
+# when the primary AND-query returns zero results.
+_OR_EXPANSION_STOP = _STOP_WORDS | {
+    'procedure', 'procedures', 'protocol', 'protocols', 'guideline', 'guidelines',
+    'care', 'method', 'methods', 'technique', 'techniques', 'step', 'steps',
+    'process', 'treatment', 'management', 'use', 'using', 'used',
+    'perform', 'performing', 'performed', 'follow', 'following',
+    'approach', 'action', 'actions', 'activity', 'activities',
+    # Generic operational/hydraulic/admin terms that appear in many apparatus
+    # and medical documents — excluding them prevents off-domain OR-expansion
+    # hits on partial token overlap.
+    # e.g. "hydrant water supply flow rate" must not match the foam manual on
+    # "water OR flow OR rate"; "covid vaccination schedule personnel" must not
+    # match equipment manuals on "schedule OR personnel" alone.
+    'water', 'supply', 'flow', 'rate',
+    'schedule', 'personnel', 'staff', 'record', 'records',
+    'system', 'systems', 'service',
+    # Clearly out-of-scope / environment terms that should never yield
+    # fire/medical corpus hits via OR expansion:
+    # "weather forecast tomorrow" must not match EMR text on a single token.
+    'weather', 'forecast', 'tomorrow', 'morning', 'tonight',
+    'today', 'yesterday', 'date', 'time', 'hour', 'hours',
+    # HR/admin terms beyond what was already covered:
+    'payroll', 'salary', 'overtime', 'vacation', 'discipline', 'disciplinary',
+    'employment', 'memo', 'staffing', 'station', 'shift',
+    # Generic domain-context terms that appear in nearly every fire/structural
+    # document and would cause off-domain OR-expansion hits when used alone or
+    # mixed with out-of-scope tokens:
+    #   "roof" alone → must not approve structural protocol without context
+    #   "structural" alone in OR expansion → cross-domain false positive risk
+    #     (e.g. "burn treatment after structural fire" must not match lrfd-003)
+    #   "fire" alone → every LRFD doc mentions fire; too broad for OR expansion
+    #   "after" → generic preposition with no domain signal
+    #   "equipment" / "allocation" / "budget" → admin/inventory terms that
+    #     appear in apparatus manuals and must not approve via single-token OR
+    'roof', 'structural', 'fire', 'after',
+    'equipment', 'allocation', 'budget',
+    # Generic EMR domain terms that appear in nearly every medical chunk.
+    # OR-expansion on "patient" returns patient-movement, patient-assessment,
+    # and patient-scoring content regardless of the actual medical topic.
+    # Without this exclusion, a query like "how to treat a patient having a
+    # heart attack" routes to the Glasgow Coma Scale table as its top hit.
+    'patient', 'patients',
+}
+
+# Synonym expansion applied during OR-expansion fallback.
+# Maps a normalised token to a list of equivalent FTS terms.
+# Used so queries using lay or clinical language find the same chunks.
+_QUERY_SYNONYMS: dict[str, list[str]] = {
+    # ── Medical / EMR ──────────────────────────────────────────────────────────
+    'nosebleed':   ['nosebleed', 'epistaxis'],
+    'epistaxis':   ['epistaxis', 'nosebleed'],
+    'cpr':         ['cpr', 'resuscitation', 'compressions'],
+    'aed':         ['aed', 'defibrillator', 'defibrillation'],
+    'defibrillator': ['defibrillator', 'aed', 'defibrillation'],
+    'hypothermia': ['hypothermia', 'cold', 'exposure'],
+    'burn':        ['burn', 'burns', 'thermal'],
+    'burns':       ['burns', 'burn', 'thermal'],
+    'fracture':    ['fracture', 'fractures', 'broken'],
+    'bleeding':    ['bleeding', 'hemorrhage', 'haemorrhage'],
+    'hemorrhage':  ['hemorrhage', 'haemorrhage', 'bleeding'],
+    'haemorrhage': ['haemorrhage', 'hemorrhage', 'bleeding'],
+    'shock':       ['shock', 'hypoperfusion'],
+    'seizure':     ['seizure', 'seizures', 'convulsion'],
+    'seizures':    ['seizures', 'seizure', 'convulsion'],
+    'convulsion':  ['convulsion', 'seizure', 'seizures'],
+    'stroke':      ['stroke', 'cerebrovascular'],
+    'choking':     ['choking', 'obstruction', 'airway'],
+    'unconscious': ['unconscious', 'unresponsive'],
+    'unresponsive':['unresponsive', 'unconscious'],
+    'overdose':    ['overdose', 'poisoning', 'narcotic'],
+    'chest':       ['chest', 'cardiac', 'heart'],
+    # ── Fire ops / LRFD operational ────────────────────────────────────────────
+    'mayday':      ['mayday', 'distress'],
+    'rit':         ['rit', 'rapid', 'intervention'],
+    # "rapid intervention team" — maps back to rit so it finds lrfd-007 via OR.
+    'rapid':       ['rapid', 'rit', 'intervention'],
+    'declaration': ['declaration', 'mayday', 'distress'],  # "emergency declaration"
+    # "snow load" — lrfd-001 covers roof load (snow is the most common roof load).
+    'snow':        ['snow', 'roof', 'load'],
+    # ── Apparatus / equipment ──────────────────────────────────────────────────
+    # FoamPro brand name does not always stem predictably; expand to generic terms.
+    'foampro':     ['foam', 'foampro', 'proportioning'],
+    'foam':        ['foam', 'foampro', 'proportioning'],
+    # Decontamination short forms.
+    'decon':       ['decon', 'decontamination'],
+    'decontamination': ['decontamination', 'decon'],
+    # ── Structural ─────────────────────────────────────────────────────────────
+    'collapse':    ['collapse', 'zone', 'structural'],
+    'structural':  ['structural', 'triage', 'collapse'],
+}
+
 _EVIDENCE_THRESHOLD = 1
+
+# Minimum ts_rank_cd score accepted from Postgres FTS.
+# Chunks ranked below this are near-zero-relevance noise and are discarded
+# before reranking.  Applies to both AND and OR-expansion FTS paths.
+# 0.05 excludes "procedure"-stem matches in unrelated documents while
+# retaining secondary-topic chunks that rank 0.1-0.2.
+_FTS_RANK_MIN = 0.05
 
 # ---------------------------------------------------------------------------
 # Corpus root (used by retrieval, document endpoint, and availability check)
@@ -386,18 +526,34 @@ _SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 # Minimum fraction of question tokens that must appear in the excerpt.
 # Example: "cpr electric shock" vs MAYDAY excerpt → 0/3 = 0.0 → refusal.
 #          "MAYDAY procedure"  vs MAYDAY excerpt → 1/2 = 0.5 → approved.
-_RELEVANCE_THRESHOLD = 0.12
+# Raised from 0.12 to 0.20: long questions now require at least 2 matching
+# tokens instead of 1, preventing single-word coincidences from passing.
+_RELEVANCE_THRESHOLD = 0.20
+
+# Tighter threshold applied when an OR-expansion FTS result is being evaluated
+# in operational mode.  OR expansion already signals that no AND match existed;
+# requiring stronger overlap prevents off-domain content from passing.
+_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.30
+
+# Multi-answer configuration.
+# Maximum number of distinct-document answers to return (including primary).
+_MULTI_ANSWER_MAX: int = 3
+# Normalised rerank score thresholds (secondary_score / primary_score).
+# "Strong match" ≥ 0.85 — nearly as good as the primary answer.
+# "Related" ≥ 0.72 — meaningfully relevant but weaker signal.
+# Below 0.72 — suppressed; not included in the answers list.
+_MULTI_ANSWER_STRONG_THRESHOLD: float = 0.85
+_MULTI_ANSWER_RELATED_THRESHOLD: float = 0.72
 
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
     "type": "refusal",
     "reasonCode": "NO_RELEVANT_PROCEDURE",
-    "title": "No relevant procedure found",
+    "title": "No approved guidance found for this query",
     "message": (
-        "The system found documents but none are relevant to your question. "
-        "Ask about a specific procedure, equipment, or emergency that this "
-        "system covers."
+        "Result withheld — evidence confidence was insufficient for this query. "
+        "The matched content did not contain enough terms relevant to your question."
     ),
-    "safeNextStep": "Rephrase your question with specific equipment or procedure names.",
+    "safeNextStep": "Ask about a specific procedure, equipment, or emergency by name.",
     "hiddenSource": False,
 }
 
@@ -440,19 +596,102 @@ def _lexical_score(terms: set[str], doc: Document) -> int:
     return sum(1 for t in terms if t in corpus)
 
 
+def _build_multi_answers(
+    reranked: list,
+    primary_rel: str,
+    primary_rerank: float,
+    primary_doc: dict,
+    primary_summary: str,
+    primary_excerpt: str,
+    question: str,
+    relevance_threshold: float,
+    content_kind_map: dict,
+) -> list[dict]:
+    """Return a list of per-document answer dicts for multi-answer ranked responses.
+
+    The first entry is always the primary answer.  Subsequent entries are the
+    best chunks from distinct documents that pass both the relevance gate and
+    the normalised-score threshold.  Returns an empty list when no secondary
+    answers qualify (caller should omit the 'answers' key in that case).
+
+    Each entry format:
+        {rank, confidence, documentId, title, page, chunkIndex, domain,
+         content_kind, summary, excerpt}
+
+    confidence is one of "Strong match" (≥ _MULTI_ANSWER_STRONG_THRESHOLD)
+    or "Related" (≥ _MULTI_ANSWER_RELATED_THRESHOLD).  Raw scores are not
+    exposed to callers.
+    """
+    if primary_rerank <= 0:
+        return []
+
+    secondary: list[dict] = []
+    seen_docs: set[str] = {primary_rel}
+
+    for row in reranked[1:]:
+        rel, title, ci, txt, rank, pg, dom = row
+        if rel in seen_docs:
+            continue
+        if _is_toc_like(ci, txt):
+            continue
+        ck = content_kind_map.get(rel, "procedure")
+        row_rerank = _rerank_score(ci, txt, rank) * (1.15 if ck == "procedure" else 1.0)
+        norm = min(1.0, row_rerank / primary_rerank)
+        if norm < _MULTI_ANSWER_RELATED_THRESHOLD:
+            continue
+        clean_sec = clean_lines(txt)
+        if _relevance_score(question, clean_sec) < relevance_threshold:
+            continue
+        label = "Strong match" if norm >= _MULTI_ANSWER_STRONG_THRESHOLD else "Related"
+        eff_pg = pg if pg is not None else ci
+        secondary.append({
+            "rank": len(secondary) + 2,
+            "confidence": label,
+            "documentId": rel,
+            "title": title,
+            "page": eff_pg,
+            "chunkIndex": ci,
+            "domain": dom,
+            "content_kind": ck,
+            "summary": make_summary(clean_sec),
+            "excerpt": clean_sec[:1500],
+        })
+        seen_docs.add(rel)
+        if len(secondary) >= _MULTI_ANSWER_MAX - 1:
+            break
+
+    if not secondary:
+        return []
+
+    primary_entry: dict = {
+        "rank": 1,
+        "confidence": "Strong match",
+        "documentId": primary_doc.get("documentId", ""),
+        "title": primary_doc.get("title", ""),
+        "page": primary_doc.get("page", 0),
+        "chunkIndex": primary_doc.get("chunkIndex", 0),
+        "domain": primary_doc.get("domain", ""),
+        "content_kind": primary_doc.get("content_kind", "procedure"),
+        "summary": primary_summary,
+        "excerpt": primary_excerpt,
+    }
+    return [primary_entry] + secondary
+
+
 def _corpus_fts_retrieve(
     question: str, mode: str, db: DBSession,
     domain_filter: "list[str] | None" = None,
+    requester_role: str = "member",
 ) -> "tuple[dict, str, list, list] | None":
     """
     Postgres FTS retrieval from corpus_chunks.
 
     Returns None if corpus is empty — caller falls through to lexical fixtures.
     Returns a refusal tuple if corpus is non-empty but no FTS hits are found.
-    All corpus docs are treated as role-0 (no per-doc ACL on corpus yet).
 
     domain_filter: when provided, only match documents whose domain is in
     the list.  None (default) = no domain restriction.
+    requester_role: used for per-document min_role gate (additive check).
     """
     try:
         count = db.execute(text("SELECT COUNT(*) FROM corpus_chunks LIMIT 1")).scalar()
@@ -469,6 +708,8 @@ def _corpus_fts_retrieve(
     _domain_clause = "AND cd.domain = ANY(:domains)" if domain_filter else ""
     _domain_params: dict = {"domains": domain_filter} if domain_filter else {}
 
+    _requester_level = _ROLE_LEVEL.get(requester_role, 0)
+
     _FTS_SQL = f"""
         SELECT
             cd.rel_path,
@@ -483,23 +724,48 @@ def _corpus_fts_retrieve(
         CROSS JOIN websearch_to_tsquery('english', :q) query
         WHERE cc.tsv @@ query
           {_domain_clause}
+          AND CASE cd.min_role
+                WHEN 'member'    THEN 0
+                WHEN 'custodian' THEN 0
+                WHEN 'officer'   THEN 1
+                WHEN 'admin'     THEN 2
+                ELSE 0 END <= :req_level
         ORDER BY rank DESC
         LIMIT 50
     """
-    _fts_params = {"q": question, **_domain_params}
+    _fts_params = {"q": question, "req_level": _requester_level, **_domain_params}
     rows = db.execute(text(_FTS_SQL), _fts_params).fetchall()
+    # Discard near-zero-relevance noise from the AND query.
+    rows = [r for r in rows if r[4] >= _FTS_RANK_MIN]
 
     # OR-expansion fallback: when AND-FTS returns nothing, retry with any matching term.
     # This handles equipment questions where brand/type keywords only appear in the
     # title/front-matter while operational content uses generic terms.
+    #
+    # Generic terms (procedure, protocol, care, …) are excluded via
+    # _OR_EXPANSION_STOP so a high-frequency word doesn't pollute ranking and
+    # let an unrelated document out-score the correct one.
+    #
+    # Synonym expansion: lay/clinical synonyms are folded so that e.g.
+    # "nosebleed" also matches chunks that only contain "epistaxis".
     _used_or_fts = False
     if not rows:
-        tokens = [t for t in re.split(r'\W+', question.lower())
-                  if t not in _STOP_WORDS and len(t) > 2]
-        if tokens:
-            or_question = " OR ".join(tokens[:8])
+        raw_tokens = [t for t in re.split(r'\W+', question.lower())
+                      if t not in _OR_EXPANSION_STOP and len(t) > 2]
+        # Expand synonyms: replace each token with its synonym cluster (deduped).
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for tok in raw_tokens[:8]:
+            for syn in _QUERY_SYNONYMS.get(tok, [tok]):
+                if syn not in seen:
+                    expanded.append(syn)
+                    seen.add(syn)
+        if expanded:
+            or_question = " OR ".join(expanded)
             try:
-                rows = db.execute(text(_FTS_SQL), {"q": or_question, **_domain_params}).fetchall()
+                or_rows = db.execute(text(_FTS_SQL), {"q": or_question, "req_level": _requester_level, **_domain_params}).fetchall()
+                # Apply same rank floor to OR results.
+                rows = [r for r in or_rows if r[4] >= _FTS_RANK_MIN]
                 _used_or_fts = bool(rows)
             except Exception:
                 db.rollback()
@@ -508,12 +774,49 @@ def _corpus_fts_retrieve(
         guidance = {
             "type": "refusal",
             "reasonCode": "INSUFFICIENT_EVIDENCE",
-            "title": "No matching guidance",
-            "message": "The system could not find a matching document for this question.",
-            "safeNextStep": "Rephrase your question or consult your supervisor.",
+            "title": "No approved departmental guidance found",
+            "message": (
+                "No approved departmental guidance found for this query. "
+                "The corpus does not contain a document that matches the terms in your question."
+            ),
+            "safeNextStep": "Rephrase your question with specific procedure or equipment names, or consult your supervisor.",
             "hiddenSource": False,
         }
         return guidance, "refused", [], []
+
+    # ── All-generic-query guard ────────────────────────────────────────────────
+    # If every token in the question (after removing _OR_EXPANSION_STOP) is
+    # generic (nothing specific to a procedure, equipment, or emergency), the
+    # FTS hit is likely driven by a domain-ubiquitous word (e.g. "protocol",
+    # "roof", "equipment") that appears in every document.  Refuse fail-closed
+    # rather than returning potentially misleading guidance.
+    #
+    # Examples caught here:
+    #   "what is the protocol"  → tokens after OR-stop = {}   → refuse
+    #   "roof"                  → tokens after OR-stop = {}   → refuse
+    #   "budget allocation equipment" → tokens = {}           → refuse
+    #
+    # NOT caught (correctly passes through):
+    #   "mayday declaration"    → tokens = {mayday, declaration}
+    #   "rit activation"        → tokens = {rit, activation}
+    #   "roof load assessment"  → tokens = {load (filtered), assessment} → {assessment}
+    _meaningful_tokens = [
+        t for t in re.split(r'\W+', question.lower())
+        if t not in _OR_EXPANSION_STOP and len(t) > 2
+    ]
+    if not _meaningful_tokens:
+        return {
+            "type": "refusal",
+            "reasonCode": "INSUFFICIENT_EVIDENCE",
+            "title": "No approved departmental guidance found",
+            "message": (
+                "No approved departmental guidance found for this query. "
+                "The question does not contain specific enough terms to retrieve "
+                "a procedure, equipment document, or emergency protocol."
+            ),
+            "safeNextStep": "Ask about a specific procedure, equipment, or emergency by name.",
+            "hiddenSource": False,
+        }, "refused", [], []
 
     # Fetch content_kind for all matched documents in one query.
     # Used by intent-aware rerankers to apply kind-specific multipliers
@@ -753,10 +1056,28 @@ def _corpus_fts_retrieve(
     _clean_top = clean_lines(top_text)
     _eff_page = top_page if top_page is not None else top_chunk
 
-    # ── Relevance gate — refuse if question tokens have no overlap with excerpt
+    # ── Relevance gate — refuse if question tokens have no overlap with excerpt.
     # Applied in both operational and training modes.
-    if _relevance_score(question, _clean_top) < _RELEVANCE_THRESHOLD:
-        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
+    # OR-expansion results in operational mode require a stricter threshold:
+    # the OR path already signals no AND match was found, so higher overlap is
+    # needed before returning potentially weaker evidence as guidance.
+    _eff_relevance_threshold = (
+        _RELEVANCE_THRESHOLD_OR_OPERATIONAL
+        if (_used_or_fts and mode == "operational")
+        else _RELEVANCE_THRESHOLD
+    )
+    if _relevance_score(question, _clean_top) < _eff_relevance_threshold:
+        return {
+            "type": "refusal",
+            "reasonCode": "NO_RELEVANT_PROCEDURE",
+            "title": "No approved guidance found for this query",
+            "message": (
+                "Result withheld — evidence confidence was insufficient for this query. "
+                "The matched content did not contain enough terms relevant to your question."
+            ),
+            "safeNextStep": "Ask about a specific procedure, equipment, or emergency by name.",
+            "hiddenSource": False,
+        }, "refused", [], []
 
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
@@ -785,12 +1106,14 @@ def _corpus_fts_retrieve(
     # contribute to step extraction — adjacent sections often contain unrelated
     # bullet lists (e.g. AED device setup adjacent to CPR treatment steps).
     #
-    # If the anchor yields ≥4 steps: use as-is.
-    # If the anchor yields fewer: accept the sparse result and let
-    # procedure_quality flag it as "weak" rather than pulling in noise.
-    # Apply a final step-level relevance filter to drop any step that shares no
-    # token with the question — catches residual noise from ambiguous anchors.
+    # Procedure quality is assessed on the FULL parsed result BEFORE step-level
+    # filtering so that query-token coverage of individual step text does not
+    # reduce the apparent quality of a legitimate procedure document.
+    # (e.g. "rit activation" tokens appear in only 1 of 8 MAYDAY steps, but
+    # all 8 steps are valid procedure content — the quality must be ok.)
+    # Step-level filtering runs afterwards for display purposes only.
     proc = parse_procedure(_clean_top)
+    _pq = procedure_quality(proc, _clean_top)
 
     _question_tokens = _tokenize(question)
     if _question_tokens:
@@ -800,8 +1123,6 @@ def _corpus_fts_retrieve(
             s for s in proc["steps"]
             if _tokenize(s) & _question_tokens
         ]
-
-    _pq = procedure_quality(proc, _clean_top)
 
     # ── Fetch document-level metadata (owner/dates/status) ───────────────────
     try:
@@ -825,9 +1146,12 @@ def _corpus_fts_retrieve(
             refusal = {
                 "type": "refusal",
                 "reasonCode": "NO_ACTIVE_PROCEDURE",
-                "title": "No active procedure found",
-                "message": "The matched document is not in active status.",
-                "safeNextStep": "Consult your training officer for the current version.",
+                "title": "No active approved guidance found",
+                "message": (
+                    "No active approved guidance found — the matched document has status "
+                    f"'{_status_ov}' and cannot be used for operational decisions."
+                ),
+                "safeNextStep": "Consult your training officer for the current active version of this procedure.",
                 "hiddenSource": False,
             }
             return refusal, "refused", [], []
@@ -902,13 +1226,12 @@ def _corpus_fts_retrieve(
         return {
             "type": "refusal",
             "reasonCode": "LOW_CONFIDENCE",
-            "title": "Low confidence — guidance withheld",
+            "title": "Reference material found — not an approved LRFD protocol",
             "message": (
-                "The system found a relevant document but could not extract "
-                "a high-confidence procedure. Operational use requires clear "
-                "procedure structure."
+                "Reference material was found but could not be confirmed as an approved LRFD procedure. "
+                "The matched content did not have sufficient procedural structure for operational use."
             ),
-            "safeNextStep": "Consult your supervisor or training officer for the current procedure.",
+            "safeNextStep": "Consult your training officer or supervisor for the current approved protocol.",
             "hiddenSource": False,
         }, "refused", [], []
 
@@ -960,17 +1283,20 @@ def _corpus_fts_retrieve(
     # allowed during the pilot but must never show as "Approved Guidance".
     # They are returned as type="medical_reference" — a distinct card type
     # that carries a hard banner and no "approved" label.
-    # Exception: operational + weak/reject quality → fail-closed LOW_CONFIDENCE_MEDICAL.
+    # Exception: operational + "reject" quality only → fail-closed LOW_CONFIDENCE_MEDICAL.
+    # "Weak" quality is NOT refused here because EMR textbooks are narrative/
+    # explanatory prose; the procedure parser rates them as "weak" even when
+    # they contain directly relevant medical guidance.  The relevance gate
+    # (above) already ensures off-topic content is withheld.
     if _top_domain == "medical_emr" and mode != "medical_reference":
-        if mode == "operational" and _pq["decision"] in ("reject", "weak"):
+        if mode == "operational" and _pq["decision"] == "reject":
             return {
                 "type": "refusal",
                 "reasonCode": "LOW_CONFIDENCE_MEDICAL",
-                "title": "Medical guidance refused — low confidence",
+                "title": "Medical guidance withheld — insufficient confidence",
                 "message": (
-                    "The system found a potentially relevant medical/EMR document but "
-                    "could not extract a high-confidence procedure. "
-                    "Providing imprecise medical guidance could cause harm."
+                    "Medical reference material was found but confidence was insufficient to surface it. "
+                    "Imprecise medical guidance could cause harm — this result has been withheld."
                 ),
                 "safeNextStep": (
                     "Contact medical control or your Medical Director for guidance. "
@@ -980,7 +1306,8 @@ def _corpus_fts_retrieve(
             }, "refused", [], []
         # Allowed — build a medical_reference guidance card (not "approved").
         _emr_disclaimer = (
-            "This is EMR reference material only — NOT an approved LRFD protocol. "
+            "Reference material found — NOT an approved LRFD protocol. "
+            "This is EMR reference content only. "
             "Follow medical control direction and your agency's standing orders."
         )
         top5 = reranked[:5]
@@ -1033,11 +1360,21 @@ def _corpus_fts_retrieve(
             "warnings": _pq_warnings,
             "confidence": {
                 "rerank_reason": "; ".join(_reason_parts),
-                "toc_filtered":  _toc_filtered,
-                "used_fallback": _used_fallback,
+                "toc_filtered":   _toc_filtered,
+                "used_fallback":  _used_fallback,
+                "or_expansion":   _used_or_fts,
+                "fts_rank_min":   _FTS_RANK_MIN,
             },
             "procedure_quality": _pq,
         }
+        _medref_primary_rerank = _rerank_val * (1.15 if _top_content_kind == "procedure" else 1.0)
+        _medref_answers = _build_multi_answers(
+            reranked, top_rel, _medref_primary_rerank,
+            medref_guidance["document"], make_summary(_clean_top), _clean_top[:1500],
+            question, _eff_relevance_threshold, _content_kind_map,
+        )
+        if _medref_answers:
+            medref_guidance["answers"] = _medref_answers
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1055,7 +1392,7 @@ def _corpus_fts_retrieve(
                 "hiddenSource": False,
             }, "refused", [], []
         _emr_disclaimer = (
-            "This is a reference excerpt only — NOT an approved operational protocol. "
+            "Reference material found — NOT an approved operational protocol. "
             "Follow your agency's standing orders and medical director guidance."
         )
         top5 = reranked[:5]
@@ -1105,11 +1442,21 @@ def _corpus_fts_retrieve(
             },
             "confidence": {
                 "rerank_reason": "; ".join(_reason_parts),
-                "toc_filtered":  _toc_filtered,
-                "used_fallback": _used_fallback,
+                "toc_filtered":   _toc_filtered,
+                "used_fallback":  _used_fallback,
+                "or_expansion":   _used_or_fts,
+                "fts_rank_min":   _FTS_RANK_MIN,
             },
             "procedure_quality": _pq,
         }
+        _ref_primary_rerank = _rerank_val * (1.15 if _top_content_kind == "procedure" else 1.0)
+        _ref_answers = _build_multi_answers(
+            reranked, top_rel, _ref_primary_rerank,
+            ref_guidance["document"], make_summary(_clean_top), _clean_top[:1500],
+            question, _eff_relevance_threshold, _content_kind_map,
+        )
+        if _ref_answers:
+            ref_guidance["answers"] = _ref_answers
         return ref_guidance, "allowed", ref_sources, ref_citations
 
     # ── Policy gate D: training + weak → reference type (not approved) ───────
@@ -1193,8 +1540,10 @@ def _corpus_fts_retrieve(
         "troubleshooting": [] if _force_reference else _pq_troubles,
         "confidence": {
             "rerank_reason": "; ".join(_reason_parts),
-            "toc_filtered":  _toc_filtered,
-            "used_fallback": _used_fallback,
+            "toc_filtered":   _toc_filtered,
+            "used_fallback":  _used_fallback,
+            "or_expansion":   _used_or_fts,
+            "fts_rank_min":   _FTS_RANK_MIN,
         },
         "procedure_quality": _pq,
     }
@@ -1235,12 +1584,22 @@ def _corpus_fts_retrieve(
         }
         for rel_path, _title, chunk_idx, chunk_text_val, _rank, pg, _dom in top5
     ]
+    # ── Multi-answer: collect secondary results from other documents ──────────
+    _primary_rerank_val = _rerank_val * (1.15 if _top_content_kind == "procedure" else 1.0)
+    _multi_answers = _build_multi_answers(
+        reranked, top_rel, _primary_rerank_val,
+        guidance["document"], guidance.get("summary", ""), _clean_top[:1500],
+        question, _eff_relevance_threshold, _content_kind_map,
+    )
+    if _multi_answers:
+        guidance["answers"] = _multi_answers
     return guidance, "allowed", sources, citations
 
 
 def _retrieve(
     question: str, mode: str, role_level: int, db: DBSession,
     domain_filter: "list[str] | None" = None,
+    requester_role: str = "member",
 ) -> tuple[dict, str, list, list]:
     """
     Primary retrieval dispatcher:
@@ -1249,7 +1608,9 @@ def _retrieve(
     Fail-closed in both paths: INSUFFICIENT_EVIDENCE if nothing matches.
     """
     # FTS path — active whenever corpus has been ingested.
-    fts_result = _corpus_fts_retrieve(question, mode, db, domain_filter=domain_filter)
+    fts_result = _corpus_fts_retrieve(question, mode, db,
+                                      domain_filter=domain_filter,
+                                      requester_role=requester_role)
     if fts_result is not None:
         return fts_result
 
@@ -1273,9 +1634,12 @@ def _retrieve(
         guidance = {
             "type": "refusal",
             "reasonCode": "INSUFFICIENT_EVIDENCE",
-            "title": "No matching guidance",
-            "message": "The system could not find a matching policy document for this question.",
-            "safeNextStep": "Rephrase your question or consult your supervisor.",
+            "title": "No approved departmental guidance found",
+            "message": (
+                "No approved departmental guidance found for this query. "
+                "The corpus does not contain a document that matches the terms in your question."
+            ),
+            "safeNextStep": "Rephrase your question with specific procedure or equipment names, or consult your supervisor.",
             "hiddenSource": False,
         }
         return guidance, "refused", [], []
@@ -1346,15 +1710,26 @@ def _scenario_key_from_guidance(guidance: dict) -> str:
 
 _db_ready = False
 
-# Resolved once at startup; falls back to "0.1.0" when git is unavailable.
-try:
-    _VERSION: str = subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=os.path.dirname(os.path.abspath(__file__)),
-        stderr=subprocess.DEVNULL,
-    ).decode().strip()
-except Exception:
-    _VERSION = "0.1.0"
+# Build provenance — baked in at image build time via Dockerfile ARG → ENV.
+# GIT_SHA is the short git SHA of the keystone-gov repo at build time.
+# BUILD_TIMESTAMP is an ISO-8601 UTC string from the build host.
+# Both default to "unknown" when the image was built without scripts/build-api.sh.
+_BUILD_SHA: str = os.environ.get("GIT_SHA", "unknown").strip() or "unknown"
+_BUILD_TS: str = os.environ.get("BUILD_TIMESTAMP", "unknown").strip() or "unknown"
+
+# _VERSION: prefer baked SHA; fall back to live git (local dev); then "0.1.0".
+if _BUILD_SHA != "unknown":
+    _VERSION: str = _BUILD_SHA
+else:
+    try:
+        _VERSION = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        _BUILD_SHA = _VERSION  # also update _BUILD_SHA for /health
+    except Exception:
+        _VERSION = "0.1.0"
 
 # ---------------------------------------------------------------------------
 # Governance config flags (read once at startup from environment)
@@ -1439,6 +1814,15 @@ async def lifespan(app: FastAPI):
               file=sys.stderr, flush=True)
     _load_signing_key()
     init_role_config()
+    try:
+        db = SessionLocal()
+        try:
+            seed_managed_users(db)
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[startup] seed_managed_users failed: {exc}", file=sys.stderr, flush=True)
+    validate_hmac_key()
     yield
 
 
@@ -1538,6 +1922,8 @@ def health():
         "service": "keystone-gov-api",
         "db": _db_ready,
         "version": _VERSION,
+        "git_sha": _BUILD_SHA,
+        "build_ts": _BUILD_TS,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
     }
@@ -1641,14 +2027,14 @@ def login(req: LoginRequest, db: DBSession = Depends(get_db)):
                 "reasonCode": "CF_AUTH_REQUIRED",
             },
         )
-    # In public demo mode, admin login is disabled regardless of credentials.
+    # In public demo mode, authority login is disabled regardless of credentials.
     if _PUBLIC_DEMO_MODE:
         user_row = db.query(User).filter(User.username == req.username).first()
-        if user_row and user_row.role == "admin":
+        if user_row and user_row.role == "authority":
             raise HTTPException(
                 status_code=403,
                 detail={
-                    "message": "Admin login is disabled in public demo mode.",
+                    "message": "Authority login is disabled in public demo mode.",
                     "reasonCode": "PUBLIC_ADMIN_DISABLED",
                 },
             )
@@ -1700,10 +2086,10 @@ def submit_query(
     if req.mode == "medical_reference":
         _effective_domain_filter = ["medical_emr"]
 
-    # Admin override: scenario_key short-circuits retrieval for demo purposes.
+    # Authority override: scenario_key short-circuits retrieval for demo purposes.
     # "restricted" is handled first (its template contains the member-refused fixture,
-    # not the officer/admin approved guidance, so it needs ACL-aware handling).
-    if req.scenario_key and role_level >= _ROLE_LEVEL["admin"]:
+    # not the officer/authority approved guidance, so it needs ACL-aware handling).
+    if req.scenario_key and _has_perm(current_user, "case_management"):
         if req.scenario_key == "restricted":
             min_level = _SCENARIO_MIN_LEVEL.get("restricted", 1)
             if role_level >= min_level:
@@ -1753,11 +2139,11 @@ def submit_query(
             stored_scenario_key = req.scenario_key
         else:
             # Unknown scenario_key — fall through to retrieval
-            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter)
+            guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter, requester_role=role)
             stored_scenario_key = _scenario_key_from_guidance(guidance)
     else:
-        # Real retrieval — scenario_key ignored for non-admins
-        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter)
+        # Real retrieval — scenario_key ignored unless user has case_management
+        guidance, policy_outcome, sources, citations = _retrieve(req.question, req.mode, role_level, db, domain_filter=_effective_domain_filter, requester_role=role)
         stored_scenario_key = _scenario_key_from_guidance(guidance)
 
     query_id = str(uuid.uuid4())
@@ -1850,7 +2236,8 @@ def get_source(
     try:
         corpus_row = db.execute(
             text("""
-                SELECT cd.rel_path, cd.title, cc.text
+                SELECT cd.rel_path, cd.title, cc.text,
+                       cd.owner, cd.effective_date, cd.review_date, cd.status_override
                 FROM corpus_documents cd
                 JOIN corpus_chunks cc ON cc.doc_id = cd.id
                 WHERE cd.rel_path = :rel AND cc.chunk_index = :idx
@@ -1862,16 +2249,16 @@ def get_source(
         corpus_row = None
 
     if corpus_row:
-        rel_path, title, chunk_text = corpus_row
+        rel_path, title, chunk_text, c_owner, c_eff, c_rev, c_status = corpus_row
         return SourceResponse(
             documentId=rel_path,
             page=page,
             title=title,
-            section=f"chunk {page}",
-            status="active",
-            effectiveDate="",
-            reviewDate="",
-            owner="",
+            section=f"passage {page}",
+            status=c_status or "active",
+            effectiveDate=c_eff or "",
+            reviewDate=c_rev or "",
+            owner=c_owner or "",
             excerpt=(chunk_text or "")[:800],
             highlight="",
             notes=[],
@@ -1920,7 +2307,8 @@ def get_source_chunk(
     try:
         corpus_row = db.execute(
             text("""
-                SELECT cd.rel_path, cd.title, cc.text, cc.page
+                SELECT cd.rel_path, cd.title, cc.text, cc.page,
+                       cd.owner, cd.effective_date, cd.review_date, cd.status_override
                 FROM corpus_documents cd
                 JOIN corpus_chunks cc ON cc.doc_id = cd.id
                 WHERE cd.rel_path = :rel AND cc.chunk_index = :idx
@@ -1932,18 +2320,18 @@ def get_source_chunk(
         corpus_row = None
 
     if not corpus_row:
-        raise HTTPException(status_code=404, detail="Chunk not found")
+        raise HTTPException(status_code=404, detail="Passage not found")
 
-    rel_path, title, chunk_text_val, page_num = corpus_row
+    rel_path, title, chunk_text_val, page_num, c_owner, c_eff, c_rev, c_status = corpus_row
     return SourceResponse(
         documentId=rel_path,
         page=page_num if page_num is not None else chunk_index,
         title=title,
-        section=f"page {page_num}" if page_num is not None else f"chunk {chunk_index}",
-        status="active",
-        effectiveDate="",
-        reviewDate="",
-        owner="",
+        section=f"page {page_num}" if page_num is not None else f"passage {chunk_index}",
+        status=c_status or "active",
+        effectiveDate=c_eff or "",
+        reviewDate=c_rev or "",
+        owner=c_owner or "",
         excerpt=(chunk_text_val or "")[:800],
         highlight="",
         notes=[],
@@ -2081,9 +2469,9 @@ def list_audit(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """List audit log entries — officer/admin only."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """List audit log entries — officer/authority/custodian (view_all_audit)."""
+    if not _has_perm(current_session, "view_all_audit"):
+        raise HTTPException(status_code=403, detail="view_all_audit permission required")
 
     where_clauses: list[str] = []
     params: dict = {"limit": min(limit, 200), "offset": offset}
@@ -2388,8 +2776,8 @@ def get_evidence_zip(
     JSON files use sort_keys=True for canonical form.
     """
     _require_signing_key()
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin token required")
+    if not _has_perm(current_session, "audit_export_governance"):
+        raise HTTPException(status_code=403, detail="audit_export_governance permission required")
 
     # ── Evidence approval gate ─────────────────────────────────────────────────
     _approval_row = None
@@ -2519,6 +2907,10 @@ class AddQueryBody(BaseModel):
     query_id: str
 
 
+class _ChangeRoleBody(BaseModel):
+    role: str  # member | officer | authority
+
+
 # ---------------------------------------------------------------------------
 # Evidence export approval (KDAT-005)
 # ---------------------------------------------------------------------------
@@ -2556,8 +2948,8 @@ def create_export_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "audit_export_governance"):
+        raise HTTPException(status_code=403, detail="audit_export_governance permission required")
     # Verify query exists
     q = db.query(Query).filter(Query.id == query_id).first()
     if not q:
@@ -2588,8 +2980,8 @@ def get_export_requests_for_query(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "audit_export_governance"):
+        raise HTTPException(status_code=403, detail="audit_export_governance permission required")
     try:
         rows = db.execute(text("""
             SELECT id, query_id, requested_by, requested_by_role, requested_at,
@@ -2612,8 +3004,8 @@ def approve_export_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "audit_export_governance"):
+        raise HTTPException(status_code=403, detail="audit_export_governance permission required")
     try:
         row = db.execute(
             text("SELECT id, status, requested_by FROM evidence_export_requests WHERE id=:id"),
@@ -2653,8 +3045,8 @@ def reject_export_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "audit_export_governance"):
+        raise HTTPException(status_code=403, detail="audit_export_governance permission required")
     try:
         row = db.execute(
             text("SELECT id, status FROM evidence_export_requests WHERE id=:id"),
@@ -2688,6 +3080,20 @@ def reject_export_request(
 
 _DECISION_VALUES = {"followed", "partial", "overridden", "no_action"}
 
+_RUN_ID_RE = re.compile(r'^[a-zA-Z0-9._:\-]{1,80}$')
+
+
+def _validate_run_id(value: "str | None") -> "str | None":
+    """Return value if valid run_id, None if absent, raises 422 if malformed."""
+    if not value:
+        return None
+    if not _RUN_ID_RE.match(value):
+        raise HTTPException(
+            status_code=422,
+            detail="X-Keystone-Run-Id: invalid format (allowed: [a-zA-Z0-9._:-], max 80 chars)",
+        )
+    return value
+
 
 def _decision_to_dict(row: tuple) -> dict:
     (dec_id, query_id, created_at_utc, created_by_username, created_by_role,
@@ -2716,8 +3122,10 @@ def create_operator_decision(
     body: OperatorDecisionBody,
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
+    x_keystone_run_id: "str | None" = Header(default=None),
 ):
     """Record an operator decision for a query (member/officer/admin)."""
+    run_id = _validate_run_id(x_keystone_run_id)
     if body.decision not in _DECISION_VALUES:
         raise HTTPException(
             status_code=422,
@@ -2747,9 +3155,11 @@ def create_operator_decision(
         result = db.execute(text("""
             INSERT INTO operator_decisions
                 (query_id, created_by_username, created_by_role,
-                 decision, decision_reason, actions_taken, notes, attachments)
+                 decision, decision_reason, actions_taken, notes, attachments,
+                 run_id)
             VALUES (:qid, :uname, :role, :decision, :reason,
-                    CAST(:actions AS jsonb), :notes, CAST(:attachments AS jsonb))
+                    CAST(:actions AS jsonb), :notes, CAST(:attachments AS jsonb),
+                    :run_id)
             RETURNING id
         """), {
             "qid":        query_id,
@@ -2760,6 +3170,7 @@ def create_operator_decision(
             "actions":    json.dumps(body.actions_taken),
             "notes":      body.notes,
             "attachments":json.dumps(body.attachments),
+            "run_id":     run_id,
         }).fetchone()
         db.commit()
     except Exception as exc:
@@ -2809,9 +3220,9 @@ def review_operator_decision(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Supervisor review sign-off (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Supervisor review sign-off (decision_review permission)."""
+    if not _has_perm(current_session, "decision_review"):
+        raise HTTPException(status_code=403, detail="decision_review permission required")
     try:
         row = db.execute(
             text("SELECT id FROM operator_decisions WHERE query_id = :qid"),
@@ -2886,10 +3297,10 @@ def get_incident_manifest(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Return the incident pack manifest JSON (officer/admin)."""
+    """Return the incident pack manifest JSON (decision_review permission)."""
     _require_signing_key()
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    if not _has_perm(current_session, "decision_review"):
+        raise HTTPException(status_code=403, detail="decision_review permission required")
 
     # Require decision
     try:
@@ -3024,10 +3435,10 @@ def get_incident_pack(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Build and return a signed incident pack ZIP (officer/admin)."""
+    """Build and return a signed incident pack ZIP (decision_review permission)."""
     _require_signing_key()
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    if not _has_perm(current_session, "decision_review"):
+        raise HTTPException(status_code=403, detail="decision_review permission required")
     zip_bytes = _build_incident_pack_zip(query_id, db)
     return Response(
         content=zip_bytes,
@@ -3074,10 +3485,10 @@ def get_supervisor_review_queue(
 ):
     """
     List queries that have an operator decision, optionally filtered to
-    those not yet reviewed by a supervisor (officer/admin only).
+    those not yet reviewed by a supervisor (decision_review permission).
     """
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    if not _has_perm(current_session, "decision_review"):
+        raise HTTPException(status_code=403, detail="decision_review permission required")
 
     where_clauses = []
     params: dict = {"limit": limit, "offset": offset}
@@ -3146,17 +3557,19 @@ def create_case(
     body: CreateCaseBody,
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
+    x_keystone_run_id: "str | None" = Header(default=None),
 ):
-    """Create a new incident case (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Create a new incident case (case_management permission)."""
+    run_id = _validate_run_id(x_keystone_run_id)
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
     if body.severity not in _CASE_SEVERITIES:
         raise HTTPException(status_code=422, detail=f"severity must be one of: {', '.join(sorted(_CASE_SEVERITIES))}")
 
     try:
         result = db.execute(text("""
-            INSERT INTO incident_cases (created_by, status, severity, title, summary, assigned_to)
-            VALUES (:created_by, 'open', :severity, :title, :summary, :assigned_to)
+            INSERT INTO incident_cases (created_by, status, severity, title, summary, assigned_to, run_id)
+            VALUES (:created_by, 'open', :severity, :title, :summary, :assigned_to, :run_id)
             RETURNING case_id
         """), {
             "created_by":  current_session.username,
@@ -3164,6 +3577,7 @@ def create_case(
             "title":       body.title,
             "summary":     body.summary,
             "assigned_to": body.assigned_to,
+            "run_id":      run_id,
         }).fetchone()
         case_id = str(result[0])
 
@@ -3171,10 +3585,10 @@ def create_case(
             q = db.query(Query).filter(Query.id == qid).first()
             if q:
                 db.execute(text("""
-                    INSERT INTO incident_case_queries (case_id, query_id, added_by)
-                    VALUES (:case_id, :qid, :uname)
+                    INSERT INTO incident_case_queries (case_id, query_id, added_by, run_id)
+                    VALUES (:case_id, :qid, :uname, :run_id)
                     ON CONFLICT DO NOTHING
-                """), {"case_id": case_id, "qid": qid, "uname": current_session.username})
+                """), {"case_id": case_id, "qid": qid, "uname": current_session.username, "run_id": run_id})
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -3192,9 +3606,9 @@ def list_cases(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """List incident cases with optional filters (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """List incident cases with optional filters (case_management permission)."""
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
 
     where_clauses = []
     params: dict = {"limit": limit, "offset": offset}
@@ -3241,9 +3655,9 @@ def get_case_timeline(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Return a merged, time-sorted timeline of events for a case (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Return a merged, time-sorted timeline of events for a case (case_management permission)."""
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
 
     try:
         query_rows = db.execute(text("""
@@ -3356,8 +3770,8 @@ def get_case_pack(
       manifest.json (signed, schema=case-manifest/v1), manifest.sig
     """
     _require_signing_key()
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
 
     try:
         case_row = db.execute(text("""
@@ -3471,9 +3885,9 @@ def get_case(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Return case detail including linked query list (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Return case detail including linked query list (case_management permission)."""
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
 
     try:
         row = db.execute(text("""
@@ -3511,9 +3925,9 @@ def patch_case(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Update case fields (officer/admin). Setting status=closed sets closed_at_utc."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Update case fields (case_management permission). Setting status=closed sets closed_at_utc."""
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
     if body.severity is not None and body.severity not in _CASE_SEVERITIES:
         raise HTTPException(status_code=422, detail=f"severity must be one of: {', '.join(sorted(_CASE_SEVERITIES))}")
     if body.status is not None and body.status not in _CASE_STATUSES:
@@ -3568,10 +3982,12 @@ def add_query_to_case(
     body: AddQueryBody,
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
+    x_keystone_run_id: "str | None" = Header(default=None),
 ):
-    """Add a query to a case (officer/admin)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["officer"]:
-        raise HTTPException(status_code=403, detail="Officer or admin role required")
+    """Add a query to a case (case_management permission)."""
+    run_id = _validate_run_id(x_keystone_run_id)
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
     try:
         case_row = db.execute(
             text("SELECT case_id FROM incident_cases WHERE case_id = :cid"),
@@ -3583,10 +3999,10 @@ def add_query_to_case(
         if not q:
             raise HTTPException(status_code=404, detail="Query not found")
         db.execute(text("""
-            INSERT INTO incident_case_queries (case_id, query_id, added_by)
-            VALUES (:cid, :qid, :uname)
+            INSERT INTO incident_case_queries (case_id, query_id, added_by, run_id)
+            VALUES (:cid, :qid, :uname, :run_id)
             ON CONFLICT DO NOTHING
-        """), {"cid": case_id, "qid": body.query_id, "uname": current_session.username})
+        """), {"cid": case_id, "qid": body.query_id, "uname": current_session.username, "run_id": run_id})
         db.commit()
     except HTTPException:
         raise
@@ -3603,9 +4019,9 @@ def remove_query_from_case(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    """Remove a query from a case (admin only)."""
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    """Remove a query from a case (case_management permission)."""
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
     try:
         db.execute(text("""
             DELETE FROM incident_case_queries
@@ -3635,8 +4051,8 @@ def tamper_audit_entry(
     Uses DB owner credentials (TAMPER_DATABASE_URL) to simulate a privileged
     insider threat — proving tamper-evidence holds even against owner-level edits.
     """
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin token required")
+    if not _has_perm(current_session, "case_management"):
+        raise HTTPException(status_code=403, detail="case_management permission required")
 
     # Verify the entry exists via runtime connection first.
     entry = db.query(AuditEntry).filter(AuditEntry.query_id == query_id).first()
@@ -3900,8 +4316,8 @@ def list_change_requests(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "promote_document"):
+        raise HTTPException(status_code=403, detail="promote_document permission required")
     filters: list[str] = []
     params: dict = {"limit": limit, "offset": offset}
     if status:
@@ -3937,8 +4353,8 @@ def get_change_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "promote_document"):
+        raise HTTPException(status_code=403, detail="promote_document permission required")
     try:
         row = db.execute(text("""
             SELECT id, document_id, requested_by, requested_by_role, requested_at,
@@ -4007,10 +4423,10 @@ def patch_document_metadata(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if current_session.role not in ("custodian", "admin"):
-        raise HTTPException(status_code=403, detail="custodian or admin role required")
-    # If approval workflow is enabled, custodians must use change requests
-    if _REQUIRE_DOC_CHANGE_APPROVAL and current_session.role == "custodian":
+    if not _has_perm(current_session, "edit_corpus_metadata"):
+        raise HTTPException(status_code=403, detail="edit_corpus_metadata permission required")
+    # If approval workflow is enabled, users without promote_document must use change requests
+    if _REQUIRE_DOC_CHANGE_APPROVAL and not _has_perm(current_session, "promote_document"):
         raise HTTPException(
             status_code=403,
             detail="APPROVAL_REQUIRED: Use POST /documents/{id}/change-requests instead",
@@ -4117,8 +4533,8 @@ def create_change_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if current_session.role not in ("custodian", "admin"):
-        raise HTTPException(status_code=403, detail="custodian or admin role required")
+    if not _has_perm(current_session, "edit_corpus_metadata"):
+        raise HTTPException(status_code=403, detail="edit_corpus_metadata permission required")
 
     # Validate patch fields
     allowed_keys = {"owner", "status_override", "effective_date", "review_date", "title_override",
@@ -4172,8 +4588,8 @@ def approve_change_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "promote_document"):
+        raise HTTPException(status_code=403, detail="promote_document permission required")
     try:
         row = db.execute(
             text("SELECT id, status FROM corpus_doc_change_requests WHERE id = :id"),
@@ -4208,8 +4624,8 @@ def reject_change_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "reject_document"):
+        raise HTTPException(status_code=403, detail="reject_document permission required")
     try:
         row = db.execute(
             text("SELECT id, status FROM corpus_doc_change_requests WHERE id = :id"),
@@ -4243,8 +4659,8 @@ def apply_change_request(
     db: DBSession = Depends(get_db),
     current_session: AppUser = Depends(get_current_user),
 ):
-    if _ROLE_LEVEL.get(current_session.role, 0) < _ROLE_LEVEL["admin"]:
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if not _has_perm(current_session, "promote_document"):
+        raise HTTPException(status_code=403, detail="promote_document permission required")
 
     try:
         row = db.execute(text("""
@@ -4336,3 +4752,1131 @@ def apply_change_request(
         raise HTTPException(status_code=500, detail=f"DB error during apply: {exc}")
 
     return {"applied": True, "request_id": req_id, "document": after}
+
+
+# ---------------------------------------------------------------------------
+# Upload workflow  (Steps 3-6)
+# ---------------------------------------------------------------------------
+#
+# POST   /uploads                    custodian or admin; synchronous extract
+# GET    /uploads                    custodian sees own + all pending; admin sees all
+# GET    /uploads/{id}               custodian own + admin any
+# PATCH  /uploads/{id}               metadata correction before activation
+# POST   /uploads/{id}/activate      admin only; temp-file + rename atomicity
+# POST   /uploads/{id}/reject        admin or custodian own; non-empty reason required
+# DELETE /uploads/{id}               pending/failed/rejected only; admin or custodian own
+# POST   /uploads/{id}/retry         failed only; re-runs extraction
+#
+# Staging directory: $CORPUS_ROOT/staging/
+# Max upload size  : 20 MB (enforced in handler before writing to disk)
+# ---------------------------------------------------------------------------
+
+_UPLOAD_MAX_BYTES = 20 * 1024 * 1024   # 20 MB
+_STAGING_DIR      = _CORPUS_ROOT / "staging"
+_ACTIVE_DIR_UPLOAD = _CORPUS_ROOT / "active"
+
+_UPLOAD_MIN_ROLE_VALUES = {"member", "custodian", "officer", "authority"}
+
+
+class _UploadMetaPatch(BaseModel):
+    title:          str | None = None
+    owner:          str | None = None
+    effective_date: str | None = None
+    review_date:    str | None = None
+    domain:         str | None = None
+    content_kind:   str | None = None
+    min_role:       str | None = None
+
+
+class _ActivateBody(BaseModel):
+    supersede_document_id: str | None = None   # rel_path of existing doc to mark superseded
+
+
+class _RejectBody(BaseModel):
+    reason: str
+
+
+def _upload_to_dict(row: tuple) -> dict:
+    """Convert a staged_uploads SELECT row to API dict.
+
+    Columns (positional):
+      0  id, 1 uploaded_at, 2 uploader_username, 3 uploader_role,
+      4  original_filename, 5 stored_filename, 6 sha256, 7 size_bytes, 8 mime,
+      9  title, 10 owner, 11 effective_date, 12 review_date,
+      13 domain, 14 content_kind, 15 min_role,
+      16 status, 17 failure_reason, 18 failure_detail,
+      19 rejection_reason, 20 rejected_by, 21 rejected_at,
+      22 activated_at, 23 activated_by, 24 activated_rel_path, 25 activation_error,
+      26 processing_started_at, 27 processing_completed_at
+    """
+    (uid, uploaded_at, uploader_username, uploader_role,
+     original_filename, stored_filename, sha256, size_bytes, mime,
+     title, owner, effective_date, review_date,
+     domain, content_kind, min_role,
+     status, failure_reason, failure_detail,
+     rejection_reason, rejected_by, rejected_at,
+     activated_at, activated_by, activated_rel_path, activation_error,
+     processing_started_at, processing_completed_at) = row
+    return {
+        "id":                       str(uid),
+        "uploaded_at":              uploaded_at.isoformat() if uploaded_at else None,
+        "uploader_username":        uploader_username,
+        "uploader_role":            uploader_role,
+        "original_filename":        original_filename,
+        "stored_filename":          stored_filename,
+        "sha256":                   sha256,
+        "size_bytes":               size_bytes,
+        "mime":                     mime,
+        "title":                    title,
+        "owner":                    owner,
+        "effective_date":           effective_date,
+        "review_date":              review_date,
+        "domain":                   domain,
+        "content_kind":             content_kind,
+        "min_role":                 min_role,
+        "status":                   status,
+        "failure_reason":           failure_reason,
+        "failure_detail":           failure_detail,
+        "rejection_reason":         rejection_reason,
+        "rejected_by":              rejected_by,
+        "rejected_at":              rejected_at.isoformat() if rejected_at else None,
+        "activated_at":             activated_at.isoformat() if activated_at else None,
+        "activated_by":             activated_by,
+        "activated_rel_path":       activated_rel_path,
+        "activation_error":         activation_error,
+        "processing_started_at":    processing_started_at.isoformat() if processing_started_at else None,
+        "processing_completed_at":  processing_completed_at.isoformat() if processing_completed_at else None,
+    }
+
+
+_UPLOAD_SELECT = """
+    SELECT id, uploaded_at, uploader_username, uploader_role,
+           original_filename, stored_filename, sha256, size_bytes, mime,
+           title, owner, effective_date, review_date,
+           domain, content_kind, min_role,
+           status, failure_reason, failure_detail,
+           rejection_reason, rejected_by, rejected_at,
+           activated_at, activated_by, activated_rel_path, activation_error,
+           processing_started_at, processing_completed_at
+    FROM staged_uploads
+"""
+
+
+def _validate_upload_meta(
+    title: str, domain: str, content_kind: str,
+    effective_date: str, review_date: str, min_role: str,
+) -> None:
+    """Raise HTTPException(422) if any required metadata field is invalid."""
+    if not title.strip():
+        raise HTTPException(status_code=422, detail="title is required")
+    if domain not in _ALLOWED_DOMAINS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"domain must be one of {sorted(_ALLOWED_DOMAINS)}",
+        )
+    if content_kind not in _ALLOWED_CONTENT_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"content_kind must be one of {sorted(_ALLOWED_CONTENT_KINDS)}",
+        )
+    for field_name, field_val in [("effective_date", effective_date), ("review_date", review_date)]:
+        if field_val and not _DATE_RE.match(field_val):
+            raise HTTPException(status_code=422, detail=f"{field_name} must be yyyy-mm-dd or empty")
+    if min_role not in _UPLOAD_MIN_ROLE_VALUES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_role must be one of {sorted(_UPLOAD_MIN_ROLE_VALUES)}",
+        )
+
+
+@app.post("/uploads", status_code=201)
+def upload_document(
+    file:           UploadFile = File(...),
+    title:          str        = File(default=""),
+    owner:          str        = File(default=""),
+    effective_date: str        = File(default=""),
+    review_date:    str        = File(default=""),
+    domain:         str        = File(default=""),
+    content_kind:   str        = File(default="procedure"),
+    min_role:       str        = File(default="member"),
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "upload_to_staging"):
+        raise HTTPException(status_code=403, detail="upload_to_staging permission required")
+
+    # Read file content into memory (enforces size cap without streaming to disk)
+    raw = file.file.read(_UPLOAD_MAX_BYTES + 1)
+    if len(raw) > _UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {_UPLOAD_MAX_BYTES // (1024*1024)} MB limit",
+        )
+
+    original_filename = file.filename or "upload"
+    # Sanitise: keep only safe characters, collapse sequences
+    safe_name = re.sub(r"[^\w.\-]", "_", original_filename)
+    safe_name = re.sub(r"_+", "_", safe_name).strip("_")
+    if not safe_name:
+        safe_name = "upload"
+
+    # Infer MIME from filename extension (more reliable than Content-Type header)
+    upload_id    = str(uuid.uuid4())
+    staging_path = _STAGING_DIR / f"{safe_name}.staging_{upload_id[:8]}"
+    mime         = _ingest_mime_for(Path(safe_name))
+
+    # Use filename-derived title when caller omits it
+    if not title.strip():
+        title = Path(safe_name).stem.replace("_", " ").replace("-", " ")
+
+    # Infer domain from filename/title when caller omits it
+    if not domain:
+        domain = _ingest_infer_domain(safe_name, title)
+
+    _validate_upload_meta(title, domain, content_kind, effective_date, review_date, min_role)
+
+    if not _ingest_is_supported_mime(mime):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported file type: {mime}. Accepted: PDF, DOCX, TXT, MD",
+        )
+
+    # Ensure staging/ exists
+    _STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write to staging (temp name to avoid partial-file races)
+    staging_path.write_bytes(raw)
+    sha256 = _ingest_sha256_file(staging_path)
+    size_bytes = len(raw)
+
+    # Synchronous extraction
+    import time as _time
+    t0 = _time.monotonic()
+    extraction_error: str = ""
+    failure_reason:   str = ""
+    chunks_data: list[tuple[int, int | None, str]] = []
+    try:
+        if mime == "application/pdf":
+            chunks_data = _ingest_build_chunks_pdf(staging_path)
+        else:
+            chunks_data = _ingest_build_chunks_other(staging_path, mime)
+    except Exception as exc:
+        extraction_error = str(exc)
+        failure_reason   = "EXTRACTION_ERROR"
+
+    if not extraction_error and not chunks_data:
+        failure_reason = "NO_TEXT_EXTRACTED"
+
+    status = "failed" if failure_reason else "pending"
+    t1 = _time.monotonic()
+
+    # Write DB row
+    try:
+        row = db.execute(text("""
+            INSERT INTO staged_uploads (
+                id, uploader_username, uploader_role,
+                original_filename, stored_filename,
+                sha256, size_bytes, mime,
+                title, owner, effective_date, review_date,
+                domain, content_kind, min_role,
+                status, failure_reason, failure_detail,
+                processing_started_at, processing_completed_at
+            ) VALUES (
+                :uid, :uname, :role,
+                :orig, :stored,
+                :sha256, :size, :mime,
+                :title, :owner, :eff, :rev,
+                :domain, :ck, :min_role,
+                :status, :freason, :fdetail,
+                now() - :elapsed_start * interval '1 second',
+                now()
+            ) RETURNING id
+        """), {
+            "uid":           upload_id,
+            "uname":         current_user.username,
+            "role":          current_user.role,
+            "orig":          original_filename,
+            "stored":        safe_name,
+            "sha256":        sha256,
+            "size":          size_bytes,
+            "mime":          mime,
+            "title":         title,
+            "owner":         owner,
+            "eff":           effective_date,
+            "rev":           review_date,
+            "domain":        domain,
+            "ck":            content_kind,
+            "min_role":      min_role,
+            "status":        status,
+            "freason":       failure_reason,
+            "fdetail":       extraction_error,
+            "elapsed_start": round(t1 - t0, 3),
+        })
+
+        if status == "pending" and chunks_data:
+            for ci, pg, ct in chunks_data:
+                db.execute(text("""
+                    INSERT INTO staged_upload_chunks (upload_id, chunk_index, page, text)
+                    VALUES (:uid, :ci, :pg, :ct)
+                """), {"uid": upload_id, "ci": ci, "pg": pg, "ct": ct})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        try:
+            staging_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # On failure, clean up staging file
+    if status == "failed":
+        try:
+            staging_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    preview_chunks = [
+        {"chunk_index": c[0], "page": c[1], "text": c[2][:300]}
+        for c in chunks_data[:5]
+    ]
+    return {
+        "id":               upload_id,
+        "status":           status,
+        "mime":             mime,
+        "size_bytes":       size_bytes,
+        "sha256":           sha256,
+        "title":            title,
+        "domain":           domain,
+        "content_kind":     content_kind,
+        "chunk_count":      len(chunks_data),
+        "failure_reason":   failure_reason,
+        "failure_detail":   extraction_error,
+        "preview_chunks":   preview_chunks,
+    }
+
+
+@app.get("/uploads")
+def list_uploads(
+    status:  str | None = QueryParam(default=None),
+    limit:   int         = QueryParam(default=50, ge=1, le=200),
+    offset:  int         = QueryParam(default=0, ge=0),
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "view_staging_queue"):
+        raise HTTPException(status_code=403, detail="view_staging_queue permission required")
+
+    conditions = []
+    params: dict = {"limit": limit, "offset": offset}
+
+    # custodians see their own uploads; authority (view_all_user_activity) sees all
+    if not _has_perm(current_user, "view_all_user_activity"):
+        conditions.append("uploader_username = :uname")
+        params["uname"] = current_user.username
+
+    if status:
+        conditions.append("status = :status")
+        params["status"] = status
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    sql = f"{_UPLOAD_SELECT} {where} ORDER BY uploaded_at DESC LIMIT :limit OFFSET :offset"
+
+    try:
+        rows = db.execute(text(sql), params).fetchall()
+        total_row = db.execute(
+            text(f"SELECT COUNT(*) FROM staged_uploads {where}"),
+            {k: v for k, v in params.items() if k not in ("limit", "offset")},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "total": total_row[0] if total_row else 0,
+        "items": [_upload_to_dict(r) for r in rows],
+    }
+
+
+@app.get("/uploads/{upload_id}")
+def get_upload(
+    upload_id: str,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "view_staging_queue"):
+        raise HTTPException(status_code=403, detail="view_staging_queue permission required")
+
+    try:
+        row = db.execute(
+            text(f"{_UPLOAD_SELECT} WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    d = _upload_to_dict(row)
+    # users without view_all_user_activity may only view their own uploads
+    if not _has_perm(current_user, "view_all_user_activity") and d["uploader_username"] != current_user.username:
+        raise HTTPException(status_code=403, detail="Not your upload")
+
+    # Attach preview chunks
+    try:
+        chunk_rows = db.execute(
+            text("SELECT chunk_index, page, text FROM staged_upload_chunks "
+                 "WHERE upload_id = :uid ORDER BY chunk_index LIMIT 10"),
+            {"uid": upload_id},
+        ).fetchall()
+    except Exception:
+        db.rollback()
+        chunk_rows = []
+
+    d["preview_chunks"] = [
+        {"chunk_index": r[0], "page": r[1], "text": r[2][:300]}
+        for r in chunk_rows
+    ]
+    return d
+
+
+@app.patch("/uploads/{upload_id}")
+def patch_upload(
+    upload_id: str,
+    patch: _UploadMetaPatch,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "upload_to_staging"):
+        raise HTTPException(status_code=403, detail="upload_to_staging permission required")
+
+    try:
+        row = db.execute(
+            text("SELECT id, uploader_username, status, title, domain, content_kind, "
+                 "effective_date, review_date, min_role FROM staged_uploads WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    (_, uploader, status, cur_title, cur_domain, cur_ck,
+     cur_eff, cur_rev, cur_min_role) = row
+
+    if current_user.role == "custodian" and uploader != current_user.username:
+        raise HTTPException(status_code=403, detail="Not your upload")
+    if status not in ("pending", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot patch upload in status '{status}'",
+        )
+
+    updates: dict = {}
+    if patch.title          is not None: updates["title"]          = patch.title
+    if patch.owner          is not None: updates["owner"]          = patch.owner
+    if patch.effective_date is not None: updates["effective_date"] = patch.effective_date
+    if patch.review_date    is not None: updates["review_date"]    = patch.review_date
+    if patch.domain         is not None: updates["domain"]         = patch.domain
+    if patch.content_kind   is not None: updates["content_kind"]   = patch.content_kind
+    if patch.min_role       is not None: updates["min_role"]       = patch.min_role
+
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    # Validate the merged state
+    _validate_upload_meta(
+        title          = updates.get("title", cur_title),
+        domain         = updates.get("domain", cur_domain),
+        content_kind   = updates.get("content_kind", cur_ck),
+        effective_date = updates.get("effective_date", cur_eff),
+        review_date    = updates.get("review_date", cur_rev),
+        min_role       = updates.get("min_role", cur_min_role),
+    )
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+    try:
+        db.execute(
+            text(f"UPDATE staged_uploads SET {set_clause} WHERE id = :uid"),
+            {**updates, "uid": upload_id},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {"updated": True, "upload_id": upload_id, "fields": list(updates.keys())}
+
+
+@app.post("/uploads/{upload_id}/activate", status_code=201)
+def activate_upload(
+    upload_id: str,
+    body: _ActivateBody,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "promote_document"):
+        raise HTTPException(status_code=403, detail="promote_document permission required")
+
+    try:
+        row = db.execute(
+            text(f"{_UPLOAD_SELECT} WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    d = _upload_to_dict(row)
+    if d["status"] != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot activate upload in status '{d['status']}'",
+        )
+
+    stored_filename = d["stored_filename"]
+    staging_path    = _STAGING_DIR / f"{stored_filename}.staging_{upload_id[:8]}"
+    active_path     = _ACTIVE_DIR_UPLOAD / stored_filename
+
+    # Path traversal guard (same pattern as existing /document/ endpoint)
+    active_root = _ACTIVE_DIR_UPLOAD.resolve()
+    target      = active_path.resolve()
+    if not str(target).startswith(str(active_root) + os.sep) and target != active_root:
+        raise HTTPException(status_code=400, detail="Invalid document path")
+
+    if not staging_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Staging file missing — upload may have been cleaned up",
+        )
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    # ── DB transaction (must commit before rename) ────────────────────────────
+    rel_path = stored_filename
+    try:
+        # Upsert corpus_documents
+        existing = db.execute(
+            text("SELECT id FROM corpus_documents WHERE rel_path = :rel"),
+            {"rel": rel_path},
+        ).fetchone()
+        if existing:
+            doc_id = existing[0]
+            db.execute(text("""
+                UPDATE corpus_documents
+                   SET sha256=:sha256, size_bytes=:size, mime=:mime, title=:title,
+                       owner=:owner, effective_date=:eff, review_date=:rev,
+                       status_override='active', domain=:domain,
+                       content_kind=:ck, min_role=:min_role
+                 WHERE id=:doc_id
+            """), {
+                "sha256": d["sha256"], "size": d["size_bytes"], "mime": d["mime"],
+                "title": d["title"], "owner": d["owner"],
+                "eff": d["effective_date"], "rev": d["review_date"],
+                "domain": d["domain"], "ck": d["content_kind"],
+                "min_role": d["min_role"], "doc_id": doc_id,
+            })
+            db.execute(text("DELETE FROM corpus_chunks WHERE doc_id = :doc_id"), {"doc_id": doc_id})
+        else:
+            result = db.execute(text("""
+                INSERT INTO corpus_documents
+                    (rel_path, sha256, size_bytes, mtime_utc, mime, title,
+                     owner, effective_date, review_date, status_override,
+                     domain, content_kind, min_role)
+                VALUES (:rel, :sha256, :size, now(), :mime, :title,
+                        :owner, :eff, :rev, 'active',
+                        :domain, :ck, :min_role)
+                RETURNING id
+            """), {
+                "rel": rel_path, "sha256": d["sha256"], "size": d["size_bytes"],
+                "mime": d["mime"], "title": d["title"], "owner": d["owner"],
+                "eff": d["effective_date"], "rev": d["review_date"],
+                "domain": d["domain"], "ck": d["content_kind"],
+                "min_role": d["min_role"],
+            })
+            doc_id = result.fetchone()[0]
+
+        # Copy staging chunks to corpus_chunks
+        chunk_rows = db.execute(
+            text("SELECT chunk_index, page, text FROM staged_upload_chunks "
+                 "WHERE upload_id = :uid ORDER BY chunk_index"),
+            {"uid": upload_id},
+        ).fetchall()
+        for chunk_index, page, chunk_text_val in chunk_rows:
+            db.execute(text("""
+                INSERT INTO corpus_chunks (doc_id, chunk_index, page, text)
+                VALUES (:doc_id, :ci, :page, :text)
+                ON CONFLICT (doc_id, chunk_index) DO UPDATE
+                    SET text = EXCLUDED.text, page = EXCLUDED.page
+            """), {"doc_id": doc_id, "ci": chunk_index, "page": page, "text": chunk_text_val})
+
+        # Mark superseded document if requested
+        if body.supersede_document_id:
+            db.execute(text("""
+                UPDATE corpus_documents SET status_override='superseded'
+                WHERE rel_path = :rel AND rel_path != :new_rel
+            """), {"rel": body.supersede_document_id, "new_rel": rel_path})
+
+        # Audit event
+        db.execute(text("""
+            INSERT INTO corpus_doc_events
+                (ts_utc, actor_username, actor_role, document_id, action,
+                 before_json, after_json, upload_id)
+            VALUES
+                (now(), :uname, :role, :doc_id, 'activated',
+                 '{}', CAST(:after_j AS jsonb), CAST(:upload_id AS uuid))
+        """), {
+            "uname":     current_user.username,
+            "role":      current_user.role,
+            "doc_id":    rel_path,
+            "after_j":   json.dumps({k: d[k] for k in
+                             ("title","domain","content_kind","sha256","min_role")},
+                             sort_keys=True),
+            "upload_id": upload_id,
+        })
+
+        # Mark staged_uploads as activated
+        db.execute(text("""
+            UPDATE staged_uploads
+               SET status='activated', activated_at=now(),
+                   activated_by=:uname, activated_rel_path=:rel
+             WHERE id=:uid
+        """), {"uname": current_user.username, "rel": rel_path, "uid": upload_id})
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error during activation: {exc}")
+
+    # ── Rename staging file to active/ (after DB commit) ─────────────────────
+    try:
+        _ACTIVE_DIR_UPLOAD.mkdir(parents=True, exist_ok=True)
+        staging_path.rename(active_path)
+    except Exception as exc:
+        # DB is committed; file rename failed — mark for operator attention.
+        try:
+            db.execute(text("""
+                UPDATE staged_uploads
+                   SET status='activation_file_error', activation_error=:err
+                 WHERE id=:uid
+            """), {"err": str(exc), "uid": upload_id})
+            db.commit()
+        except Exception:
+            db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB committed but file rename failed: {exc}. "
+                   "Upload marked activation_file_error — operator action required.",
+        )
+
+    # Write sidecar (non-fatal)
+    try:
+        sidecar_path = active_path.with_suffix(active_path.suffix + ".metadata.json")
+        sidecar_data = {
+            "title":        d["title"],
+            "owner":        d["owner"],
+            "effectiveDate": d["effective_date"],
+            "reviewDate":   d["review_date"],
+            "domain":       d["domain"],
+            "content_kind": d["content_kind"],
+        }
+        sidecar_path.write_text(json.dumps(sidecar_data, indent=2))
+    except Exception as sidecar_exc:
+        import logging as _logging
+        _logging.getLogger("keystone.uploads").warning(
+            "Sidecar write failed for %s: %s", rel_path, sidecar_exc
+        )
+
+    return {
+        "activated":    True,
+        "upload_id":    upload_id,
+        "rel_path":     rel_path,
+        "chunk_count":  len(chunk_rows),
+    }
+
+
+@app.post("/uploads/{upload_id}/reject", status_code=200)
+def reject_upload(
+    upload_id: str,
+    body: _RejectBody,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "upload_to_staging") and not _has_perm(current_user, "reject_document"):
+        raise HTTPException(status_code=403, detail="upload_to_staging or reject_document permission required")
+
+    if not body.reason.strip():
+        raise HTTPException(status_code=422, detail="reason is required")
+
+    try:
+        row = db.execute(
+            text("SELECT id, uploader_username, status FROM staged_uploads WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    _, uploader, status = row
+    # custodians may only reject their own uploads; authority (reject_document) may reject any
+    if _has_perm(current_user, "upload_to_staging") and not _has_perm(current_user, "reject_document") and uploader != current_user.username:
+        raise HTTPException(status_code=403, detail="Not your upload")
+    if status not in ("pending", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reject upload in status '{status}'",
+        )
+
+    try:
+        db.execute(text("""
+            UPDATE staged_uploads
+               SET status='rejected', rejection_reason=:reason,
+                   rejected_by=:uname, rejected_at=now()
+             WHERE id=:uid
+        """), {"reason": body.reason.strip(), "uname": current_user.username, "uid": upload_id})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Clean up staging file (best-effort)
+    try:
+        staging_path = _STAGING_DIR / f"{row[0]}.staging_{upload_id[:8]}"
+        staging_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {"rejected": True, "upload_id": upload_id}
+
+
+@app.delete("/uploads/{upload_id}", status_code=200)
+def delete_upload(
+    upload_id: str,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    if not _has_perm(current_user, "upload_to_staging"):
+        raise HTTPException(status_code=403, detail="upload_to_staging permission required")
+
+    try:
+        row = db.execute(
+            text("SELECT id, uploader_username, status, stored_filename "
+                 "FROM staged_uploads WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    _, uploader, status, stored_filename = row
+    if not _has_perm(current_user, "view_all_user_activity") and uploader != current_user.username:
+        raise HTTPException(status_code=403, detail="Not your upload")
+    if status not in ("pending", "failed", "rejected"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete upload in status '{status}' — only pending/failed/rejected may be deleted",
+        )
+
+    try:
+        db.execute(text("DELETE FROM staged_uploads WHERE id = :uid"), {"uid": upload_id})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Clean up staging file (best-effort)
+    try:
+        staging_path = _STAGING_DIR / f"{stored_filename}.staging_{upload_id[:8]}"
+        staging_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {"deleted": True, "upload_id": upload_id}
+
+
+@app.post("/uploads/{upload_id}/retry", status_code=200)
+def retry_upload(
+    upload_id: str,
+    db: DBSession = Depends(get_db),
+    current_user: AppUser = Depends(get_current_user),
+):
+    """Re-run extraction for a failed upload (e.g. after installing a missing extractor)."""
+    if not _has_perm(current_user, "upload_to_staging"):
+        raise HTTPException(status_code=403, detail="upload_to_staging permission required")
+
+    try:
+        row = db.execute(
+            text("SELECT id, uploader_username, status, stored_filename, mime "
+                 "FROM staged_uploads WHERE id = :uid"),
+            {"uid": upload_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    _, uploader, status, stored_filename, mime = row
+    if not _has_perm(current_user, "view_all_user_activity") and uploader != current_user.username:
+        raise HTTPException(status_code=403, detail="Not your upload")
+    if status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Retry only applies to failed uploads (current status: '{status}')",
+        )
+
+    staging_path = _STAGING_DIR / f"{stored_filename}.staging_{upload_id[:8]}"
+    if not staging_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Staging file missing — cannot retry",
+        )
+
+    import time as _time
+    t0 = _time.monotonic()
+    extraction_error = ""
+    failure_reason   = ""
+    chunks_data: list[tuple[int, int | None, str]] = []
+    try:
+        if mime == "application/pdf":
+            chunks_data = _ingest_build_chunks_pdf(staging_path)
+        else:
+            chunks_data = _ingest_build_chunks_other(staging_path, mime)
+    except Exception as exc:
+        extraction_error = str(exc)
+        failure_reason   = "EXTRACTION_ERROR"
+
+    if not extraction_error and not chunks_data:
+        failure_reason = "NO_TEXT_EXTRACTED"
+
+    new_status = "failed" if failure_reason else "pending"
+    t1 = _time.monotonic()
+
+    try:
+        db.execute(text("DELETE FROM staged_upload_chunks WHERE upload_id = :uid"), {"uid": upload_id})
+        db.execute(text("""
+            UPDATE staged_uploads
+               SET status=:status, failure_reason=:freason, failure_detail=:fdetail,
+                   processing_started_at=now() - :elapsed * interval '1 second',
+                   processing_completed_at=now()
+             WHERE id=:uid
+        """), {
+            "status":  new_status,
+            "freason": failure_reason,
+            "fdetail": extraction_error,
+            "elapsed": round(t1 - t0, 3),
+            "uid":     upload_id,
+        })
+
+        if new_status == "pending" and chunks_data:
+            for ci, pg, ct in chunks_data:
+                db.execute(text("""
+                    INSERT INTO staged_upload_chunks (upload_id, chunk_index, page, text)
+                    VALUES (:uid, :ci, :pg, :ct)
+                """), {"uid": upload_id, "ci": ci, "pg": pg, "ct": ct})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "upload_id":       upload_id,
+        "status":          new_status,
+        "chunk_count":     len(chunks_data),
+        "failure_reason":  failure_reason,
+        "failure_detail":  extraction_error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 7: min_role additive check in _corpus_fts_retrieve
+# ---------------------------------------------------------------------------
+# Applied inline in _corpus_fts_retrieve via SQL — the WHERE clause
+# already filters on cd.domain; we add a min_role gate here by patching
+# the FTS SQL at the module level after all definitions are complete.
+#
+# Pattern: AND _ROLE_LEVEL[requester_role] >= _role_level_for(cd.min_role)
+# Implemented as a helper used when the FTS path is called.
+
+# ---------------------------------------------------------------------------
+# User management (KDAT-059) — Authority role only
+# ---------------------------------------------------------------------------
+
+
+def _managed_user_to_dict(row: "ManagedUser", query_count: int = 0) -> dict:
+    return {
+        "email":          row.email,
+        "display_name":   row.display_name,
+        "role":           row.role,
+        "status":         row.status,
+        "provisioned_at": row.provisioned_at.isoformat() if row.provisioned_at else None,
+        "enabled_at":     row.enabled_at.isoformat() if row.enabled_at else None,
+        "disabled_at":    row.disabled_at.isoformat() if row.disabled_at else None,
+        "enabled_by":     row.enabled_by,
+        "disabled_by":    row.disabled_by,
+        "last_login":     row.last_login.isoformat() if row.last_login else None,
+        "query_count":    query_count,
+    }
+
+
+def _log_user_mgmt_event(
+    db: "DBSession",
+    actor: "AppUser",
+    subject_email: str,
+    action: str,
+    old_value: "str | None" = None,
+    new_value: "str | None" = None,
+    note: "str | None" = None,
+) -> None:
+    """Write a user_management_events row."""
+    db.execute(text("""
+        INSERT INTO user_management_events
+            (id, ts_utc, actor_email, actor_role, subject_email, action, old_value, new_value, note)
+        VALUES
+            (:id, now(), :actor_email, :actor_role, :subject_email, :action, :old_value, :new_value, :note)
+    """), {
+        "id":            str(uuid.uuid4()),
+        "actor_email":   actor.email,
+        "actor_role":    actor.role,
+        "subject_email": subject_email,
+        "action":        action,
+        "old_value":     old_value,
+        "new_value":     new_value,
+        "note":          note,
+    })
+
+
+@app.get("/users")
+def list_managed_users(
+    role:   "str | None" = QueryParam(default=None),
+    status: "str | None" = QueryParam(default=None),
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Return full user roster with activity summary (approve_role_assignments)."""
+    if not _has_perm(current_session, "approve_role_assignments"):
+        raise HTTPException(status_code=403, detail="approve_role_assignments permission required")
+
+    # Build filters
+    where_clauses: list[str] = []
+    params: dict = {}
+    if role:
+        where_clauses.append("mu.role = :role")
+        params["role"] = role
+    if status:
+        where_clauses.append("mu.status = :status")
+        params["status"] = status
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    try:
+        rows = db.execute(text(f"""
+            SELECT mu.email, mu.display_name, mu.role, mu.status,
+                   mu.provisioned_at, mu.enabled_at, mu.disabled_at,
+                   mu.enabled_by, mu.disabled_by, mu.last_login,
+                   COUNT(al.id) AS query_count
+            FROM managed_users mu
+            LEFT JOIN audit_log al ON al.user_email = mu.email
+            {where_sql}
+            GROUP BY mu.email, mu.display_name, mu.role, mu.status,
+                     mu.provisioned_at, mu.enabled_at, mu.disabled_at,
+                     mu.enabled_by, mu.disabled_by, mu.last_login
+            ORDER BY
+                CASE mu.role
+                    WHEN 'authority' THEN 0
+                    WHEN 'custodian' THEN 1
+                    WHEN 'officer'   THEN 2
+                    ELSE 3
+                END,
+                mu.email ASC
+        """), params).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "total": len(rows),
+        "items": [
+            {
+                "email":          r[0],
+                "display_name":   r[1],
+                "role":           r[2],
+                "status":         r[3],
+                "provisioned_at": r[4].isoformat() if r[4] else None,
+                "enabled_at":     r[5].isoformat() if r[5] else None,
+                "disabled_at":    r[6].isoformat() if r[6] else None,
+                "enabled_by":     r[7],
+                "disabled_by":    r[8],
+                "last_login":     r[9].isoformat() if r[9] else None,
+                "query_count":    int(r[10]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/users/{email}/enable")
+def enable_managed_user(
+    email: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Enable a provisioned user (approve_role_assignments)."""
+    if not _has_perm(current_session, "approve_role_assignments"):
+        raise HTTPException(status_code=403, detail="approve_role_assignments permission required")
+
+    email = email.lower().strip()
+
+    try:
+        mu = db.query(ManagedUser).filter(ManagedUser.email == email).first()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not mu:
+        raise HTTPException(status_code=404, detail=f"User {email!r} not found in roster")
+    if mu.status == "enabled":
+        raise HTTPException(status_code=409, detail=f"User {email!r} is already enabled")
+
+    now = datetime.now(timezone.utc)
+    mu.status = "enabled"
+    mu.enabled_at = now
+    mu.enabled_by = current_session.email
+
+    try:
+        _log_user_mgmt_event(db, current_session, email, "enabled", old_value="disabled", new_value="enabled")
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _managed_user_to_dict(mu)
+
+
+@app.post("/users/{email}/disable")
+def disable_managed_user(
+    email: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Disable a user (approve_role_assignments). Cannot disable self or custodians."""
+    if not _has_perm(current_session, "approve_role_assignments"):
+        raise HTTPException(status_code=403, detail="approve_role_assignments permission required")
+
+    email = email.lower().strip()
+
+    if email == current_session.email.lower():
+        raise HTTPException(status_code=400, detail="Cannot disable your own account")
+
+    try:
+        mu = db.query(ManagedUser).filter(ManagedUser.email == email).first()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not mu:
+        raise HTTPException(status_code=404, detail=f"User {email!r} not found in roster")
+    if mu.role == "custodian":
+        raise HTTPException(status_code=403, detail="Cannot disable Custodian accounts — system operator access is not managed by Authority")
+    if mu.status == "disabled":
+        raise HTTPException(status_code=409, detail=f"User {email!r} is already disabled")
+
+    now = datetime.now(timezone.utc)
+    mu.status = "disabled"
+    mu.disabled_at = now
+    mu.disabled_by = current_session.email
+
+    # Invalidate any active demo sessions for this email
+    try:
+        db.execute(text("DELETE FROM sessions WHERE username = :email"), {"email": email})
+        _log_user_mgmt_event(db, current_session, email, "disabled", old_value="enabled", new_value="disabled")
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _managed_user_to_dict(mu)
+
+
+@app.post("/users/{email}/role")
+def change_managed_user_role(
+    email: str,
+    body: _ChangeRoleBody,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Change a user's role (approve_role_assignments). Cannot change own role or custodian role."""
+    if not _has_perm(current_session, "approve_role_assignments"):
+        raise HTTPException(status_code=403, detail="approve_role_assignments permission required")
+
+    email = email.lower().strip()
+
+    if email == current_session.email.lower():
+        raise HTTPException(status_code=400, detail="Cannot change your own role")
+
+    allowed_target_roles = {"member", "officer", "authority"}
+    if body.role not in allowed_target_roles:
+        raise HTTPException(status_code=422, detail=f"role must be one of: {sorted(allowed_target_roles)}")
+
+    try:
+        mu = db.query(ManagedUser).filter(ManagedUser.email == email).first()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    if not mu:
+        raise HTTPException(status_code=404, detail=f"User {email!r} not found in roster")
+    if mu.role == "custodian":
+        raise HTTPException(status_code=403, detail="Cannot change Custodian role — system operator roles are not managed by Authority")
+    if body.role == "custodian":
+        raise HTTPException(status_code=403, detail="Cannot assign Custodian role — contact system operator")
+    if mu.role == body.role:
+        raise HTTPException(status_code=409, detail=f"User {email!r} already has role {body.role!r}")
+
+    old_role = mu.role
+    mu.role = body.role
+
+    # Sync cf_users record if present
+    try:
+        db.execute(
+            text("UPDATE cf_users SET assigned_role = :role, updated_at = now() WHERE email = :email"),
+            {"role": body.role, "email": email},
+        )
+        # Invalidate sessions so user re-authenticates with new role
+        db.execute(text("DELETE FROM sessions WHERE username = :email"), {"email": email})
+        _log_user_mgmt_event(
+            db, current_session, email, "role_changed",
+            old_value=old_role, new_value=body.role,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _managed_user_to_dict(mu)
+
+
+def _min_role_level_sql_expr(role_param: str) -> str:
+    """Return a SQL snippet that compares the requester's role level against cd.min_role."""
+    # Use CASE to translate min_role TEXT to integer inline in SQL
+    return (
+        f"AND CASE cd.min_role "
+        f"    WHEN 'member' THEN 0 "
+        f"    WHEN 'custodian' THEN 0 "
+        f"    WHEN 'officer' THEN 1 "
+        f"    WHEN 'authority' THEN 2 "
+        f"    ELSE 0 END <= :{role_param}"
+    )

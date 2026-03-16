@@ -82,3 +82,32 @@ class Session(Base):
     username = Column(String, nullable=False)
     role = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ManagedUser(Base):
+    """Canonical user management state. Seeded from config, managed by Authority."""
+    __tablename__ = "managed_users"
+    email          = Column(String, primary_key=True)
+    display_name   = Column(String, nullable=False, default="")
+    role           = Column(String, nullable=False, default="member")
+    status         = Column(String, nullable=False, default="disabled")  # 'enabled' | 'disabled'
+    provisioned_at = Column(DateTime(timezone=True))
+    enabled_at     = Column(DateTime(timezone=True))
+    disabled_at    = Column(DateTime(timezone=True))
+    enabled_by     = Column(String)
+    disabled_by    = Column(String)
+    last_login     = Column(DateTime(timezone=True))
+
+
+class UserManagementEvent(Base):
+    """Governance audit trail for user management actions."""
+    __tablename__ = "user_management_events"
+    id            = Column(String, primary_key=True)
+    ts_utc        = Column(DateTime(timezone=True), nullable=False)
+    actor_email   = Column(String, nullable=False)
+    actor_role    = Column(String, nullable=False)
+    subject_email = Column(String, nullable=False)
+    action        = Column(String, nullable=False)  # 'enabled' | 'disabled' | 'role_changed'
+    old_value     = Column(String)
+    new_value     = Column(String)
+    note          = Column(String)
