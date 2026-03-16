@@ -802,10 +802,42 @@ def _corpus_fts_retrieve(
     if not rows:
         raw_tokens = [t for t in re.split(r'\W+', question.lower())
                       if t not in _OR_EXPANSION_STOP and len(t) > 2]
+        # RC3: for long queries, sort tokens by corpus specificity (IDF) before
+        # applying the 8-token cap.  Positional selection caused long narrative
+        # queries (e.g. E09) to drop rare key terms like MAYDAY and RIT that
+        # appear late in the sentence, using common scene-setting words instead.
+        # One DB round trip; only runs when AND FTS already returned 0 rows.
+        _OR_EXPANSION_CAP = 8
+        if len(raw_tokens) > _OR_EXPANSION_CAP:
+            try:
+                placeholders = ", ".join(f":_idf{i}" for i in range(len(raw_tokens)))
+                freq_rows = db.execute(
+                    text(f"""
+                        SELECT unnested.tok, COUNT(cc.id) AS df
+                        FROM (SELECT unnest(ARRAY[{placeholders}]) AS tok) unnested
+                        LEFT JOIN corpus_chunks cc
+                            ON cc.tsv @@ to_tsquery('english', unnested.tok)
+                        GROUP BY unnested.tok
+                    """),
+                    {f"_idf{i}": t for i, t in enumerate(raw_tokens)},
+                ).fetchall()
+                _pos = {t: i for i, t in enumerate(raw_tokens)}
+                _df_map = {r[0]: r[1] for r in freq_rows}
+                # Sort key: tokens absent from the corpus (df=0) are last —
+                # they won't match any chunk so they waste OR-expansion slots.
+                # Among present tokens, sort ascending by df (rarest first).
+                raw_tokens = sorted(
+                    raw_tokens,
+                    key=lambda t: (0, _df_map[t], _pos[t]) if _df_map.get(t, 0) > 0
+                                  else (1, 0, _pos[t]),
+                )
+            except Exception:
+                db.rollback()
+                # Fall back to positional selection on error.
         # Expand synonyms: replace each token with its synonym cluster (deduped).
         expanded: list[str] = []
         seen: set[str] = set()
-        for tok in raw_tokens[:8]:
+        for tok in raw_tokens[:_OR_EXPANSION_CAP]:
             for syn in _QUERY_SYNONYMS.get(tok, [tok]):
                 if syn not in seen:
                     expanded.append(syn)
@@ -1117,17 +1149,41 @@ def _corpus_fts_retrieve(
         else _RELEVANCE_THRESHOLD
     )
     if _relevance_score(question, _clean_top) < _eff_relevance_threshold:
-        return {
-            "type": "refusal",
-            "reasonCode": "NO_RELEVANT_PROCEDURE",
-            "title": "No approved guidance found for this query",
-            "message": (
-                "Result withheld — evidence confidence was insufficient for this query. "
-                "The matched content did not contain enough terms relevant to your question."
-            ),
-            "safeNextStep": "Ask about a specific procedure, equipment, or emergency by name.",
-            "hiddenSource": False,
-        }, "refused", [], []
+        # RC3 cascade: when OR expansion is in use and the top FTS result barely
+        # misses the relevance threshold, try the next reranked candidates before
+        # refusing.  The best FTS hit may be an off-topic document that scores
+        # highly on a shared structural token (e.g. "floor" → floor-collapse
+        # protocol) while the genuinely relevant doc sits one rank lower.
+        # Cap at 3 fallbacks; skip TOC-like chunks; only active on the OR path.
+        _cascade_found = False
+        if _used_or_fts and not _used_fallback:
+            for _cand in reranked[1:4]:
+                _c_rel, _c_title, _c_chunk, _c_text, _c_rank, _c_page, _c_dom = _cand
+                if _is_toc_like(_c_chunk, _c_text):
+                    continue
+                _c_clean = clean_lines(_c_text)
+                if _relevance_score(question, _c_clean) >= _eff_relevance_threshold:
+                    top_rel, top_title, top_chunk, top_text, _clean_top = (
+                        _c_rel, _c_title, _c_chunk, _c_text, _c_clean
+                    )
+                    top_page   = _c_page
+                    _fts_rank  = _c_rank
+                    _top_domain = _c_dom
+                    _top_content_kind = _content_kind_map.get(_c_rel, "procedure")
+                    _cascade_found = True
+                    break
+        if not _cascade_found:
+            return {
+                "type": "refusal",
+                "reasonCode": "NO_RELEVANT_PROCEDURE",
+                "title": "No approved guidance found for this query",
+                "message": (
+                    "Result withheld — evidence confidence was insufficient for this query. "
+                    "The matched content did not contain enough terms relevant to your question."
+                ),
+                "safeNextStep": "Ask about a specific procedure, equipment, or emergency by name.",
+                "hiddenSource": False,
+            }, "refused", [], []
 
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
