@@ -204,7 +204,7 @@ DEMO_SOURCES = [
         ),
         "highlight": "disciplinary action per department SOP section 7.4",
         "notes": [
-            "Restricted to officer and admin roles.",
+            "Restricted to officer and authority roles.",
             "Not visible to member role.",
         ],
         "min_role_level": 1,
@@ -262,7 +262,7 @@ def seed_demo_data(db: DBSession) -> None:
     users = [
         User(id=str(uuid.uuid4()), username="demo", role="member", password_hash=hash_password("demo")),
         User(id=str(uuid.uuid4()), username="officer", role="officer", password_hash=hash_password("officer")),
-        User(id=str(uuid.uuid4()), username="admin", role="admin", password_hash=hash_password("admin")),
+        User(id=str(uuid.uuid4()), username="admin", role="authority", password_hash=hash_password("admin")),
     ]
     db.add_all(users)
 
