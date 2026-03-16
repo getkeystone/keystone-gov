@@ -1187,6 +1187,19 @@ def _corpus_fts_retrieve(
                 "hiddenSource": False,
             }, "refused", [], []
 
+    # ── RC6: equipment manual gate ────────────────────────────────────────────
+    # Equipment/apparatus instruction manuals (BAM monitor, decon washer,
+    # System 2000 pump) are tagged content_kind='equipment_manual'.  When an
+    # OR-expanded result lands on one of these docs, a single coincidental
+    # token match (e.g. "system" in a BAM parameter section, "fill" in a
+    # decon washer panel description) is not enough to serve apparatus content
+    # to a procedure query.  Require 0.40 token overlap — roughly 2/5 tokens.
+    _RC6_EQUIPMENT_THRESHOLD = 0.40
+    if (_used_or_fts
+            and _top_content_kind == "equipment_manual"
+            and _relevance_score(question, _clean_top) < _RC6_EQUIPMENT_THRESHOLD):
+        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
+
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
     # Run combined text through clean_lines before parsing.
