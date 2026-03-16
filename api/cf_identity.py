@@ -64,7 +64,7 @@ _DEMO_SIM_ALLOWED: set[str] = {
     if e.strip()
 }
 
-_VALID_ROLES: set[str] = {"member", "officer", "custodian", "admin"}
+_VALID_ROLES: set[str] = {"member", "officer", "custodian", "authority"}
 
 # ---------------------------------------------------------------------------
 # Role config
@@ -109,7 +109,7 @@ def load_role_config(path: str = _CONFIG_PATH) -> dict[str, RoleEntry]:
                 f"Invalid role '{role}' for {email}; valid roles: {sorted(_VALID_ROLES)}"
             )
 
-        status = (entry.get("status") or "active").strip()
+        status = (entry.get("status") or "disabled").strip()
         dn_raw = (entry.get("display_name") or "").strip()
         display_name = dn_raw or email.split("@")[0].replace(".", " ").title()
 
@@ -174,6 +174,42 @@ def init_role_config() -> None:
         f"[cf_identity] loaded {len(_role_map)} users from {path}",
         flush=True,
     )
+
+
+def seed_managed_users(db: DBSession) -> None:
+    """Seed managed_users from the loaded role config for any email not yet present.
+
+    Called once at startup after init_role_config(). Additive only — never overwrites
+    existing rows (Authority's changes take precedence over config file).
+    """
+    from models import ManagedUser
+
+    if not _role_map:
+        print("[cf_identity] seed_managed_users: no role config loaded, skipping", flush=True)
+        return
+
+    now = datetime.now(timezone.utc)
+    count = 0
+    for email, entry in _role_map.items():
+        existing = db.query(ManagedUser).filter(ManagedUser.email == email).first()
+        if existing is None:
+            # Map config status to managed_users status
+            status = "enabled" if entry.status in ("active", "enabled") else "disabled"
+            db.add(ManagedUser(
+                email=email,
+                display_name=entry.display_name,
+                role=entry.role,
+                status=status,
+                provisioned_at=now,
+                enabled_at=now if status == "enabled" else None,
+            ))
+            count += 1
+
+    if count > 0:
+        db.commit()
+        print(f"[cf_identity] seeded {count} new users into managed_users", flush=True)
+    else:
+        print("[cf_identity] seed_managed_users: all config users already in DB", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -325,14 +361,16 @@ class AppUser:
 def provision_cf_user(email: str, db: DBSession) -> "CFUser":
     """Provision or sync a cf_users record for this email.
 
-    - Raises 403 NOT_PROVISIONED if email not in role config.
-    - Raises 403 ACCOUNT_DISABLED if config entry is disabled.
-    - Creates record on first visit, syncs role/display_name on subsequent visits.
+    - Raises 403 NOT_PROVISIONED if email not in managed_users.
+    - Raises 403 ACCOUNT_DISABLED if managed_users status != 'enabled'.
+    - Updates last_login in managed_users.
+    - Creates/syncs cf_users record for backward compat.
     """
-    from models import CFUser  # local import to avoid circular at module level
+    from models import CFUser, ManagedUser  # local import to avoid circular at module level
 
-    entry = _role_map.get(email)
-    if not entry:
+    # Canonical check: managed_users (DB state, Authority-controlled)
+    mu = db.query(ManagedUser).filter(ManagedUser.email == email).first()
+    if not mu:
         raise HTTPException(
             status_code=403,
             detail={
@@ -343,7 +381,7 @@ def provision_cf_user(email: str, db: DBSession) -> "CFUser":
                 "reasonCode": "NOT_PROVISIONED",
             },
         )
-    if entry.status != "active":
+    if mu.status != "enabled":
         raise HTTPException(
             status_code=403,
             detail={
@@ -353,37 +391,32 @@ def provision_cf_user(email: str, db: DBSession) -> "CFUser":
         )
 
     now = datetime.now(timezone.utc)
-    user = db.query(CFUser).filter(CFUser.email == email).first()
 
+    # Update last_login in managed_users
+    mu.last_login = now
+
+    # JIT-provision or sync cf_users record (backward compat for existing code)
+    user = db.query(CFUser).filter(CFUser.email == email).first()
     if user is None:
         user = CFUser(
             id=str(uuid.uuid4()),
             email=email,
-            display_name=entry.display_name,
-            assigned_role=entry.role,
-            status=entry.status,
+            display_name=mu.display_name,
+            assigned_role=mu.role,
+            status=mu.status,
             source="cloudflare_access",
             created_at=now,
             updated_at=now,
             last_seen_at=now,
         )
         db.add(user)
-        db.flush()
-        print(f"[cf_identity] provisioned new user: {email} role={entry.role}", flush=True)
+        print(f"[cf_identity] provisioned new user: {email} role={mu.role}", flush=True)
     else:
-        changed = False
-        if user.assigned_role != entry.role:
-            user.assigned_role = entry.role
-            changed = True
-        if user.display_name != entry.display_name:
-            user.display_name = entry.display_name
-            changed = True
-        if user.status != entry.status:
-            user.status = entry.status
-            changed = True
+        user.assigned_role = mu.role  # Authority may have changed this
+        user.display_name = mu.display_name
+        user.status = mu.status
         user.last_seen_at = now
-        if changed:
-            user.updated_at = now
+        user.updated_at = now
 
     db.commit()
     db.refresh(user)
