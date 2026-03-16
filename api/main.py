@@ -728,8 +728,10 @@ def _corpus_fts_retrieve(
                 WHEN 'member'    THEN 0
                 WHEN 'custodian' THEN 0
                 WHEN 'officer'   THEN 1
-                WHEN 'admin'     THEN 2
+                WHEN 'authority' THEN 2
                 ELSE 0 END <= :req_level
+          AND (cd.status_override IS DISTINCT FROM 'restricted'
+               OR :req_level >= 1)
         ORDER BY rank DESC
         LIMIT 50
     """
@@ -1141,6 +1143,13 @@ def _corpus_fts_retrieve(
 
     # ── Prompt 2: Metadata-driven policy (status_override / review_date) ─────
     _today_str = datetime.now(timezone.utc).date().isoformat()
+
+    # Belt-and-suspenders: restricted docs are filtered at SQL time (WHERE clause),
+    # but if one reaches here (e.g. via TOC fallback fetching adjacent chunks
+    # that lack the status gate), enforce fail-closed with no content leak.
+    if _status_ov == "restricted" and _requester_level < 1:
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
+
     if mode == "operational":
         if _status_ov in ("superseded", "draft"):
             refusal = {
@@ -1164,6 +1173,8 @@ def _corpus_fts_retrieve(
     else:  # training mode
         if _status_ov in ("superseded", "draft"):
             _notice = f"TRAINING_ONLY: document status is {_status_ov}"
+        elif _status_ov == "restricted":
+            _notice = "RESTRICTED_CONTENT: This document is restricted. Access granted for your role."
 
     # ── Confidence metadata ───────────────────────────────────────────────────
     _rerank_val = _rerank_score(top_chunk, top_text, _fts_rank)
@@ -1467,8 +1478,13 @@ def _corpus_fts_retrieve(
         _pq_notice = "LOW_CONFIDENCE"
 
     # Merge notices: quality notice takes precedence; if both, combine.
+    # RESTRICTED_CONTENT is always surfaced — append rather than suppress so
+    # that officer/authority callers always know a restricted document was returned.
     if _pq_notice and _notice:
-        _final_notice: str | None = _pq_notice  # quality notice wins in text; both communicated
+        if _notice.startswith("RESTRICTED_CONTENT"):
+            _final_notice: str | None = _pq_notice + "|" + _notice
+        else:
+            _final_notice = _pq_notice  # quality notice wins; status in type
     elif _pq_notice:
         _final_notice = _pq_notice
     else:
@@ -1646,6 +1662,10 @@ def _retrieve(
 
     # ACL check: if best doc requires higher role level, fail closed — no title/citations leaked
     if best_doc.min_role_level > role_level:
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
+
+    # Restricted-status check for lexical fixture path (belt-and-suspenders).
+    if getattr(best_doc, "status", "") == "restricted" and role_level < 1:
         return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
     _clean_ex = clean_lines(best_doc.excerpt or "")
@@ -2101,7 +2121,7 @@ def submit_query(
                         "standard operating procedure section 7.4. Details are restricted to supervisory "
                         "and administrative personnel only."
                     ),
-                    "note": "Restricted to officer and admin roles only.",
+                    "note": "Restricted to officer and authority roles only.",
                     "document": {
                         "documentId": "demo-fd-restricted-001",
                         "title": "Demo FD Post-Incident Disciplinary Memo (2025-11-03)",
