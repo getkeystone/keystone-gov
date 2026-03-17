@@ -579,6 +579,19 @@ _MULTI_ANSWER_MAX: int = 3
 _MULTI_ANSWER_STRONG_THRESHOLD: float = 0.85
 _MULTI_ANSWER_RELATED_THRESHOLD: float = 0.72
 
+# KDAT-064d: Hybrid retrieval weights.
+# FTS is weighted higher because exact-term matching is authoritative for
+# procedure names, equipment codes, and LRFD-specific terminology.
+# Vector search adds semantic recall for paraphrased queries and near-miss
+# vocabulary where the author used different words than the questioner.
+_HYBRID_W_FTS     = 0.60   # FTS normalized score weight
+_HYBRID_W_VEC     = 0.40   # vector cosine similarity weight
+# Minimum raw cosine similarity for a vector row to participate in the merge.
+# Rows below this floor are dropped before normalization so that a batch of
+# uniformly low-similarity results cannot inflate after min-max scaling and
+# push irrelevant content into the merged ranking.
+_HYBRID_VEC_FLOOR = 0.20
+
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
     "type": "refusal",
     "reasonCode": "NO_RELEVANT_PROCEDURE",
@@ -733,6 +746,74 @@ def _build_multi_answers(
     return [primary_entry] + secondary
 
 
+def _hybrid_merge(
+    fts_rows: list,
+    vec_rows: list,
+    w_fts: float,
+    w_vec: float,
+    vec_floor: float,
+) -> "tuple[list, str]":
+    """
+    Merge FTS and vector result sets into a single ranked list.
+
+    Both inputs are 7-tuples: (rel_path, title, chunk_index, text,
+                                score, page, domain).
+    Returns (merged_rows, retrieval_source).
+      retrieval_source: "fts_only" | "vector_only" | "hybrid"
+      merged_rows: same 7-tuple shape; score = weighted normalized combined score.
+    """
+    # Drop vector rows below minimum cosine similarity floor before normalization
+    # so that low-signal entries don't inflate after min-max scaling.
+    vec_rows = [r for r in vec_rows if r[4] >= vec_floor]
+
+    has_fts = bool(fts_rows)
+    has_vec = bool(vec_rows)
+
+    if not has_vec:
+        return list(fts_rows), "fts_only"
+    if not has_fts:
+        return list(vec_rows), "vector_only"
+
+    # Min-max normalize scores within each set independently.
+    fts_mn = min(r[4] for r in fts_rows)
+    fts_mx = max(r[4] for r in fts_rows)
+    vec_mn = min(r[4] for r in vec_rows)
+    vec_mx = max(r[4] for r in vec_rows)
+
+    def _norm_fts(s: float) -> float:
+        return (s - fts_mn) / (fts_mx - fts_mn) if fts_mx > fts_mn else 1.0
+
+    def _norm_vec(s: float) -> float:
+        return (s - vec_mn) / (vec_mx - vec_mn) if vec_mx > vec_mn else 1.0
+
+    # Merge by (rel_path, chunk_index) key.
+    # A chunk present in both sets accumulates both weighted contributions.
+    # A chunk present in only one set carries only that contribution.
+    merged: dict = {}
+
+    for row in fts_rows:
+        key = (row[0], row[2])
+        merged[key] = {"row": row, "score": w_fts * _norm_fts(row[4])}
+
+    for row in vec_rows:
+        key = (row[0], row[2])
+        if key in merged:
+            merged[key]["score"] += w_vec * _norm_vec(row[4])
+        else:
+            merged[key] = {"row": row, "score": w_vec * _norm_vec(row[4])}
+
+    result = sorted(
+        [
+            (e["row"][0], e["row"][1], e["row"][2],
+             e["row"][3], e["score"],  e["row"][5], e["row"][6])
+            for e in merged.values()
+        ],
+        key=lambda r: r[4],
+        reverse=True,
+    )
+    return result, "hybrid"
+
+
 def _corpus_fts_retrieve(
     question: str, mode: str, db: DBSession,
     domain_filter: "list[str] | None" = None,
@@ -858,6 +939,62 @@ def _corpus_fts_retrieve(
                 _used_or_fts = bool(rows)
             except Exception:
                 db.rollback()
+
+    # ── KDAT-064d: Hybrid vector retrieval ────────────────────────────────────
+    # Runs after FTS + OR-expansion so that:
+    #   - vec results supplement FTS hits (hybrid case)
+    #   - vec results can recover when FTS returns 0 (vector_only case)
+    # Graceful degradation: ollama_client.embed() returns None on any failure;
+    # vec_rows stays empty and merge returns (fts_rows, "fts_only") unchanged.
+    #
+    # Vector SQL replicates ALL FTS WHERE clause filters verbatim:
+    #   ACL, restricted, draft, superseded, domain.
+    _retrieval_source = "fts_only"
+    _query_vec = ollama_client.embed(question)
+    _vec_rows: list = []
+    if _query_vec is not None:
+        _VEC_SQL = f"""
+            SELECT
+                cd.rel_path,
+                cd.title,
+                cc.chunk_index,
+                cc.text,
+                1.0 - (cc.embedding <=> CAST(:embedding AS vector)) AS cosine_sim,
+                cc.page,
+                cd.domain
+            FROM corpus_chunks cc
+            JOIN corpus_documents cd ON cd.id = cc.doc_id
+            WHERE cc.embedding IS NOT NULL
+              {_domain_clause}
+              AND CASE cd.min_role
+                    WHEN 'member'    THEN 0
+                    WHEN 'custodian' THEN 0
+                    WHEN 'officer'   THEN 1
+                    WHEN 'authority' THEN 2
+                    ELSE 0 END <= :req_level
+              AND (cd.status_override IS DISTINCT FROM 'restricted'
+                   OR :req_level >= 1)
+              AND (cd.status_override IS DISTINCT FROM 'draft')
+              AND (cd.status_override IS DISTINCT FROM 'superseded'
+                   OR :mode != 'operational')
+            ORDER BY cc.embedding <=> CAST(:embedding AS vector)
+            LIMIT 50
+        """
+        _pg_vec = "[" + ",".join(str(v) for v in _query_vec) + "]"
+        try:
+            _vec_rows = db.execute(
+                text(_VEC_SQL),
+                {"embedding": _pg_vec, "req_level": _requester_level,
+                 "mode": mode, **_domain_params},
+            ).fetchall()
+        except Exception:
+            db.rollback()
+            _vec_rows = []
+
+    rows, _retrieval_source = _hybrid_merge(
+        rows, _vec_rows, _HYBRID_W_FTS, _HYBRID_W_VEC, _HYBRID_VEC_FLOOR
+    )
+    # ── End hybrid block ──────────────────────────────────────────────────────
 
     if not rows:
         guidance = {
@@ -1506,11 +1643,12 @@ def _corpus_fts_retrieve(
             "steps": _pq_steps if _pq["decision"] == "ok" else [],
             "warnings": _pq_warnings,
             "confidence": {
-                "rerank_reason": "; ".join(_reason_parts),
-                "toc_filtered":   _toc_filtered,
-                "used_fallback":  _used_fallback,
-                "or_expansion":   _used_or_fts,
-                "fts_rank_min":   _FTS_RANK_MIN,
+                "rerank_reason":    "; ".join(_reason_parts),
+                "toc_filtered":     _toc_filtered,
+                "used_fallback":    _used_fallback,
+                "or_expansion":     _used_or_fts,
+                "fts_rank_min":     _FTS_RANK_MIN,
+                "retrieval_source": _retrieval_source,
             },
             "procedure_quality": _pq,
         }
@@ -1588,11 +1726,12 @@ def _corpus_fts_retrieve(
                 "content_kind": _top_content_kind,
             },
             "confidence": {
-                "rerank_reason": "; ".join(_reason_parts),
-                "toc_filtered":   _toc_filtered,
-                "used_fallback":  _used_fallback,
-                "or_expansion":   _used_or_fts,
-                "fts_rank_min":   _FTS_RANK_MIN,
+                "rerank_reason":    "; ".join(_reason_parts),
+                "toc_filtered":     _toc_filtered,
+                "used_fallback":    _used_fallback,
+                "or_expansion":     _used_or_fts,
+                "fts_rank_min":     _FTS_RANK_MIN,
+                "retrieval_source": _retrieval_source,
             },
             "procedure_quality": _pq,
         }
@@ -1691,11 +1830,12 @@ def _corpus_fts_retrieve(
         "prereqs":         [] if _force_reference else _pq_prereqs,
         "troubleshooting": [] if _force_reference else _pq_troubles,
         "confidence": {
-            "rerank_reason": "; ".join(_reason_parts),
-            "toc_filtered":   _toc_filtered,
-            "used_fallback":  _used_fallback,
-            "or_expansion":   _used_or_fts,
-            "fts_rank_min":   _FTS_RANK_MIN,
+            "rerank_reason":    "; ".join(_reason_parts),
+            "toc_filtered":     _toc_filtered,
+            "used_fallback":    _used_fallback,
+            "or_expansion":     _used_or_fts,
+            "fts_rank_min":     _FTS_RANK_MIN,
+            "retrieval_source": _retrieval_source,
         },
         "procedure_quality": _pq,
     }
