@@ -91,7 +91,7 @@ _ROLE_PERMISSIONS: dict[str, frozenset] = {
     }),
     "authority": frozenset({
         "query", "view_own_history", "view_own_audit", "view_documents",
-        "access_officer_restricted", "promote_document", "reject_document",
+        "access_officer_restricted", "upload_to_staging", "promote_document", "reject_document",
         "decision_review", "audit_export_governance", "view_all_audit",
         "view_all_user_activity", "approve_role_assignments",
         "case_management", "view_staging_queue", "edit_corpus_metadata",
