@@ -443,8 +443,12 @@ _OR_EXPANSION_STOP = _STOP_WORDS | {
     #   "after" → generic preposition with no domain signal
     #   "equipment" / "allocation" / "budget" → admin/inventory terms that
     #     appear in apparatus manuals and must not approve via single-token OR
+    #   "annual" / "department" → financial/org terms that appear in admin
+    #     documents (infobooks) but carry no procedural signal on their own;
+    #     "annual budget", "department budget" should always refuse fail-closed
     'roof', 'structural', 'fire', 'after',
     'equipment', 'allocation', 'budget',
+    'annual', 'department',
     # Generic EMR domain terms that appear in nearly every medical chunk.
     # OR-expansion on "patient" returns patient-movement, patient-assessment,
     # and patient-scoring content regardless of the actual medical topic.
