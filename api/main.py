@@ -57,6 +57,7 @@ from procedure_parse import parse_procedure, procedure_quality
 from requirements_parse import make_requirements_summary, parse_requirements
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
+import ollama_client
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -2081,6 +2082,7 @@ def health():
         "build_ts": _BUILD_TS,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
+        **ollama_client.healthy(),
     }
 
 
