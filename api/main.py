@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -591,6 +592,66 @@ _HYBRID_W_VEC     = 0.40   # vector cosine similarity weight
 # uniformly low-similarity results cannot inflate after min-max scaling and
 # push irrelevant content into the merged ranking.
 _HYBRID_VEC_FLOOR = 0.20
+
+# KDAT-064e: LLM answer generation from evidence pack.
+# The prompt enforces evidence-only answering with explicit citation rules.
+# The LLM is called AFTER all policy gates pass and sees only ACL-filtered,
+# status-filtered, reranked chunks.  It never runs on refused queries.
+_LLM_SYSTEM_PROMPT = (
+    "You are an operational procedure assistant for a fire department. "
+    "Answer the question using ONLY the evidence provided below. "
+    "Do not use any other knowledge.\n\n"
+    "Rules:\n"
+    "- Cite the source document name and page for each claim\n"
+    "- If the evidence does not contain enough information, say "
+    "\"The available evidence does not fully address this question\"\n"
+    "- Keep the answer concise and actionable\n"
+    "- Use clear, direct language appropriate for emergency responders\n"
+    "- Do not speculate or add information beyond the evidence\n"
+    "- If the evidence contains numbered steps, preserve the step "
+    "numbers in your answer"
+)
+
+
+def _build_evidence_pack(top5_rows: list) -> str:
+    """Build a labeled text string from top-5 reranked chunk rows.
+
+    Each chunk is prefixed with its source title and page/chunk locator.
+    Input rows: 7-tuples (rel_path, title, chunk_index, text, score, page, domain).
+    """
+    parts = []
+    for rel_path, title, chunk_idx, chunk_text, score, page, domain in top5_rows:
+        loc = f"page {page}" if page is not None else f"chunk {chunk_idx}"
+        parts.append(f"[Source: {title}, {loc}]\n{chunk_text.strip()}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
+    """Attempt LLM synthesis from evidence pack.  Mutates guidance in-place.
+
+    Adds:
+      guidance["answer"]        — LLM text or deterministic summary fallback
+      guidance["answer_source"] — "llm" | "deterministic"
+      guidance["confidence"]["gen_model"]       — model name used
+      guidance["confidence"]["gen_latency_ms"]  — wall-clock ms for generate()
+      guidance["confidence"]["evidence_titles"] — titles of chunks fed to LLM
+    """
+    evidence = _build_evidence_pack(top5)
+    user_prompt = f"Question: {question}\n\nEvidence:\n{evidence}"
+    t0 = time.monotonic()
+    answer = ollama_client.generate(_LLM_SYSTEM_PROMPT, user_prompt)
+    gen_ms = int((time.monotonic() - t0) * 1000)
+    if answer:
+        guidance["answer"] = answer
+        guidance["answer_source"] = "llm"
+    else:
+        guidance["answer"] = guidance.get("summary", "")
+        guidance["answer_source"] = "deterministic"
+    conf = guidance.setdefault("confidence", {})
+    conf["gen_model"]       = ollama_client.GEN_MODEL
+    conf["gen_latency_ms"]  = gen_ms
+    conf["evidence_titles"] = [row[1] for row in top5]
+
 
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
     "type": "refusal",
@@ -1660,6 +1721,7 @@ def _corpus_fts_retrieve(
         )
         if _medref_answers:
             medref_guidance["answers"] = _medref_answers
+        _add_llm_answer(medref_guidance, question, top5)
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1743,6 +1805,7 @@ def _corpus_fts_retrieve(
         )
         if _ref_answers:
             ref_guidance["answers"] = _ref_answers
+        _add_llm_answer(ref_guidance, question, top5)
         return ref_guidance, "allowed", ref_sources, ref_citations
 
     # ── Policy gate D: training + weak → reference type (not approved) ───────
@@ -1885,6 +1948,7 @@ def _corpus_fts_retrieve(
     )
     if _multi_answers:
         guidance["answers"] = _multi_answers
+    _add_llm_answer(guidance, question, top5)
     return guidance, "allowed", sources, citations
 
 
