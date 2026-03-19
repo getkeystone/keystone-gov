@@ -2277,6 +2277,7 @@ def get_current_session(
 
 @app.get("/health")
 def health():
+    from deployment_config import CONFIG
     return {
         "status": "ok" if _db_ready else "degraded",
         "service": "keystone-gov-api",
@@ -2286,7 +2287,20 @@ def health():
         "build_ts": _BUILD_TS,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
+        "deployment_id": CONFIG.get("deployment", {}).get("id", "unknown"),
         **ollama_client.healthy(),
+    }
+
+
+@app.get("/config")
+def get_deployment_config():
+    """Return deployment configuration for the console."""
+    from deployment_config import CONFIG
+    return {
+        "deployment": CONFIG.get("deployment", {}),
+        "roles": CONFIG.get("roles", []),
+        "modes": CONFIG.get("modes", []),
+        "suggested_queries": CONFIG.get("suggested_queries", []),
     }
 
 
