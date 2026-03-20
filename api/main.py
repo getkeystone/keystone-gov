@@ -599,18 +599,19 @@ _HYBRID_VEC_FLOOR = 0.20
 # The LLM is called AFTER all policy gates pass and sees only ACL-filtered,
 # status-filtered, reranked chunks.  It never runs on refused queries.
 _LLM_SYSTEM_PROMPT = (
-    "You are an operational procedure assistant for a fire department. "
+    "You are a safety procedure assistant. "
     "Answer the question using ONLY the evidence provided below. "
-    "Do not use any other knowledge.\n\n"
+    "Do not use any prior knowledge.\n\n"
     "Rules:\n"
-    "- Cite the source document name and page for each claim\n"
+    "- Every claim must cite the source document title and page\n"
     "- If the evidence does not contain enough information, say "
-    "\"The available evidence does not fully address this question\"\n"
-    "- Keep the answer concise and actionable\n"
-    "- Use clear, direct language appropriate for emergency responders\n"
+    "\"The available evidence does not fully address this question\" "
+    "and explain what is missing\n"
+    "- Provide the answer first, then list key points\n"
     "- Do not speculate or add information beyond the evidence\n"
     "- If the evidence contains numbered steps, preserve the step "
-    "numbers in your answer"
+    "numbers and order\n"
+    "- Use clear, direct language appropriate for workplace safety"
 )
 
 
@@ -1053,8 +1054,12 @@ def _corpus_fts_retrieve(
             db.rollback()
             _vec_rows = []
 
+    # When OR-expansion fires, FTS results are noisy (AND matched nothing);
+    # vector search is the more reliable signal in that case.
+    _w_fts = 0.30 if _used_or_fts else _HYBRID_W_FTS
+    _w_vec = 0.70 if _used_or_fts else _HYBRID_W_VEC
     rows, _retrieval_source = _hybrid_merge(
-        rows, _vec_rows, _HYBRID_W_FTS, _HYBRID_W_VEC, _HYBRID_VEC_FLOOR
+        rows, _vec_rows, _w_fts, _w_vec, _HYBRID_VEC_FLOOR
     )
     # ── End hybrid block ──────────────────────────────────────────────────────
 
