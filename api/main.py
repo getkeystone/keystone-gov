@@ -56,6 +56,7 @@ from ingest_lib import (
 )
 from procedure_parse import parse_procedure, procedure_quality
 from requirements_parse import make_requirements_summary, parse_requirements
+from reranker import rerank_chunks
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 import ollama_client
@@ -1120,157 +1121,24 @@ def _corpus_fts_retrieve(
         db.rollback()
         _content_kind_map = {}
 
-    # Rerank: penalize TOC/front-matter chunks, boost procedural content.
-    # Procedure-kind docs receive a mild ×1.15 boost on the default path
-    # (before any intent-specific secondary sort overrides this ranking).
-    reranked = sorted(
-        rows,
-        key=lambda r: _rerank_score(r[2], r[3], r[4]) * (
-            1.15 if _content_kind_map.get(r[0], "procedure") == "procedure" else 1.0
-        ),
-        reverse=True,
-    )
-
-    # Intent-based secondary rerank: if the question is about treating an
-    # electric-shock victim (electrical_injury intent), penalize AED shock-
-    # delivery chunks and boost electrical-injury treatment chunks so that
-    # CPR/first-aid content ranks above AED-operation content.
-    if _ELECTRICAL_INJURY_INTENT.search(question):
-        def _intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            base = _rerank_score(ci, txt, rank)
-            if _AED_DELIVERY_MARKERS.search(txt):
-                base *= 0.25  # penalize AED shock-delivery content
-            if _ELECTRICAL_INJURY_MARKERS.search(txt):
-                base *= 1.60  # boost electrical-injury treatment content
-            return base
-        reranked = sorted(rows, key=_intent_score, reverse=True)
-
-    # CPR intent: boost chunks with CPR procedure keywords; penalize MAYDAY/fire-ops chunks
-    # that match on "shock" or "rescue" but are not about CPR.
-    if _CPR_INTENT.search(question):
-        def _cpr_intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            base = _rerank_score(ci, txt, rank)
-            if _CPR_PROCEDURE_MARKERS.search(txt):
-                base *= 2.0   # strong boost for CPR procedure content
-            if _MAYDAY_CONTENT_MARKERS.search(txt) and not _CPR_PROCEDURE_MARKERS.search(txt):
-                base *= 0.15  # penalize MAYDAY content without CPR keywords
-            return base
-        reranked = sorted(reranked, key=_cpr_intent_score, reverse=True)
-
-        # Must-have gate: if the top candidate has no CPR keywords, scan the
-        # candidate pool for any chunk that does and promote it.
-        if not _CPR_PROCEDURE_MARKERS.search(reranked[0][3]):
-            cpr_hits = [r for r in reranked if _CPR_PROCEDURE_MARKERS.search(r[3])]
-            if cpr_hits:
-                reranked = cpr_hits + [r for r in reranked if r not in cpr_hits]
-
-    # Requirements intent: detect and promote spec-data chunks; penalize
-    # pointer-only and caution-list chunks.
-    #
-    # Signals applied (cumulative):
-    #   HEADING + SPEC DATA   → ×2.0  (authoritative spec section w/ numeric data)
-    #   HEADING only          → ×1.35 (may be a safety-intro heading — mild boost)
-    #   SPEC DATA only        → ×1.50 + digit-density penalty bypassed
-    #   POINTER, no SPEC DATA → ×0.20 (chunk redirects; actual data is elsewhere)
-    #   CAUTION ≥2, no SPEC   → ×0.30 (pure warning list matched on "require")
-    #
-    # For SPEC DATA chunks the digit-density penalty in _rerank_score is
-    # intentionally skipped so that numeric spec lists (41 amps, 60 amps,
-    # 12 VDC …) are not demoted by the TOC/front-matter digit guard.
-    if _REQUIREMENTS_INTENT.search(question):
-        def _req_intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            has_spec = bool(_SPEC_DATA_SIGNAL.search(txt))
-            # Count spec-data lines to detect a spec table.
-            n_spec_lines = len([l for l in txt.split("\n") if _SPEC_DATA_SIGNAL.search(l)])
-            spec_table = n_spec_lines >= 3
-            # Score selection:
-            #   spec table  → skip front-matter AND digit-density penalties
-            #   spec data   → skip digit-density penalty only
-            #   plain chunk → standard scorer
-            if spec_table:
-                base = _rerank_score_spec_table(ci, txt, rank)
-            elif has_spec:
-                base = _rerank_score_no_digit_penalty(ci, txt, rank)
-            else:
-                base = _rerank_score(ci, txt, rank)
-            has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
-            if has_heading and has_spec:
-                base *= 1.70  # heading + spec: good signal but not stronger than
-                              # a spec-dense chunk where the REQUIREMENTS text IS
-                              # the content (not an intro section that contains a
-                              # spec table mid-chunk alongside other topics)
-            elif has_heading:
-                base *= 1.35  # heading alone (could be a safety-section title)
-            elif has_spec:
-                base *= 1.50  # numeric spec data without a heading still valuable
-            caution_count = len(_SAFETY_CAUTION_DENSE.findall(txt))
-            if caution_count >= 2 and not has_spec:
-                base *= 0.30  # penalize pure caution/warning lists
-            if _POINTER_SIGNAL.search(txt) and not has_spec:
-                base *= 0.20  # strongly penalize redirect-only chunks
-            # Strong boost for chunks where spec data is stated inline as
-            # "requires 41 amps" / "requires 60 amps" — the primary-purpose
-            # spec section format.  Chunks that embed a spec table inside a
-            # CAUTION block use tabular notation ("2001 12 VDC 41") and
-            # produce zero matches here, so they do NOT receive this boost.
-            n_explicit = len(_EXPLICIT_REQUIRES_SPEC.findall(txt))
-            if n_explicit > 0:
-                base *= 1.0 + min(n_explicit * 2.0, 8.0)
-            # content_kind boost: docs tagged 'requirements' in corpus metadata
-            # receive a ×1.35 multiplier to prefer authoritative spec sections
-            # when the operator has explicitly labelled the document.
-            if _content_kind_map.get(_ri, "procedure") == "requirements":
-                base *= 1.35
-            return base
-
-        reranked = sorted(reranked, key=_req_intent_score, reverse=True)
-
-        # Spec-data document fallback: if the top candidate has pointer
-        # language ("Refer to Section X") — regardless of whether it also has
-        # some embedded spec data — query the same matched documents for a
-        # chunk where spec data is the primary content.  Also triggers for
-        # spec-less, caution-dense top candidates.
-        # A pointer chunk always redirects; the real spec section is elsewhere.
-        _top_has_spec = bool(_SPEC_DATA_SIGNAL.search(reranked[0][3]))
-        _top_is_pointer = bool(_POINTER_SIGNAL.search(reranked[0][3]))
-        _top_cautions = len(_SAFETY_CAUTION_DENSE.findall(reranked[0][3]))
-        if _top_is_pointer or (not _top_has_spec and _top_cautions >= 2):
-            _req_docs = list({r[0] for r in reranked[:8]})
-            try:
-                _spec_rows = db.execute(
-                    text("""
-                        SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text,
-                               CAST(0.001 AS FLOAT) AS rank, cc.page, cd.domain
-                        FROM corpus_chunks cc
-                        JOIN corpus_documents cd ON cd.id = cc.doc_id
-                        WHERE cd.rel_path = ANY(:docs)
-                          AND (   cc.text ~* '[0-9]+[[:space:]]*(amps?|vdc|vac|psi|gpm|kPa)'
-                               OR cc.text ~* 'minimum[[:space:]]+(?:service|flow|pressure)'
-                               OR cc.text ~* 'requires?[[:space:]]+[0-9]+[[:space:]]*(amps?|vdc|psi|gpm)')
-                        ORDER BY cd.rel_path, cc.chunk_index ASC
-                        LIMIT 80
-                    """),
-                    {"docs": _req_docs},
-                ).fetchall()
-            except Exception:
-                db.rollback()
-                _spec_rows = []
-            if _spec_rows:
-                _spec_reranked = sorted(
-                    _spec_rows,
-                    key=lambda r: _req_intent_score(r),
-                    reverse=True,
-                )
-                _existing_keys = {(r[0], r[2]) for r in reranked}
-                _new_spec = [
-                    r for r in _spec_reranked
-                    if (r[0], r[2]) not in _existing_keys
-                ]
-                if _new_spec:
-                    reranked = _new_spec + list(reranked)
+    # ── Rerank: generic quality filter before LLM evidence pack ──────────────
+    # LRFD-specific reranker removed in dev/keystone-next.
+    # See feature/pilot-enhancements for original fire-service intent detection
+    # (electrical_injury, CPR, MAYDAY, requirements), domain routing, and
+    # synonym boosting.
+    _chunk_dicts = [
+        {
+            'rel_path': r[0], 'title': r[1], 'chunk_index': r[2],
+            'text': r[3], 'score': r[4], 'page': r[5], 'domain': r[6],
+        }
+        for r in rows
+    ]
+    _reranked_dicts = rerank_chunks(_chunk_dicts, question, top_k=len(rows))
+    reranked = [
+        (d['rel_path'], d['title'], d['chunk_index'], d['text'],
+         d['score'], d['page'], d['domain'])
+        for d in _reranked_dicts
+    ]
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _top_content_kind: str = _content_kind_map.get(top_rel, "procedure")
@@ -1506,6 +1374,8 @@ def _corpus_fts_retrieve(
     if _used_fallback:
         _reason_parts.append(f"document fallback (initial top was TOC-like)")
     _reason_parts.append(f"FTS rank {_fts_rank:.4f}; rerank {_rerank_val:.4f}")
+    if _reranked_dicts:
+        _reason_parts.append(_reranked_dicts[0].get('rerank_reason', ''))
 
     # ── Prompt 3: Apply procedure quality decision ────────────────────────────
     _pq_notice: str | None = None
