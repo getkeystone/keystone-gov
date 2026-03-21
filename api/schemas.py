@@ -1,10 +1,11 @@
 from typing import Any, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    # Upper bounds prevent oversized payloads reaching auth logic.
+    username: str = Field(..., max_length=128)
+    password: str = Field(..., max_length=256)
 
 
 class LoginResponse(BaseModel):
@@ -14,7 +15,8 @@ class LoginResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    question: str
+    # 2000-char limit prevents FTS/LLM abuse and controls DB storage size.
+    question: str = Field(..., max_length=2000)
     mode: Literal["operational", "training", "medical_reference"]
     # role is accepted for backward-compat but ignored — server derives from token
     role: Optional[str] = None

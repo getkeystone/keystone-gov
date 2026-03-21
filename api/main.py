@@ -1,15 +1,24 @@
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+
+# ── Structured logging ──────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("keystone.api")
 
 from pathlib import Path
 
@@ -2058,18 +2067,134 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[startup] seed_managed_users failed: {exc}", file=sys.stderr, flush=True)
     validate_hmac_key()
+    # ── Startup security warnings ────────────────────────────────────────────
+    _salt_val = os.environ.get("AUTH_PASSWORD_SALT", "")
+    if not _salt_val or _salt_val == "dev-salt-change-me":
+        logger.warning(
+            "SECURITY WARNING: AUTH_PASSWORD_SALT is not set or uses the insecure default "
+            "'dev-salt-change-me'.  All password hashes use a known salt — set this env "
+            "var to a 32+ character random value before exposing this API publicly."
+        )
     yield
 
 
 app = FastAPI(title="Keystone Gov API", version="0.2.0", lifespan=lifespan)
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# allow_credentials=False: API uses Bearer tokens in the Authorization header,
+# not cookies, so credentials mode is not needed.  The wildcard origin is safe
+# when credentials=False (no cross-origin cookie leakage).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+# Adds defensive HTTP headers to every response.  CSP and HSTS are handled
+# by Cloudflare/Caddy upstream; Cache-Control, XCTO, and XFO are set here.
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # API responses must not be cached by intermediaries.
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Global exception handlers — prevent internal detail leakage
+# ---------------------------------------------------------------------------
+# All HTTPExceptions with status >= 500 log the detail server-side but return
+# a generic message to the client.  Unhandled exceptions are also caught.
+
+@app.exception_handler(HTTPException)
+async def sanitised_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        # Log full detail server-side; return only a generic message to the client.
+        logger.error(
+            "HTTP %d at %s %s: %s",
+            exc.status_code, request.method, request.url.path, exc.detail,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": "An internal server error occurred."},
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception at %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred."},
+    )
+
+
+# ---------------------------------------------------------------------------
+# In-memory rate limiters
+# ---------------------------------------------------------------------------
+# Simple sliding-window counters.  Process-local only; acceptable for a
+# single-process deployment.  Not shared across workers.
+
+# Login rate limiter: 5 attempts per IP per 60 seconds.
+_LOGIN_RATE_LIMIT  = 5
+_LOGIN_RATE_WINDOW = 60  # seconds
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _check_login_rate_limit(ip: str) -> None:
+    """Raise 429 if the IP has exceeded the login attempt threshold."""
+    now = time.time()
+    with _login_lock:
+        window = _login_attempts.get(ip, [])
+        window = [t for t in window if now - t < _LOGIN_RATE_WINDOW]
+        if len(window) >= _LOGIN_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts. Please wait before trying again.",
+            )
+        window.append(now)
+        _login_attempts[ip] = window
+
+
+# Query rate limiter: 20 queries per session token per 60 seconds.
+_QUERY_RATE_LIMIT  = 20
+_QUERY_RATE_WINDOW = 60  # seconds
+_query_attempts: dict[str, list[float]] = {}
+_query_lock = threading.Lock()
+
+
+def _check_query_rate_limit(token: str) -> None:
+    """Raise 429 if the session token has exceeded the query threshold."""
+    now = time.time()
+    with _query_lock:
+        window = _query_attempts.get(token, [])
+        window = [t for t in window if now - t < _QUERY_RATE_WINDOW]
+        if len(window) >= _QUERY_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Query rate limit exceeded. Please wait before submitting again.",
+            )
+        window.append(now)
+        _query_attempts[token] = window
 
 
 # ---------------------------------------------------------------------------
@@ -2087,9 +2212,6 @@ app.add_middleware(
 #   - POST /decisions/*      (if PUBLIC_ALLOW_DECISIONS=1, default)
 #
 # Everything else (PATCH, DELETE, other POSTs) → 403 PUBLIC_DEMO_READ_ONLY.
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 
 @app.middleware("http")
@@ -2132,6 +2254,10 @@ async def public_demo_guard(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 
+# Sessions expire after this many hours of age (measured from created_at).
+SESSION_TTL_HOURS = 8
+
+
 def get_current_session(
     authorization: str | None = Header(default=None),
     db: DBSession = Depends(get_db),
@@ -2142,6 +2268,16 @@ def get_current_session(
     session = db.query(Session).filter(Session.token == token).first()
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    # ── Session TTL check ────────────────────────────────────────────────────
+    # Sessions older than SESSION_TTL_HOURS are expired.  The row is deleted
+    # so the next request fails fast (no DB row to find) and old tokens do not
+    # accumulate indefinitely.
+    if session.created_at:
+        age_seconds = (datetime.utcnow() - session.created_at).total_seconds()
+        if age_seconds > SESSION_TTL_HOURS * 3600:
+            db.delete(session)
+            db.commit()
+            raise HTTPException(status_code=401, detail="Session expired — please log in again")
     return session
 
 
@@ -2267,7 +2403,16 @@ def public_reset(request: Request):
 
 
 @app.post("/auth/login", response_model=LoginResponse)
-def login(req: LoginRequest, db: DBSession = Depends(get_db)):
+def login(req: LoginRequest, request: Request, db: DBSession = Depends(get_db)):
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    # Brute-force protection: 5 attempts per IP per 60 seconds.
+    client_ip = (request.headers.get("X-Forwarded-For") or
+                 request.headers.get("X-Real-IP") or
+                 (request.client.host if request.client else "unknown"))
+    # Use only the first IP if X-Forwarded-For contains a chain.
+    client_ip = client_ip.split(",")[0].strip()
+    _check_login_rate_limit(client_ip)
+
     # Login endpoint is only available when CF Access is disabled or demo simulation is enabled.
     if get_cf_enabled() and not get_demo_sim_enabled():
         raise HTTPException(
@@ -2325,6 +2470,10 @@ def submit_query(
     db: DBSession = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    # 20 queries per session token per 60 seconds.  Protects GPU from abuse.
+    _check_query_rate_limit(current_user.user_id or current_user.email)
+
     # Role is ALWAYS derived from the authenticated session — request body value ignored.
     role = current_user.role
     role_level = _ROLE_LEVEL.get(role, 0)
