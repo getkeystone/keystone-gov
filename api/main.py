@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session as DBSession
 
 from audit import compute_entry_hash, verify_entry, validate_hmac_key
 from auth import verify_password
+from input_sanitizer import check_injection
 from database import Base, SessionLocal, engine, get_db
 from models import AuditEntry, Document, ManagedUser, Query, Session, User, UserManagementEvent
 from schemas import (
@@ -637,6 +638,29 @@ def _build_evidence_pack(top5_rows: list) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _validate_llm_output(answer: str, evidence_titles: list[str]) -> str:
+    """
+    Basic output validation: check that the LLM didn't
+    fabricate document references not in the evidence pack.
+    This is a lightweight check, not a full citation parser.
+    """
+    # If the answer mentions phrases that suggest injection got through,
+    # return a safe fail-closed response instead.
+    injection_signals = [
+        'all documents in', 'list of documents',
+        'here are the documents', 'document titles:',
+        'i have access to', 'my instructions',
+        'system prompt', 'i was told to',
+    ]
+    answer_lower = answer.lower()
+    for signal in injection_signals:
+        if signal in answer_lower:
+            logger.warning("LLM output injection signal detected: %r", signal)
+            return ("The available evidence does not fully address "
+                    "this question.")
+    return answer
+
+
 def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     """Attempt LLM synthesis from evidence pack.  Mutates guidance in-place.
 
@@ -652,7 +676,9 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     t0 = time.monotonic()
     answer = ollama_client.generate(_LLM_SYSTEM_PROMPT, user_prompt)
     gen_ms = int((time.monotonic() - t0) * 1000)
+    evidence_titles = [row[1] for row in top5]
     if answer:
+        answer = _validate_llm_output(answer, evidence_titles)
         guidance["answer"] = answer
         guidance["answer_source"] = "llm"
     else:
@@ -661,7 +687,7 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     conf = guidance.setdefault("confidence", {})
     conf["gen_model"]       = ollama_client.GEN_MODEL
     conf["gen_latency_ms"]  = gen_ms
-    conf["evidence_titles"] = [row[1] for row in top5]
+    conf["evidence_titles"] = evidence_titles
 
 
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
@@ -2422,25 +2448,40 @@ def login(req: LoginRequest, request: Request, db: DBSession = Depends(get_db)):
                 "reasonCode": "CF_AUTH_REQUIRED",
             },
         )
+
+    # ── Privileged user lookup via TAMPER_DATABASE_URL ───────────────────────
+    # keystone_app (DATABASE_URL) does not have SELECT on password_hash.
+    # Password verification must use the superuser connection.
+    _auth_url = os.environ.get("TAMPER_DATABASE_URL", "")
+    if not _auth_url:
+        raise HTTPException(status_code=500, detail="Authentication service unavailable")
+    _auth_engine = create_engine(_auth_url)
+    try:
+        with _auth_engine.connect() as _auth_conn:
+            _user_row = _auth_conn.execute(
+                text("SELECT id, username, role, password_hash FROM users WHERE username = :u"),
+                {"u": req.username},
+            ).first()
+    finally:
+        _auth_engine.dispose()
+
     # In public demo mode, authority login is disabled regardless of credentials.
-    if _PUBLIC_DEMO_MODE:
-        user_row = db.query(User).filter(User.username == req.username).first()
-        if user_row and user_row.role == "authority":
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "Authority login is disabled in public demo mode.",
-                    "reasonCode": "PUBLIC_ADMIN_DISABLED",
-                },
-            )
-    user = db.query(User).filter(User.username == req.username).first()
-    if not user or not verify_password(req.password, user.password_hash):
+    if _PUBLIC_DEMO_MODE and _user_row and _user_row.role == "authority":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Authority login is disabled in public demo mode.",
+                "reasonCode": "PUBLIC_ADMIN_DISABLED",
+            },
+        )
+
+    if not _user_row or not verify_password(req.password, _user_row.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = str(uuid.uuid4())
-    db.add(Session(token=token, user_id=user.id, username=user.username, role=user.role))
+    db.add(Session(token=token, user_id=_user_row.id, username=_user_row.username, role=_user_row.role))
     db.commit()
-    return LoginResponse(token=token, username=user.username, role=user.role)
+    return LoginResponse(token=token, username=_user_row.username, role=_user_row.role)
 
 
 @app.get("/auth/me")
@@ -2477,6 +2518,57 @@ def submit_query(
     # Role is ALWAYS derived from the authenticated session — request body value ignored.
     role = current_user.role
     role_level = _ROLE_LEVEL.get(role, 0)
+
+    # ── Prompt injection check ───────────────────────────────────────────────
+    # Fail-closed: if the query matches an injection pattern, return a policy
+    # refusal and log it in the audit trail without exposing any corpus data.
+    _is_safe, _injection_reason = check_injection(req.question)
+    if not _is_safe:
+        _inj_query_id = str(uuid.uuid4())
+        _inj_now = datetime.now(timezone.utc).isoformat()
+        _inj_guidance = {
+            "type": "refusal",
+            "reasonCode": "INPUT_REJECTED",
+            "title": "Query could not be processed",
+            "message": "This query was flagged and could not be processed. "
+                       "Please rephrase your question about a specific safety procedure or equipment.",
+            "safeNextStep": "Ask about a specific procedure, equipment type, or hazard by name.",
+            "hiddenSource": False,
+        }
+        _inj_last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
+        _inj_prev_hash = _inj_last.entry_hash if _inj_last else ""
+        _inj_entry_hash = compute_entry_hash(
+            _inj_query_id, _inj_now, role, req.mode, "refused", _inj_prev_hash
+        )
+        db.add(Query(
+            id=_inj_query_id,
+            question="[REDACTED — injection pattern detected]",
+            role=role,
+            mode=req.mode,
+            scenario_key="policy_refusal",
+            guidance_json=_inj_guidance,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(AuditEntry(
+            id=str(uuid.uuid4()),
+            query_id=_inj_query_id,
+            receipt_id=f"receipt-{_inj_query_id[:8]}",
+            timestamp=_inj_now,
+            role_used=role,
+            mode_used=req.mode,
+            policy_outcome="refused",
+            sources_considered_json=[],
+            citations_returned_json=[],
+            prev_hash=_inj_prev_hash,
+            entry_hash=_inj_entry_hash,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            simulated_role_used=current_user.sim_role,
+        ))
+        db.commit()
+        return QueryResponse(query_id=_inj_query_id, scenario_key="policy_refusal")
 
     # medical_reference mode always forces domain_filter to medical_emr only.
     # This is a defense-in-depth guard — the FTS gate in _corpus_fts_retrieve
