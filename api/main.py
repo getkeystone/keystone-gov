@@ -22,7 +22,7 @@ logger = logging.getLogger("keystone.api")
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query as QueryParam, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query as QueryParam, Request, Response, UploadFile
 from pydantic import BaseModel
 from cryptography.hazmat.primitives import serialization as _crypto_ser
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -658,6 +658,18 @@ def _validate_llm_output(answer: str, evidence_titles: list[str]) -> str:
             logger.warning("LLM output injection signal detected: %r", signal)
             return ("The available evidence does not fully address "
                     "this question.")
+    # Warn if the response mentions document titles not in the evidence pack.
+    # This can indicate hallucination or corpus leakage; does not block the response.
+    if evidence_titles:
+        evidence_titles_lower = {t.lower() for t in evidence_titles}
+        # Look for quoted or bracketed strings that look like document titles
+        import re as _re
+        cited = _re.findall(r'\[Source:\s*([^\],]+)', answer) + _re.findall(r'"([^"]{10,80})"', answer)
+        for title in cited:
+            if title.strip().lower() not in evidence_titles_lower:
+                logger.warning(
+                    "LLM output references title not in evidence pack: %r", title[:120]
+                )
     return answer
 
 
@@ -671,8 +683,17 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
       guidance["confidence"]["gen_latency_ms"]  — wall-clock ms for generate()
       guidance["confidence"]["evidence_titles"] — titles of chunks fed to LLM
     """
+    from input_sanitizer import sanitize_query_for_llm
     evidence = _build_evidence_pack(top5)
-    user_prompt = f"Question: {question}\n\nEvidence:\n{evidence}"
+    safe_question = sanitize_query_for_llm(question)
+    user_prompt = (
+        "[USER QUESTION]\n"
+        f"{safe_question}\n"
+        "[/USER QUESTION]\n\n"
+        "[EVIDENCE FROM APPROVED DOCUMENTS]\n"
+        f"{evidence}\n"
+        "[/EVIDENCE FROM APPROVED DOCUMENTS]"
+    )
     t0 = time.monotonic()
     answer = ollama_client.generate(_LLM_SYSTEM_PROMPT, user_prompt)
     gen_ms = int((time.monotonic() - t0) * 1000)
@@ -2074,7 +2095,8 @@ async def lifespan(app: FastAPI):
         Base.metadata.create_all(bind=engine)
         db = SessionLocal()
         try:
-            seed_demo_data(db)
+            if os.environ.get("SEED_DEMO_USERS", "").lower() == "true":
+                seed_demo_data(db)
         finally:
             db.close()
         _db_ready = True
@@ -2098,8 +2120,14 @@ async def lifespan(app: FastAPI):
     if not _salt_val or _salt_val == "dev-salt-change-me":
         logger.warning(
             "SECURITY WARNING: AUTH_PASSWORD_SALT is not set or uses the insecure default "
-            "'dev-salt-change-me'.  All password hashes use a known salt — set this env "
+            "'dev-salt-change-me'. All password hashes use a known salt - set this env "
             "var to a 32+ character random value before exposing this API publicly."
+        )
+    elif len(_salt_val) < 16:
+        logger.warning(
+            "SECURITY WARNING: AUTH_PASSWORD_SALT is too short (%d chars). "
+            "Use at least 32 random characters for production deployments.",
+            len(_salt_val),
         )
     yield
 
@@ -2313,20 +2341,29 @@ def get_current_session(
 
 
 @app.get("/health")
-def health():
+def health(request: Request):
     from deployment_config import CONFIG
-    return {
+    # Only expose build metadata to localhost or authenticated callers.
+    # Unauthenticated external requests get status/db/version only.
+    client_host = request.client.host if request.client else ""
+    _is_local = client_host in ("127.0.0.1", "::1", "localhost")
+    auth_header = request.headers.get("authorization", "")
+    _has_token = auth_header.startswith("Bearer ")
+    _show_build = _is_local or _has_token
+    result = {
         "status": "ok" if _db_ready else "degraded",
         "service": "keystone-gov-api",
         "db": _db_ready,
         "version": _VERSION,
-        "git_sha": _BUILD_SHA,
-        "build_ts": _BUILD_TS,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
         "deployment_id": CONFIG.get("deployment", {}).get("id", "unknown"),
         **ollama_client.healthy(),
     }
+    if _show_build:
+        result["git_sha"] = _BUILD_SHA
+        result["build_ts"] = _BUILD_TS
+    return result
 
 
 @app.get("/config")
@@ -2338,6 +2375,7 @@ def get_deployment_config():
         "roles": CONFIG.get("roles", []),
         "modes": CONFIG.get("modes", []),
         "suggested_queries": CONFIG.get("suggested_queries", []),
+        "demo_credentials": CONFIG.get("demo_credentials", []),
     }
 
 
@@ -2478,6 +2516,8 @@ def login(req: LoginRequest, request: Request, db: DBSession = Depends(get_db)):
     if not _user_row or not verify_password(req.password, _user_row.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    # Invalidate any existing sessions for this user before issuing a new one.
+    db.execute(text("DELETE FROM sessions WHERE user_id = :uid"), {"uid": _user_row.id})
     token = str(uuid.uuid4())
     db.add(Session(token=token, user_id=_user_row.id, username=_user_row.username, role=_user_row.role))
     db.commit()
