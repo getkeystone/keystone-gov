@@ -1522,12 +1522,12 @@ def _corpus_fts_retrieve(
         return {
             "type": "refusal",
             "reasonCode": "LOW_CONFIDENCE",
-            "title": "Reference material found — not an approved LRFD protocol",
+            "title": "Reference material found — not an approved departmental procedure",
             "message": (
-                "Reference material was found but could not be confirmed as an approved LRFD procedure. "
+                "Reference material was found but could not be confirmed as an approved departmental procedure. "
                 "The matched content did not have sufficient procedural structure for operational use."
             ),
-            "safeNextStep": "Consult your training officer or supervisor for the current approved protocol.",
+            "safeNextStep": "Consult your supervisor for the current approved procedure.",
             "hiddenSource": False,
         }, "refused", [], []
 
@@ -1607,16 +1607,16 @@ def _corpus_fts_retrieve(
                     "Imprecise medical guidance could cause harm — this result has been withheld."
                 ),
                 "safeNextStep": (
-                    "Contact medical control or your Medical Director for guidance. "
+                    "Contact your safety officer or supervisor for guidance. "
                     "Do not act on unverified medical information."
                 ),
                 "hiddenSource": False,
             }, "refused", [], []
         # Allowed — build a medical_reference guidance card (not "approved").
         _emr_disclaimer = (
-            "Reference material found — NOT an approved LRFD protocol. "
-            "This is EMR reference content only. "
-            "Follow medical control direction and your agency's standing orders."
+            "Reference material found — NOT an approved departmental procedure. "
+            "This is medical reference content only. "
+            "Follow your organization's protocols and the direction of qualified medical personnel."
         )
         top5 = reranked[:5]
         medref_sources = [
@@ -1700,12 +1700,12 @@ def _corpus_fts_retrieve(
                 "reasonCode": "NO_RELEVANT_PROCEDURE",
                 "title": "No medical reference document found",
                 "message": "No medical EMR document matched your question.",
-                "safeNextStep": "Use approved medical protocols or medical control.",
+                "safeNextStep": "Use your organization's approved medical or emergency protocols.",
                 "hiddenSource": False,
             }, "refused", [], []
         _emr_disclaimer = (
-            "Reference material found — NOT an approved operational protocol. "
-            "Follow your agency's standing orders and medical director guidance."
+            "Reference material found — NOT an approved operational procedure. "
+            "Follow your organization's protocols and the direction of qualified medical personnel."
         )
         top5 = reranked[:5]
         ref_sources = [

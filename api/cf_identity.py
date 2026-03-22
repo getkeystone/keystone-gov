@@ -375,7 +375,7 @@ def provision_cf_user(email: str, db: DBSession) -> "CFUser":
             status_code=403,
             detail={
                 "message": (
-                    "This email is not provisioned for the LRFD pilot. "
+                    "This email is not provisioned for this system. "
                     "Contact your administrator."
                 ),
                 "reasonCode": "NOT_PROVISIONED",
