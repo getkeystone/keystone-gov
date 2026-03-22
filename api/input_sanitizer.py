@@ -37,6 +37,41 @@ _INJECTION_PATTERNS = [
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _INJECTION_PATTERNS]
 
 
+_MAX_LLM_QUERY_LEN = 500
+
+# Lines that look like injected instructions rather than user questions
+_INJECTION_LINE_PATTERN = re.compile(
+    r'(ignore\s+(previous|above|all|prior)|new\s+instructions?|system\s*:|'
+    r'you\s+are\s+now|override\s+(your|the)|forget\s+(previous|above))',
+    re.IGNORECASE,
+)
+
+
+def sanitize_query_for_llm(text: str) -> str:
+    """Return a sanitized version of text safe to embed in an LLM prompt.
+
+    Strips lines that match injection patterns, removes code fences, and
+    truncates to _MAX_LLM_QUERY_LEN characters.  Only used for the text
+    passed to the LLM -- check_injection() is still the gate for blocking.
+    """
+    lines = text.splitlines()
+    clean_lines = []
+    for line in lines:
+        if _INJECTION_LINE_PATTERN.search(line):
+            log.warning("sanitize_query_for_llm: stripped injection line: %r", line[:120])
+            continue
+        # Strip code fence markers
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            continue
+        clean_lines.append(line)
+    result = "\n".join(clean_lines).strip()
+    if len(result) > _MAX_LLM_QUERY_LEN:
+        log.warning("sanitize_query_for_llm: truncated query from %d to %d chars", len(result), _MAX_LLM_QUERY_LEN)
+        result = result[:_MAX_LLM_QUERY_LEN]
+    return result
+
+
 def check_injection(query: str) -> tuple[bool, str]:
     """
     Returns (is_safe, reason).
