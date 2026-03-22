@@ -613,15 +613,15 @@ _LLM_SYSTEM_PROMPT = (
     "Answer the question using ONLY the evidence provided below. "
     "Do not use any prior knowledge.\n\n"
     "Rules:\n"
-    "- Every claim must cite the source document title and page\n"
-    "- If the evidence does not contain enough information, say "
-    "\"The available evidence does not fully address this question\" "
-    "and explain what is missing\n"
-    "- Provide the answer first, then list key points\n"
-    "- Do not speculate or add information beyond the evidence\n"
-    "- If the evidence contains numbered steps, preserve the step "
-    "numbers and order\n"
-    "- Use clear, direct language appropriate for workplace safety"
+    "- State the answer directly and concisely. Do not add a disclaimer or "
+    "preamble when the evidence supports a clear answer.\n"
+    "- Every factual claim must cite the source document title and page.\n"
+    "- If the evidence contains numbered steps, preserve the step numbers and order.\n"
+    "- If the evidence is genuinely insufficient or off-topic, state only: "
+    "\"The available evidence does not address this question.\" "
+    "Do not fabricate an answer in this case.\n"
+    "- Do not speculate or add information beyond the evidence.\n"
+    "- Use clear, direct language appropriate for workplace safety."
 )
 
 
@@ -709,6 +709,38 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     conf["gen_model"]       = ollama_client.GEN_MODEL
     conf["gen_latency_ms"]  = gen_ms
     conf["evidence_titles"] = evidence_titles
+
+
+_LLM_HEDGE_PHRASES = [
+    "does not address this question",
+    "does not fully address this question",
+    "does not contain relevant information",
+    "cannot be answered from the evidence",
+    "no relevant information",
+    "cannot find any relevant",
+    "not relevant to",
+    "the evidence does not",
+    "no information about",
+    "the provided evidence does not",
+]
+
+_LLM_REFUSAL_ON_HEDGE = {
+    "type": "refusal",
+    "reasonCode": "INSUFFICIENT_EVIDENCE",
+    "title": "No relevant guidance found",
+    "message": (
+        "The available documents do not contain relevant guidance for this question. "
+        "Ask about a specific safety procedure, regulation, or hazard covered in the corpus."
+    ),
+    "safeNextStep": "Consult your supervisor or safety officer for guidance outside the corpus.",
+    "hiddenSource": False,
+}
+
+
+def _llm_hedges(answer: str) -> bool:
+    """Return True if the LLM answer signals that the evidence is irrelevant."""
+    lower = answer.lower()
+    return any(phrase in lower for phrase in _LLM_HEDGE_PHRASES)
 
 
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
@@ -1653,6 +1685,8 @@ def _corpus_fts_retrieve(
         if _medref_answers:
             medref_guidance["answers"] = _medref_answers
         _add_llm_answer(medref_guidance, question, top5)
+        if medref_guidance.get("answer") and _llm_hedges(medref_guidance["answer"]):
+            return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1880,6 +1914,19 @@ def _corpus_fts_retrieve(
     if _multi_answers:
         guidance["answers"] = _multi_answers
     _add_llm_answer(guidance, question, top5)
+
+    # Relevance gate: if the LLM signals the evidence is off-topic, refuse.
+    # This catches cases like off-topic queries in training mode where the
+    # operational status gate (superseded → NO_ACTIVE_PROCEDURE) doesn't fire
+    # but the LLM correctly identifies the evidence as irrelevant.
+    _llm_answer = guidance.get("answer", "")
+    if _llm_answer and _llm_hedges(_llm_answer):
+        logger.info(
+            "LLM hedge detected in %s mode — converting to INSUFFICIENT_EVIDENCE refusal",
+            mode,
+        )
+        return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
+
     return guidance, "allowed", sources, citations
 
 
@@ -4668,8 +4715,14 @@ def _change_req_to_dict(row: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_STATUS_OVERRIDES = {"", "active", "superseded", "draft", "restricted"}
-_ALLOWED_DOMAINS        = {"fire_ops", "medical_emr", "lrfd_protocol"}
-_ALLOWED_CONTENT_KINDS  = {"procedure", "requirements", "reference"}
+_ALLOWED_DOMAINS        = {
+    "fire_ops", "medical_emr", "lrfd_protocol",
+    "ohs_regulation", "industry_reference", "training_material", "guide",
+}
+_ALLOWED_CONTENT_KINDS  = {
+    "procedure", "requirements", "reference",
+    "regulation", "guide", "training",
+}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -4751,7 +4804,9 @@ def list_documents(
         params["q"] = f"%{q}%"
     if status:
         if status == "active":
-            filters.append("(status_override = '' OR status_override IS NULL)")
+            # Documents are "active" when status_override is NULL, empty string,
+            # or the literal value 'active' (ingest may write either convention).
+            filters.append("(status_override IS NULL OR status_override IN ('', 'active'))")
         else:
             filters.append("status_override = :status")
             params["status"] = status
