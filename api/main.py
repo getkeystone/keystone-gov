@@ -2423,6 +2423,7 @@ def get_deployment_config():
         "modes": CONFIG.get("modes", []),
         "suggested_queries": CONFIG.get("suggested_queries", []),
         "demo_credentials": CONFIG.get("demo_credentials", []),
+        "features": CONFIG.get("features", {}),
     }
 
 
