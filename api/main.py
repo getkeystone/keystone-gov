@@ -569,16 +569,14 @@ _SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 # approved guidance.  Prevents unrelated documents from being approved.
 # ---------------------------------------------------------------------------
 
-# Minimum fraction of question tokens that must appear in the excerpt.
-# Example: "cpr electric shock" vs MAYDAY excerpt → 0/3 = 0.0 → refusal.
-#          "MAYDAY procedure"  vs MAYDAY excerpt → 1/2 = 0.5 → approved.
-# Lowered for regulatory text where vocabulary differs between questions and
-# statute language (was 0.20).
-_RELEVANCE_THRESHOLD = 0.12
+# Relevance gate disabled — will be replaced by HHEM hallucination scoring
+# (KDAT-086). Token-overlap caused over-refusal on regulatory text where
+# question vocabulary diverges from statute language.
+# Gate code and _relevance_score function are preserved for future reference.
+_RELEVANCE_THRESHOLD = 0.0
 
-# Lowered — OR-expansion already signals weak FTS match; vector similarity
-# compensates (was 0.30).
-_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.18
+# Disabled alongside _RELEVANCE_THRESHOLD (was 0.18).
+_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.0
 
 # Multi-answer configuration.
 # Maximum number of distinct-document answers to return (including primary).
