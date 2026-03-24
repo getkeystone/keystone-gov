@@ -1158,7 +1158,6 @@ def _corpus_fts_retrieve(
             "safeNextStep": "Rephrase your question with specific procedure or equipment names, or consult your supervisor.",
             "hiddenSource": False,
         }
-        guidance["_debug_gate"] = "L1161"
         return guidance, "refused", [], []
 
     # ── All-generic-query guard ────────────────────────────────────────────────
@@ -1295,7 +1294,6 @@ def _corpus_fts_retrieve(
                 ),
                 "hiddenSource": False,
             }
-            guidance["_debug_gate"] = "L1297"
             return guidance, "refused", [], []
 
     _clean_top = clean_lines(top_text)
@@ -1359,7 +1357,7 @@ def _corpus_fts_retrieve(
     if (_used_or_fts
             and _top_content_kind == "equipment_manual"
             and _relevance_score(question, _clean_top) < _RC6_EQUIPMENT_THRESHOLD):
-        return {**_NO_RELEVANT_PROCEDURE_REFUSAL, "_debug_gate": "L1360"}, "refused", [], []
+        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
 
     # ── Fetch adjacent chunks for structured procedure parsing ────────────────
     # Window: top_chunk ± 2 (up to 5 chunks ≈ 7 500 chars of context).
@@ -1428,7 +1426,7 @@ def _corpus_fts_retrieve(
     # but if one reaches here (e.g. via TOC fallback fetching adjacent chunks
     # that lack the status gate), enforce fail-closed with no content leak.
     if _status_ov == "restricted" and _requester_level < 1:
-        return {**_ACL_REFUSAL_GUIDANCE, "_debug_gate": "L1429"}, "refused", [], []
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
     if mode == "operational":
         if _status_ov in ("superseded", "draft"):
@@ -1443,7 +1441,6 @@ def _corpus_fts_retrieve(
                 "safeNextStep": "Consult your training officer for the current active version of this procedure.",
                 "hiddenSource": False,
             }
-            refusal["_debug_gate"] = "L1444"
             return refusal, "refused", [], []
 
     # Notice accumulator for approved path
@@ -1589,12 +1586,12 @@ def _corpus_fts_retrieve(
         # Only OR-expanded hits are refused here — OR expansion already signals
         # no AND match existed, so routing to EMR is cross-domain noise.
         if _used_or_fts:
-            return {**_NO_RELEVANT_PROCEDURE_REFUSAL, "_debug_gate": "L1589"}, "refused", [], []
+            return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
         # RC1b: AND-matched EMR in non-medical mode requires medical vocabulary
         # in the question. Single-word coincidences ("chief" → "chief complaint",
         # "incident command" → ICS sections in EMR) must not route to EMR content.
         if not any(t in _MEDICAL_QUERY_TOKENS for t in _tokenize(question)):
-            return {**_NO_RELEVANT_PROCEDURE_REFUSAL, "_debug_gate": "L1594"}, "refused", [], []
+            return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
         if mode == "operational" and _pq["decision"] == "reject":
             return {
                 "type": "refusal",
@@ -1609,7 +1606,6 @@ def _corpus_fts_retrieve(
                     "Do not act on unverified medical information."
                 ),
                 "hiddenSource": False,
-                "_debug_gate": "L1596",
             }, "refused", [], []
         # Allowed — build a medical_reference guidance card (not "approved").
         _emr_disclaimer = (
@@ -1686,7 +1682,7 @@ def _corpus_fts_retrieve(
         _add_llm_answer(medref_guidance, question, top5)
         # Hedge detection disabled — will be replaced by HHEM scoring (KDAT-086)
         if False and medref_guidance.get("answer") and _llm_hedges(medref_guidance["answer"]):
-            return {**_LLM_REFUSAL_ON_HEDGE, "_debug_gate": "L1684"}, "refused", [], []
+            return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1926,7 +1922,7 @@ def _corpus_fts_retrieve(
             "LLM hedge detected in %s mode — converting to INSUFFICIENT_EVIDENCE refusal",
             mode,
         )
-        return {**_LLM_REFUSAL_ON_HEDGE, "_debug_gate": "L1923"}, "refused", [], []
+        return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
 
     return guidance, "allowed", sources, citations
 
@@ -1977,23 +1973,22 @@ def _retrieve(
             "safeNextStep": "Rephrase your question with specific procedure or equipment names, or consult your supervisor.",
             "hiddenSource": False,
         }
-        guidance["_debug_gate"] = "L1974"
         return guidance, "refused", [], []
 
     # ACL check: if best doc requires higher role level, fail closed — no title/citations leaked
     if best_doc.min_role_level > role_level:
-        return {**_ACL_REFUSAL_GUIDANCE, "_debug_gate": "L1978"}, "refused", [], []
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
     # Restricted-status check for lexical fixture path (belt-and-suspenders).
     if getattr(best_doc, "status", "") == "restricted" and role_level < 1:
-        return {**_ACL_REFUSAL_GUIDANCE, "_debug_gate": "L1982"}, "refused", [], []
+        return _ACL_REFUSAL_GUIDANCE, "refused", [], []
 
     _clean_ex = clean_lines(best_doc.excerpt or "")
 
     # Relevance gate — lexical score only checks token presence in doc body;
     # it doesn't confirm the question is *about* that document's topic.
     if _relevance_score(question, _clean_ex) < _RELEVANCE_THRESHOLD:
-        return {**_NO_RELEVANT_PROCEDURE_REFUSAL, "_debug_gate": "L1989"}, "refused", [], []
+        return _NO_RELEVANT_PROCEDURE_REFUSAL, "refused", [], []
 
     guidance = {
         "type": "approved",
