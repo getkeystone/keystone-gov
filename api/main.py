@@ -572,14 +572,13 @@ _SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 # Minimum fraction of question tokens that must appear in the excerpt.
 # Example: "cpr electric shock" vs MAYDAY excerpt → 0/3 = 0.0 → refusal.
 #          "MAYDAY procedure"  vs MAYDAY excerpt → 1/2 = 0.5 → approved.
-# Raised from 0.12 to 0.20: long questions now require at least 2 matching
-# tokens instead of 1, preventing single-word coincidences from passing.
-_RELEVANCE_THRESHOLD = 0.20
+# Lowered for regulatory text where vocabulary differs between questions and
+# statute language (was 0.20).
+_RELEVANCE_THRESHOLD = 0.12
 
-# Tighter threshold applied when an OR-expansion FTS result is being evaluated
-# in operational mode.  OR expansion already signals that no AND match existed;
-# requiring stronger overlap prevents off-domain content from passing.
-_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.30
+# Lowered — OR-expansion already signals weak FTS match; vector similarity
+# compensates (was 0.30).
+_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.18
 
 # Multi-answer configuration.
 # Maximum number of distinct-document answers to return (including primary).
@@ -592,12 +591,10 @@ _MULTI_ANSWER_STRONG_THRESHOLD: float = 0.85
 _MULTI_ANSWER_RELATED_THRESHOLD: float = 0.72
 
 # KDAT-064d: Hybrid retrieval weights.
-# FTS is weighted higher because exact-term matching is authoritative for
-# procedure names, equipment codes, and LRFD-specific terminology.
-# Vector search adds semantic recall for paraphrased queries and near-miss
-# vocabulary where the author used different words than the questioner.
-_HYBRID_W_FTS     = 0.60   # FTS normalized score weight
-_HYBRID_W_VEC     = 0.40   # vector cosine similarity weight
+# Equal weight — regulatory text benefits from semantic matching alongside
+# keyword matching (was 60/40 FTS/vector).
+_HYBRID_W_FTS     = 0.50   # FTS normalized score weight
+_HYBRID_W_VEC     = 0.50   # vector cosine similarity weight
 # Minimum raw cosine similarity for a vector row to participate in the merge.
 # Rows below this floor are dropped before normalization so that a batch of
 # uniformly low-similarity results cannot inflate after min-max scaling and
