@@ -2277,7 +2277,7 @@ def _check_login_rate_limit(ip: str) -> None:
 
 
 # Query rate limiter: 20 queries per session token per 60 seconds.
-_QUERY_RATE_LIMIT  = 20
+_QUERY_RATE_LIMIT  = int(os.environ.get("QUERY_RATE_LIMIT", "20"))
 _QUERY_RATE_WINDOW = 60  # seconds
 _query_attempts: dict[str, list[float]] = {}
 _query_lock = threading.Lock()
