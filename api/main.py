@@ -1684,7 +1684,8 @@ def _corpus_fts_retrieve(
         if _medref_answers:
             medref_guidance["answers"] = _medref_answers
         _add_llm_answer(medref_guidance, question, top5)
-        if medref_guidance.get("answer") and _llm_hedges(medref_guidance["answer"]):
+        # Hedge detection disabled — will be replaced by HHEM scoring (KDAT-086)
+        if False and medref_guidance.get("answer") and _llm_hedges(medref_guidance["answer"]):
             return {**_LLM_REFUSAL_ON_HEDGE, "_debug_gate": "L1684"}, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
@@ -1919,7 +1920,8 @@ def _corpus_fts_retrieve(
     # operational status gate (superseded → NO_ACTIVE_PROCEDURE) doesn't fire
     # but the LLM correctly identifies the evidence as irrelevant.
     _llm_answer = guidance.get("answer", "")
-    if _llm_answer and _llm_hedges(_llm_answer):
+    # Hedge detection disabled — will be replaced by HHEM scoring (KDAT-086)
+    if False and _llm_answer and _llm_hedges(_llm_answer):
         logger.info(
             "LLM hedge detected in %s mode — converting to INSUFFICIENT_EVIDENCE refusal",
             mode,
