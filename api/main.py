@@ -69,6 +69,7 @@ from requirements_parse import make_requirements_summary, parse_requirements
 from reranker import rerank_chunks
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
+import hhem_scorer
 import ollama_client
 
 # Maps scenario_key -> guidance template (from seeded data)
@@ -1269,10 +1270,10 @@ def _corpus_fts_retrieve(
                     _top_domain = db.execute(
                         text("SELECT domain FROM corpus_documents WHERE rel_path = :rel"),
                         {"rel": top_rel},
-                    ).scalar() or "fire_ops"
+                    ).scalar() or "general"
                 except Exception:
                     db.rollback()
-                    _top_domain = "fire_ops"
+                    _top_domain = "general"
                 _top_content_kind = _content_kind_map.get(top_rel, "procedure")
                 _used_fallback = True
                 _fts_rank = _BASE
@@ -1513,7 +1514,10 @@ def _corpus_fts_retrieve(
             or (_req_evidence is not None and _req_evidence["spec_table_like"])
         )
     )
-    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject") and not _is_spec_answer:
+    # dev/keystone-next: loosened from ("weak", "reject") → "reject" only.
+    # "weak" quality is normal for a general procedure corpus; refusing on it
+    # is too aggressive outside the LRFD fire-service context.  KDAT-086.
+    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] == "reject" and not _is_spec_answer:
         return {
             "type": "refusal",
             "reasonCode": "LOW_CONFIDENCE",
@@ -1527,59 +1531,19 @@ def _corpus_fts_retrieve(
         }, "refused", [], []
 
     # ── Policy gate A2: operational scope guard ───────────────────────────────
-    # Enforce that operational queries retrieve the correct content_kind.
-    #
-    # Case 1: requirements-intent question but top doc is NOT content_kind=requirements
-    #         → refuse; user should check requirements corpus.
-    # Case 2: top doc IS content_kind=requirements but question has NO requirements
-    #         intent → refuse with hint to rephrase using requirements wording.
-    #
-    # Neither check fires for medical_emr (Gate B handles that path) or spec
-    # answers where the text itself contains spec data despite content_kind.
+    # DISABLED for dev/keystone-next: LRFD content_kind guard.
+    # All 85 docs in the dev corpus are content_kind='procedure'; there is no
+    # requirements corpus, so this gate produces only false refusals.
+    # Re-enable when content_kind taxonomy is implemented for the target
+    # corpus.  See KDAT-086 notes.
     _has_req_intent = bool(_REQUIREMENTS_INTENT.search(question))
-    if mode == "operational" and _top_domain != "medical_emr":
-        if _has_req_intent and _top_content_kind != "requirements" and not _is_spec_answer:
-            return {
-                "type": "refusal",
-                "reasonCode": "NO_REQUIREMENTS_FOUND",
-                "title": "No requirements document found",
-                "message": (
-                    "Your question asks for specifications or requirements, but no "
-                    "requirements document matched. The closest match is a procedure "
-                    "document which may not contain the data you need."
-                ),
-                "safeNextStep": (
-                    "Check the requirements section of the corpus or consult the "
-                    "apparatus manufacturer documentation."
-                ),
-                "hiddenSource": False,
-            }, "refused", [], []
-        if not _has_req_intent and _top_content_kind == "requirements" and not _is_spec_answer:
-            return {
-                "type": "refusal",
-                "reasonCode": "LOW_CONFIDENCE",
-                "title": "Low confidence — guidance withheld",
-                "message": (
-                    "The best matching document is a requirements/specifications sheet, "
-                    "not an operational procedure. If you need electrical or installation "
-                    "requirements, try rephrasing with requirements wording "
-                    "(e.g. 'What are the electrical requirements for …')."
-                ),
-                "safeNextStep": "Consult your supervisor or training officer for the current procedure.",
-                "hiddenSource": False,
-            }, "refused", [], []
 
     # ── Policy gate B: medical_emr domain → medical_reference card ──────────
-    # Operational/training queries that retrieve medical_emr documents are
-    # allowed during the pilot but must never show as "Approved Guidance".
-    # They are returned as type="medical_reference" — a distinct card type
-    # that carries a hard banner and no "approved" label.
-    # Exception: operational + "reject" quality only → fail-closed LOW_CONFIDENCE_MEDICAL.
-    # "Weak" quality is NOT refused here because EMR textbooks are narrative/
-    # explanatory prose; the procedure parser rates them as "weak" even when
-    # they contain directly relevant medical guidance.  The relevance gate
-    # (above) already ensures off-topic content is withheld.
-    if _top_domain == "medical_emr" and mode != "medical_reference":
+    # DISABLED for dev/keystone-next: no medical_emr documents exist in the
+    # dev corpus.  This gate can never fire and its card-type conversion would
+    # shadow future procedure results if a stale domain tag slipped through.
+    # Re-enable when a medical_emr sub-corpus is ingested.  See KDAT-086.
+    if False and _top_domain == "medical_emr" and mode != "medical_reference":
         # RC1 fix: OR expansion in non-medical modes is off-domain leakage.
         # AND-matched EMR content in training/operational is still allowed through
         # (e.g. a fire-ops query that genuinely AND-matches an EMR document).
@@ -1911,18 +1875,38 @@ def _corpus_fts_retrieve(
         guidance["answers"] = _multi_answers
     _add_llm_answer(guidance, question, top5)
 
-    # Relevance gate: if the LLM signals the evidence is off-topic, refuse.
-    # This catches cases like off-topic queries in training mode where the
-    # operational status gate (superseded → NO_ACTIVE_PROCEDURE) doesn't fire
-    # but the LLM correctly identifies the evidence as irrelevant.
+    # ── Stage 4: HHEM hallucination trust check (KDAT-086) ───────────────────
     _llm_answer = guidance.get("answer", "")
-    # Hedge detection disabled — will be replaced by HHEM scoring (KDAT-086)
-    if False and _llm_answer and _llm_hedges(_llm_answer):
+    if _llm_answer:
+        _premise = _build_evidence_pack(top5)
+        _hhem_score = hhem_scorer.score(_premise, _llm_answer)
+        guidance["factual_consistency_score"] = _hhem_score
         logger.info(
-            "LLM hedge detected in %s mode — converting to INSUFFICIENT_EVIDENCE refusal",
-            mode,
+            "[keystone] HHEM score=%.4f threshold=%.2f query_snippet=%r",
+            _hhem_score if _hhem_score is not None else -1.0,
+            hhem_scorer.HHEM_THRESHOLD,
+            question[:80],
         )
-        return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
+        if _hhem_score is not None and _hhem_score < hhem_scorer.HHEM_THRESHOLD:
+            logger.info(
+                "[keystone] HHEM below threshold (%.4f < %.2f) — LOW_FACTUAL_CONSISTENCY refusal",
+                _hhem_score,
+                hhem_scorer.HHEM_THRESHOLD,
+            )
+            return {
+                "type": "refusal",
+                "reasonCode": "LOW_FACTUAL_CONSISTENCY",
+                "title": "Answer withheld — factual consistency check failed",
+                "message": (
+                    "The generated answer could not be verified against the source documents. "
+                    "The content may not accurately reflect the retrieved procedures."
+                ),
+                "safeNextStep": "Consult the source documents directly or contact your supervisor.",
+                "hiddenSource": False,
+                "factual_consistency_score": _hhem_score,
+            }, "refused", [], []
+    else:
+        guidance["factual_consistency_score"] = None
 
     return guidance, "allowed", sources, citations
 

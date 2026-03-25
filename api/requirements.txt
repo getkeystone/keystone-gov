@@ -9,3 +9,8 @@ python-docx==1.1.2
 cryptography>=43.0.0
 PyJWT>=2.8.0
 PyYAML>=6.0
+# HHEM-2.1-Open (Stage 4: factual consistency scoring)
+transformers>=4.40,<5.0
+torch>=2.0
+sentencepiece>=0.2.0
+protobuf>=4.0
