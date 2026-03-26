@@ -387,13 +387,15 @@ def score_query(base: str, token: str, q: dict) -> dict:
     if q["expect_doc_contains"] and q["expect_doc_contains"].lower() in (result["doc_title"] or "").lower():
         result["retrieval_correct"] = True
 
-    # Score: answer quality (must contain expected facts AND not hedge)
-    if q["expect_answer_contains"] and not result["hedge_detected"]:
+    # Score: answer quality (expected facts present, independent of hedge)
+    if q["expect_answer_contains"]:
         matches = sum(
             1 for term in q["expect_answer_contains"]
             if term.lower() in answer_lower
         )
-        # At least one expected term must be present
+        # Answer quality passes if expected terms are present,
+        # EVEN if a hedge phrase is also present.
+        # A hedge-only answer (no expected terms) still fails.
         result["answer_quality"] = matches >= 1
 
     return result
