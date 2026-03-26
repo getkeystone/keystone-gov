@@ -71,6 +71,7 @@ from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 import hhem_scorer
 import ollama_client
+from compliance import router as compliance_router, get_checklist_summaries
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -2311,6 +2312,10 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ── Compliance router ─────────────────────────────────────────────────────────
+app.include_router(compliance_router)
+
+
 # ---------------------------------------------------------------------------
 # In-memory rate limiters
 # ---------------------------------------------------------------------------
@@ -2487,6 +2492,7 @@ def get_deployment_config():
         "suggested_queries": CONFIG.get("suggested_queries", []),
         "demo_credentials": CONFIG.get("demo_credentials", []),
         "features": CONFIG.get("features", {}),
+        "checklists": get_checklist_summaries(),
     }
 
 
