@@ -2721,6 +2721,71 @@ def submit_query(
         db.commit()
         return QueryResponse(query_id=_inj_query_id, scenario_key="policy_refusal")
 
+    # ── Jurisdiction guard — refuse queries about non-Alberta regulations ────
+    # The corpus covers Alberta OHS only. Queries explicitly referencing
+    # other jurisdictions (OSHA, US, UK HSE, EU, Australian WHS, etc.)
+    # should be refused rather than returning Alberta content that doesn't
+    # apply to the queried jurisdiction.
+    _NON_ALBERTA_SIGNALS = {
+        'osha', 'niosh', 'united states', 'u.s.', 'us federal',
+        'uk', 'hse uk', 'british', 'england',
+        'european', 'eu directive',
+        'australian', 'safe work australia', 'worksafe',
+        'ontario', 'british columbia', 'quebec', 'saskatchewan',
+        'manitoba', 'nova scotia',
+    }
+    _q_lower = req.question.lower()
+    _jurisdiction_match = [s for s in _NON_ALBERTA_SIGNALS if s in _q_lower]
+    if _jurisdiction_match:
+        _jur_query_id = str(uuid.uuid4())
+        _jur_now = datetime.now(timezone.utc).isoformat()
+        _jur_guidance = {
+            "type": "refusal",
+            "reasonCode": "JURISDICTION_MISMATCH",
+            "title": "Query references a jurisdiction not covered by this corpus",
+            "message": (
+                f"This corpus covers Alberta OHS regulations only. "
+                f"Your query appears to reference: {', '.join(_jurisdiction_match)}. "
+                f"Consult the relevant jurisdiction's regulatory authority."
+            ),
+            "safeNextStep": "Rephrase your question for Alberta OHS, or consult the relevant jurisdiction directly.",
+            "hiddenSource": False,
+        }
+        _jur_last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
+        _jur_prev_hash = _jur_last.entry_hash if _jur_last else ""
+        _jur_entry_hash = compute_entry_hash(
+            _jur_query_id, _jur_now, role, req.mode, "refused", _jur_prev_hash
+        )
+        db.add(Query(
+            id=_jur_query_id,
+            question=req.question,
+            role=role,
+            mode=req.mode,
+            scenario_key="policy_refusal",
+            guidance_json=_jur_guidance,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(AuditEntry(
+            id=str(uuid.uuid4()),
+            query_id=_jur_query_id,
+            receipt_id=f"receipt-{_jur_query_id[:8]}",
+            timestamp=_jur_now,
+            role_used=role,
+            mode_used=req.mode,
+            policy_outcome="refused",
+            sources_considered_json=[],
+            citations_returned_json=[],
+            prev_hash=_jur_prev_hash,
+            entry_hash=_jur_entry_hash,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            simulated_role_used=current_user.sim_role,
+        ))
+        db.commit()
+        return QueryResponse(query_id=_jur_query_id, scenario_key="policy_refusal")
+
     # medical_reference mode always forces domain_filter to medical_emr only.
     # This is a defense-in-depth guard — the FTS gate in _corpus_fts_retrieve
     # also enforces this, but we set it here so it applies to all retrieval paths.
