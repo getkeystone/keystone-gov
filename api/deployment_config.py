@@ -21,7 +21,7 @@ _DEFAULT_CONFIG = {
     "deployment": {
         "id": "default",
         "name": "Safety Procedure Assistant",
-        "subtitle": "Ask a question, get a cited answer",
+        "subtitle": "Governed operational decision retrieval",
     },
     "roles": [
         {"id": "member", "label": "Member", "level": 0},
