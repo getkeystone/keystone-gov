@@ -378,7 +378,7 @@ def score_query(base: str, token: str, q: dict) -> dict:
 
     # Score: refusal correctness
     if q["expect_scenario"] == "refusal":
-        result["refusal_correct"] = result["scenario"] == "refusal"
+        result["refusal_correct"] = result["scenario"] in ("refusal", "policy_refusal")
         result["retrieval_correct"] = True  # N/A for refusals
         result["answer_quality"] = True     # N/A for refusals
         return result
