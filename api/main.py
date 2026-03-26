@@ -718,6 +718,8 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
 _LLM_HEDGE_PHRASES = [
     "does not address this question",
     "does not fully address this question",
+    "does not address the specific",
+    "does not directly address",
     "does not contain relevant information",
     "cannot be answered from the evidence",
     "no relevant information",
@@ -1672,7 +1674,11 @@ def _corpus_fts_retrieve(
             }
             _top_text_lower = medref_guidance.get("summary", "").lower()
             _top_title_lower = medref_guidance.get("document", {}).get("title", "").lower()
-            _combined = _top_text_lower + " " + _top_title_lower
+            # Also check the top chunk text for term overlap
+            _top_chunk_text = ""
+            if top5:
+                _top_chunk_text = top5[0][3].lower()[:500]  # top5 row[3] is chunk text
+            _combined = _top_text_lower + " " + _top_title_lower + " " + _top_chunk_text
             _term_hits = sum(1 for t in _query_terms if t in _combined)
 
             if _term_hits >= 2:
@@ -1938,7 +1944,11 @@ def _corpus_fts_retrieve(
         }
         _top_text_lower = guidance.get("summary", "").lower()
         _top_title_lower = guidance.get("document", {}).get("title", "").lower()
-        _combined = _top_text_lower + " " + _top_title_lower
+        # Also check the top chunk text for term overlap
+        _top_chunk_text = ""
+        if top5:
+            _top_chunk_text = top5[0][3].lower()[:500]  # top5 row[3] is chunk text
+        _combined = _top_text_lower + " " + _top_title_lower + " " + _top_chunk_text
         _term_hits = sum(1 for t in _query_terms if t in _combined)
 
         if _term_hits >= 2:
