@@ -88,7 +88,21 @@ def rerank_chunks(
         elif overlap >= 1:
             multiplier *= 1.1
 
-        # 4. Chunk quality
+        # 4. Document title match boost
+        # If query terms appear in the document title, boost this chunk.
+        # A document titled "H2S Exposure Limits Supplement" is more likely
+        # to be the right source for a query about "H2S exposure limits"
+        # than a general document that happens to mention H2S.
+        title_lower = chunk.get('title', '').lower()
+        title_overlap = sum(1 for t in query_terms if t in title_lower)
+        if title_overlap >= 3:
+            multiplier *= 1.5
+        elif title_overlap >= 2:
+            multiplier *= 1.3
+        elif title_overlap >= 1:
+            multiplier *= 1.15
+
+        # 5. Chunk quality
         alnum = sum(c.isalnum() or c == ' ' for c in text)
         density = alnum / max(len(text), 1)
         if density < 0.5:
