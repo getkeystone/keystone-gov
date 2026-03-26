@@ -2531,6 +2531,7 @@ def health(request: Request):
 def get_deployment_config():
     """Return deployment configuration for the console."""
     from deployment_config import CONFIG
+    from compliance import get_checklist_summaries
     return {
         "deployment": CONFIG.get("deployment", {}),
         "roles": CONFIG.get("roles", []),
@@ -2538,6 +2539,7 @@ def get_deployment_config():
         "suggested_queries": CONFIG.get("suggested_queries", []),
         "demo_credentials": CONFIG.get("demo_credentials", []),
         "features": CONFIG.get("features", {}),
+        "checklists": get_checklist_summaries(),
     }
 
 
