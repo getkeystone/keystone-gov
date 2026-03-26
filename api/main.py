@@ -1651,9 +1651,18 @@ def _corpus_fts_retrieve(
         if _medref_answers:
             medref_guidance["answers"] = _medref_answers
         _add_llm_answer(medref_guidance, question, top5)
-        # Hedge detection disabled — will be replaced by HHEM scoring (KDAT-086)
-        if False and medref_guidance.get("answer") and _llm_hedges(medref_guidance["answer"]):
-            return _LLM_REFUSAL_ON_HEDGE, "refused", [], []
+        # Targeted hedge-only refusal: if the LLM produced ONLY a hedge
+        # phrase with no substantive content, convert to refusal.
+        # This catches off-topic queries where the LLM correctly refuses
+        # but the pipeline still marks "approved."
+        # Full hedge gate disabled pending HHEM (KDAT-086).
+        _medref_answer = medref_guidance.get("answer", "")
+        if _medref_answer and _llm_hedges(_medref_answer) and len(_medref_answer.strip()) < 120:
+            logger.info(
+                "LLM hedge-only answer detected (%d chars) — converting to refusal",
+                len(_medref_answer.strip()),
+            )
+            return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1884,6 +1893,19 @@ def _corpus_fts_retrieve(
 
     # ── Stage 4: HHEM hallucination trust check (KDAT-086) ───────────────────
     _llm_answer = guidance.get("answer", "")
+
+    # Targeted hedge-only refusal: if the LLM produced ONLY a hedge
+    # phrase with no substantive content, convert to refusal.
+    # This catches off-topic queries where the LLM correctly refuses
+    # but the pipeline still marks "approved."
+    # Full hedge gate disabled pending HHEM (KDAT-086).
+    if _llm_answer and _llm_hedges(_llm_answer) and len(_llm_answer.strip()) < 120:
+        logger.info(
+            "LLM hedge-only answer detected (%d chars) — converting to refusal",
+            len(_llm_answer.strip()),
+        )
+        return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
+
     if _llm_answer:
         _premise = _build_evidence_pack(top5)
         _hhem_score = hhem_scorer.score(_premise, _llm_answer)
