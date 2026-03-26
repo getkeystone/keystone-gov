@@ -1880,18 +1880,22 @@ def _corpus_fts_retrieve(
     if _llm_answer:
         _premise = _build_evidence_pack(top5)
         _hhem_score = hhem_scorer.score(_premise, _llm_answer)
+        _answer_source = guidance.get("answer_source", "llm")
+        _hhem_threshold = hhem_scorer.get_threshold(_answer_source)
         guidance["factual_consistency_score"] = _hhem_score
         logger.info(
-            "[keystone] HHEM score=%.4f threshold=%.2f query_snippet=%r",
+            "[keystone] HHEM score=%.4f threshold=%.2f answer_source=%s query_snippet=%r",
             _hhem_score if _hhem_score is not None else -1.0,
-            hhem_scorer.HHEM_THRESHOLD,
+            _hhem_threshold,
+            _answer_source,
             question[:80],
         )
-        if _hhem_score is not None and _hhem_score < hhem_scorer.HHEM_THRESHOLD:
+        if _hhem_score is not None and _hhem_score < _hhem_threshold:
             logger.info(
-                "[keystone] HHEM below threshold (%.4f < %.2f) — LOW_FACTUAL_CONSISTENCY refusal",
+                "[keystone] HHEM below threshold (%.4f < %.2f) answer_source=%s — LOW_FACTUAL_CONSISTENCY refusal",
                 _hhem_score,
-                hhem_scorer.HHEM_THRESHOLD,
+                _hhem_threshold,
+                _answer_source,
             )
             return {
                 "type": "refusal",
