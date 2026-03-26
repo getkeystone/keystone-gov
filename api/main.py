@@ -71,7 +71,6 @@ from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
 import hhem_scorer
 import ollama_client
-from compliance import router as compliance_router, get_checklist_summaries
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -2312,9 +2311,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ── Compliance router ─────────────────────────────────────────────────────────
-app.include_router(compliance_router)
-
 
 # ---------------------------------------------------------------------------
 # In-memory rate limiters
@@ -2492,7 +2488,6 @@ def get_deployment_config():
         "suggested_queries": CONFIG.get("suggested_queries", []),
         "demo_credentials": CONFIG.get("demo_credentials", []),
         "features": CONFIG.get("features", {}),
-        "checklists": get_checklist_summaries(),
     }
 
 
@@ -3602,6 +3597,10 @@ class OperatorDecisionBody(BaseModel):
 class ReviewBody(BaseModel):
     supervisor_reviewed: bool = True
 
+class FeedbackRequest(BaseModel):
+    signal_type: str
+    comment: "str | None" = None
+
 class CreateCaseBody(BaseModel):
     title: str
     summary: str = ""
@@ -3963,6 +3962,126 @@ def review_operator_decision(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error: {exc}")
     return {"reviewed": True, "query_id": query_id, "supervisor": current_session.username}
+
+
+# ---------------------------------------------------------------------------
+# Feedback signals (KDAT-B)
+# ---------------------------------------------------------------------------
+
+_FEEDBACK_SIGNAL_VALUES = {"helpful", "not_helpful"}
+
+
+@app.post("/feedback/{query_id}", status_code=201)
+def create_feedback(
+    query_id: str,
+    body: FeedbackRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Record a helpfulness signal for a query result."""
+    if body.signal_type not in _FEEDBACK_SIGNAL_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"signal_type must be one of: {', '.join(sorted(_FEEDBACK_SIGNAL_VALUES))}",
+        )
+    # One feedback entry per user per query
+    try:
+        existing = db.execute(
+            text("SELECT id FROM feedback_signals WHERE query_id = :qid AND created_by = :uid"),
+            {"qid": query_id, "uid": current_session.user_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if existing:
+        raise HTTPException(status_code=409, detail="Feedback already submitted for this query")
+    # Fetch guidance metadata from the stored query
+    q = db.query(Query).filter(Query.id == query_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Query not found")
+    guidance = q.guidance_json or {}
+    doc_title  = (guidance.get("document") or {}).get("title")
+    ans_source = guidance.get("answer_source")
+    fcs        = guidance.get("factual_consistency_score")
+    try:
+        row = db.execute(text("""
+            INSERT INTO feedback_signals
+                (query_id, signal_type, comment, created_by, created_by_role,
+                 document_title, answer_source, factual_consistency_score)
+            VALUES (:query_id, :signal_type, :comment, :user_id, :role,
+                    :doc_title, :answer_source, :fcs)
+            RETURNING id, created_at_utc
+        """), {
+            "query_id":     query_id,
+            "signal_type":  body.signal_type,
+            "comment":      body.comment,
+            "user_id":      current_session.user_id,
+            "role":         current_session.role,
+            "doc_title":    doc_title,
+            "answer_source": ans_source,
+            "fcs":          fcs,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    return {
+        "id":                       str(row[0]),
+        "query_id":                 query_id,
+        "signal_type":              body.signal_type,
+        "comment":                  body.comment,
+        "created_by":               current_session.user_id,
+        "created_by_role":          current_session.role,
+        "created_at_utc":           row[1].isoformat() if row[1] else None,
+        "document_title":           doc_title,
+        "answer_source":            ans_source,
+        "factual_consistency_score": fcs,
+    }
+
+
+@app.get("/feedback/{query_id}")
+def get_feedback(
+    query_id: str,
+    nullable: int = 0,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Return the most recent feedback signal for a query.
+
+    nullable=0 (default): 404 when no feedback exists.
+    nullable=1: always 200; body is null when no feedback has been recorded.
+    """
+    try:
+        row = db.execute(text("""
+            SELECT id, query_id, signal_type, comment, created_by, created_by_role,
+                   created_at_utc, document_title, answer_source, factual_consistency_score
+            FROM feedback_signals
+            WHERE query_id = :qid
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+        """), {"qid": query_id}).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        if nullable:
+            return None
+        raise HTTPException(status_code=404, detail="No feedback recorded for this query")
+    signal = {
+        "id":                       str(row[0]),
+        "query_id":                 row[1],
+        "signal_type":              row[2],
+        "comment":                  row[3],
+        "created_by":               row[4],
+        "created_by_role":          row[5],
+        "created_at_utc":           row[6].isoformat() if row[6] else None,
+        "document_title":           row[7],
+        "answer_source":            row[8],
+        "factual_consistency_score": row[9],
+    }
+    if nullable:
+        return signal
+    return signal
 
 
 def _build_incident_files(
