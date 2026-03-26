@@ -211,3 +211,6 @@ __marimo__/
 
 # Eval results (timestamped JSON — tracked separately)
 eval/results/
+scripts/backfill_embeddings.py
+*.bak.*
+=
