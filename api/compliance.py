@@ -16,7 +16,8 @@ generation — the goal is evidence presence, not answer quality.
 A query passes when:
   FTS ts_rank_cd  >= 0.05   (existing noise floor, same as main retrieval path)
   OR
-  vector cosine_sim >= 0.30  (meaningful semantic match)
+  vector cosine_sim >= 0.65  (strong evidence match)
+  Scores are capped at 1.0 before comparison (ts_rank_cd can exceed 1.0).
 
 Element score  = (queries_passed / queries_total) * 100
 Overall score  = weighted mean of element scores (equal weights by default)
@@ -245,7 +246,7 @@ def _get_checklist(checklist_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 _PASS_FTS_THRESHOLD = 0.05   # same noise floor as main retrieval path
-_PASS_VEC_THRESHOLD = 0.30   # cosine similarity threshold for semantic match
+_PASS_VEC_THRESHOLD = 0.75   # cosine similarity threshold for strong evidence match
 
 _FTS_SQL = text("""
     SELECT
@@ -311,7 +312,7 @@ def _retrieve_for_query(
         fts_rows = []
     if fts_rows:
         fts_title = fts_rows[0][0]
-        fts_score = float(fts_rows[0][1])
+        fts_score = min(float(fts_rows[0][1]), 1.0)  # ts_rank_cd can exceed 1.0
 
     # ── Vector ───────────────────────────────────────────────────────────────
     vec_title: str | None = None
@@ -326,7 +327,7 @@ def _retrieve_for_query(
             vec_rows = []
         if vec_rows:
             vec_title = vec_rows[0][0]
-            vec_score = float(vec_rows[0][1])
+            vec_score = min(float(vec_rows[0][1]), 1.0)  # cap cosine_sim defensively
 
     # ── Best evidence ─────────────────────────────────────────────────────────
     fts_pass = fts_score >= _PASS_FTS_THRESHOLD
