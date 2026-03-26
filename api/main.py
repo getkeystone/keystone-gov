@@ -1658,11 +1658,35 @@ def _corpus_fts_retrieve(
         # Full hedge gate disabled pending HHEM (KDAT-086).
         _medref_answer = medref_guidance.get("answer", "")
         if _medref_answer and _llm_hedges(_medref_answer) and len(_medref_answer.strip()) < 120:
-            logger.info(
-                "LLM hedge-only answer detected (%d chars) — converting to refusal",
-                len(_medref_answer.strip()),
-            )
-            return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
+            # Check if the retrieved content is actually relevant to the query
+            # before falling back to deterministic. Off-topic queries should
+            # still be refused even when the LLM hedges.
+            _query_terms = {
+                w for w in re.findall(r'[a-z0-9]+', question.lower())
+                if len(w) > 2 and w not in {'the', 'what', 'how', 'are', 'for',
+                    'does', 'with', 'from', 'this', 'that', 'which', 'when',
+                    'where', 'who', 'whom', 'have', 'has', 'had', 'was', 'were',
+                    'been', 'being', 'will', 'would', 'could', 'should', 'can',
+                    'may', 'might', 'shall', 'must', 'need', 'required'}
+            }
+            _top_text_lower = medref_guidance.get("summary", "").lower()
+            _top_title_lower = medref_guidance.get("document", {}).get("title", "").lower()
+            _combined = _top_text_lower + " " + _top_title_lower
+            _term_hits = sum(1 for t in _query_terms if t in _combined)
+
+            if _term_hits >= 2:
+                logger.info(
+                    "LLM hedge-only answer detected (%d chars, %d term hits) — falling back to deterministic",
+                    len(_medref_answer.strip()), _term_hits,
+                )
+                medref_guidance["answer"] = medref_guidance.get("summary", "")
+                medref_guidance["answer_source"] = "deterministic"
+            else:
+                logger.info(
+                    "LLM hedge-only answer detected (%d chars, %d term hits) — refusing (low relevance)",
+                    len(_medref_answer.strip()), _term_hits,
+                )
+                return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1900,11 +1924,36 @@ def _corpus_fts_retrieve(
     # but the pipeline still marks "approved."
     # Full hedge gate disabled pending HHEM (KDAT-086).
     if _llm_answer and _llm_hedges(_llm_answer) and len(_llm_answer.strip()) < 120:
-        logger.info(
-            "LLM hedge-only answer detected (%d chars) — converting to refusal",
-            len(_llm_answer.strip()),
-        )
-        return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
+        # Check if the retrieved content is actually relevant to the query
+        # before falling back to deterministic. Off-topic queries should
+        # still be refused even when the LLM hedges.
+        _query_terms = {
+            w for w in re.findall(r'[a-z0-9]+', question.lower())
+            if len(w) > 2 and w not in {'the', 'what', 'how', 'are', 'for',
+                'does', 'with', 'from', 'this', 'that', 'which', 'when',
+                'where', 'who', 'whom', 'have', 'has', 'had', 'was', 'were',
+                'been', 'being', 'will', 'would', 'could', 'should', 'can',
+                'may', 'might', 'shall', 'must', 'need', 'required'}
+        }
+        _top_text_lower = guidance.get("summary", "").lower()
+        _top_title_lower = guidance.get("document", {}).get("title", "").lower()
+        _combined = _top_text_lower + " " + _top_title_lower
+        _term_hits = sum(1 for t in _query_terms if t in _combined)
+
+        if _term_hits >= 2:
+            logger.info(
+                "LLM hedge-only answer detected (%d chars, %d term hits) — falling back to deterministic",
+                len(_llm_answer.strip()), _term_hits,
+            )
+            guidance["answer"] = guidance.get("summary", "")
+            guidance["answer_source"] = "deterministic"
+            _llm_answer = guidance["answer"]
+        else:
+            logger.info(
+                "LLM hedge-only answer detected (%d chars, %d term hits) — refusing (low relevance)",
+                len(_llm_answer.strip()), _term_hits,
+            )
+            return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
 
     if _llm_answer:
         _premise = _build_evidence_pack(top5)
