@@ -70,6 +70,18 @@ def _load_model() -> None:
 _load_model()
 
 
+def configure(llm_threshold: "float | None" = None, deterministic_threshold: "float | None" = None) -> None:
+    """Override thresholds at runtime from deployment config quality_gates."""
+    global HHEM_THRESHOLD_LLM, HHEM_THRESHOLD_DETERMINISTIC, HHEM_THRESHOLD
+    if llm_threshold is not None:
+        HHEM_THRESHOLD_LLM = llm_threshold
+        HHEM_THRESHOLD = llm_threshold
+        log.info("[keystone] HHEM LLM threshold set to %.3f (deployment config)", llm_threshold)
+    if deterministic_threshold is not None:
+        HHEM_THRESHOLD_DETERMINISTIC = deterministic_threshold
+        log.info("[keystone] HHEM deterministic threshold set to %.3f (deployment config)", deterministic_threshold)
+
+
 def get_threshold(answer_source: str) -> float:
     """Return the appropriate HHEM threshold for the answer source type.
 

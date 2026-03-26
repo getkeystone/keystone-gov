@@ -1930,7 +1930,7 @@ def _corpus_fts_retrieve(
     # This catches off-topic queries where the LLM correctly refuses
     # but the pipeline still marks "approved."
     # Full hedge gate disabled pending HHEM (KDAT-086).
-    if _llm_answer and _llm_hedges(_llm_answer) and len(_llm_answer.strip()) < 120:
+    if _llm_answer and _llm_hedges(_llm_answer) and len(_llm_answer.strip()) < _HEDGE_ONLY_MIN_CHARS:
         # Check if the retrieved content is actually relevant to the query
         # before falling back to deterministic. Off-topic queries should
         # still be refused even when the LLM hedges.
@@ -1951,7 +1951,7 @@ def _corpus_fts_retrieve(
         _combined = _top_text_lower + " " + _top_title_lower + " " + _top_chunk_text
         _term_hits = sum(1 for t in _query_terms if t in _combined)
 
-        if _term_hits >= 2:
+        if _term_hits >= _HEDGE_ONLY_TERM_HITS:
             logger.info(
                 "LLM hedge-only answer detected (%d chars, %d term hits) — falling back to deterministic",
                 len(_llm_answer.strip()), _term_hits,
@@ -2162,6 +2162,42 @@ _PUBLIC_ALLOW_DECISIONS = int(os.environ.get("PUBLIC_ALLOW_DECISIONS", "1"))
 # Reset endpoint secret — empty string disables the endpoint entirely.
 _PUBLIC_DEMO_RESET_TOKEN: str = os.environ.get("PUBLIC_DEMO_RESET_TOKEN", "").strip()
 _PUBLIC_DEMO_RETENTION_HOURS: int = int(os.environ.get("PUBLIC_DEMO_RETENTION_HOURS", "24"))
+
+# ---------------------------------------------------------------------------
+# Per-deployment quality gate parameters
+# Defaults match the hardcoded values that were previously inline.
+# Override via deployment.yaml quality_gates section.
+# ---------------------------------------------------------------------------
+
+# Hedge-only refusal gate: if the LLM answer is both a hedge phrase AND shorter
+# than this limit, check term overlap before deciding to refuse or fall back.
+_HEDGE_ONLY_MIN_CHARS: int = 120
+
+# Minimum number of query terms that must appear in the top evidence before
+# falling back to deterministic instead of refusing.
+_HEDGE_ONLY_TERM_HITS: int = 2
+
+
+def _apply_quality_gates() -> None:
+    """Read quality_gates from deployment.yaml and apply overrides at startup."""
+    global _HEDGE_ONLY_MIN_CHARS, _HEDGE_ONLY_TERM_HITS
+    from deployment_config import CONFIG
+    gates = CONFIG.get("quality_gates", {})
+    if not gates:
+        return
+    if "hhem_threshold_llm" in gates:
+        hhem_scorer.configure(llm_threshold=float(gates["hhem_threshold_llm"]))
+    if "hhem_threshold_deterministic" in gates:
+        hhem_scorer.configure(deterministic_threshold=float(gates["hhem_threshold_deterministic"]))
+    if "hedge_only_min_chars" in gates:
+        _HEDGE_ONLY_MIN_CHARS = int(gates["hedge_only_min_chars"])
+        logger.info("[keystone] quality_gates: hedge_only_min_chars=%d", _HEDGE_ONLY_MIN_CHARS)
+    if "hedge_only_term_hits" in gates:
+        _HEDGE_ONLY_TERM_HITS = int(gates["hedge_only_term_hits"])
+        logger.info("[keystone] quality_gates: hedge_only_term_hits=%d", _HEDGE_ONLY_TERM_HITS)
+
+
+_apply_quality_gates()
 
 
 # ---------------------------------------------------------------------------
