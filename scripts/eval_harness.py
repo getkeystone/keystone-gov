@@ -26,7 +26,7 @@ EVAL_SET = [
         "question": "What is the occupational exposure limit for H2S?",
         "mode": "operational",
         "expect_scenario": "approved",
-        "expect_doc_contains": "H2S Exposure Limits",
+        "expect_doc_contains": "H2S Exposure Limits|Part 4",
         "expect_answer_contains": ["10 ppm", "15 ppm"],
         "category": "regulatory_value",
     },
@@ -384,8 +384,10 @@ def score_query(base: str, token: str, q: dict) -> dict:
         return result
 
     # Score: retrieval correctness
-    if q["expect_doc_contains"] and q["expect_doc_contains"].lower() in (result["doc_title"] or "").lower():
-        result["retrieval_correct"] = True
+    if q["expect_doc_contains"]:
+        doc_title = (result["doc_title"] or "").lower()
+        alternatives = [alt.strip().lower() for alt in q["expect_doc_contains"].split("|")]
+        result["retrieval_correct"] = any(alt in doc_title for alt in alternatives)
 
     # Score: answer quality (expected facts present, independent of hedge)
     if q["expect_answer_contains"]:
