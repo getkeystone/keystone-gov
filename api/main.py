@@ -37,15 +37,19 @@ from input_sanitizer import check_injection
 from database import Base, SessionLocal, engine, get_db
 from models import AuditEntry, Document, ManagedUser, Query, Session, User, UserManagementEvent
 from schemas import (
+    AssignTaskRequest,
     AuditResponse,
     AuditVerifyResponse,
     CreateVersionRequest,
+    DismissTaskRequest,
     DocumentVersionResponse,
     GuidanceResponse,
     LoginRequest,
     LoginResponse,
     QueryRequest,
     QueryResponse,
+    ReviewCommentRequest,
+    ResolveTaskRequest,
     SourceResponse,
 )
 from cf_identity import (
@@ -4118,6 +4122,46 @@ def create_feedback(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Auto-create review task for not_helpful feedback
+    review_task_id = None
+    if body.signal_type == "not_helpful":
+        try:
+            # Find the document referenced in the query guidance
+            _guidance = q.guidance_json or {}
+            _doc_info = _guidance.get("document") or {}
+            _doc_title = _doc_info.get("title") or doc_title
+            # Try to find corpus_documents row by title
+            _corpus_doc = None
+            if _doc_title:
+                _corpus_doc = db.execute(
+                    text("SELECT id FROM corpus_documents WHERE title = :title LIMIT 1"),
+                    {"title": _doc_title}
+                ).fetchone()
+            # Try to find active version for this document
+            _source_version_id = None
+            if _corpus_doc:
+                _ver_row = db.execute(
+                    text("SELECT id FROM document_versions WHERE doc_id = :did AND status = 'active' LIMIT 1"),
+                    {"did": _corpus_doc[0]}
+                ).fetchone()
+                _source_version_id = _ver_row[0] if _ver_row else None
+            _task_row = db.execute(text("""
+                INSERT INTO review_tasks (feedback_signal_id, doc_id, source_version_id, status)
+                VALUES (:fid, :did, :vid, 'open')
+                RETURNING id
+            """), {
+                "fid": str(row[0]),
+                "did": _corpus_doc[0] if _corpus_doc else 0,
+                "vid": _source_version_id,
+            }).fetchone()
+            db.commit()
+            review_task_id = str(_task_row[0]) if _task_row else None
+        except Exception:
+            # Migration 24 may not yet be applied; degrade gracefully
+            db.rollback()
+            review_task_id = None
+
     return {
         "id":                       str(row[0]),
         "query_id":                 query_id,
@@ -4129,6 +4173,7 @@ def create_feedback(
         "document_title":           doc_title,
         "answer_source":            ans_source,
         "factual_consistency_score": fcs,
+        "review_task_id":           review_task_id,
     }
 
 
@@ -4487,6 +4532,578 @@ def approve_version(
     return {
         "version":    _version_to_dict(new_row),
         "superseded": old_ver,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Review Workflow
+# ---------------------------------------------------------------------------
+
+_REVIEW_MIN_ROLE_LEVEL = 1   # custodian (0), officer (1), authority (2)
+_RESOLUTION_TYPE_TO_DECISION = {
+    "new_version_published": "publish_new_version",
+    "no_change_needed":      "no_change",
+    "escalated":             "escalate",
+    "duplicate":             "no_change",
+}
+
+
+def _task_to_dict(row: tuple) -> dict:
+    """Convert a review_tasks SELECT row to dict.
+
+    Columns (positional):
+      0  id, 1 feedback_signal_id, 2 doc_id, 3 source_version_id,
+      4  status, 5 assigned_to, 6 priority,
+      7  resolution_type, 8 resolution_note, 9 resolved_by,
+      10 created_at, 11 assigned_at, 12 resolved_at
+    """
+    (tid, feedback_signal_id, doc_id, source_version_id,
+     status, assigned_to, priority,
+     resolution_type, resolution_note, resolved_by,
+     created_at, assigned_at, resolved_at) = row[:13]
+    return {
+        "id":                  str(tid),
+        "feedback_signal_id":  str(feedback_signal_id),
+        "doc_id":              doc_id,
+        "source_version_id":   source_version_id,
+        "status":              status,
+        "assigned_to":         assigned_to,
+        "priority":            priority,
+        "resolution_type":     resolution_type,
+        "resolution_note":     resolution_note,
+        "resolved_by":         resolved_by,
+        "created_at":          created_at.isoformat() if created_at else None,
+        "assigned_at":         assigned_at.isoformat() if assigned_at else None,
+        "resolved_at":         resolved_at.isoformat() if resolved_at else None,
+    }
+
+
+_TASK_SELECT = """
+    SELECT id, feedback_signal_id, doc_id, source_version_id,
+           status, assigned_to, priority,
+           resolution_type, resolution_note, resolved_by,
+           created_at, assigned_at, resolved_at
+    FROM review_tasks
+"""
+
+
+def _comment_to_dict(row: tuple) -> dict:
+    (cid, task_id, author, author_role, body, created_at) = row
+    return {
+        "id":          str(cid),
+        "task_id":     str(task_id),
+        "author":      author,
+        "author_role": author_role,
+        "body":        body,
+        "created_at":  created_at.isoformat() if created_at else None,
+    }
+
+
+def _pub_decision_to_dict(row: tuple) -> dict:
+    (did, review_task_id, old_vid, new_vid,
+     decision, decided_by, decided_by_role, decided_at) = row
+    return {
+        "id":              str(did),
+        "review_task_id":  str(review_task_id),
+        "old_version_id":  old_vid,
+        "new_version_id":  new_vid,
+        "decision":        decision,
+        "decided_by":      decided_by,
+        "decided_by_role": decided_by_role,
+        "decided_at":      decided_at.isoformat() if decided_at else None,
+    }
+
+
+@app.get("/review/tasks")
+def list_review_tasks(
+    status: "str | None" = QueryParam(default=None),
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """List review tasks with optional status filter (custodian, officer, or authority)."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    params: dict = {}
+    where = ""
+    if status:
+        where = "WHERE rt.status = :status"
+        params["status"] = status
+
+    try:
+        rows = db.execute(text(f"""
+            SELECT rt.id, rt.feedback_signal_id, rt.doc_id, rt.source_version_id,
+                   rt.status, rt.assigned_to, rt.priority,
+                   rt.resolution_type, rt.resolution_note, rt.resolved_by,
+                   rt.created_at, rt.assigned_at, rt.resolved_at,
+                   cd.title AS document_title,
+                   fs.comment AS feedback_comment
+            FROM review_tasks rt
+            LEFT JOIN corpus_documents cd ON cd.id = rt.doc_id
+            LEFT JOIN feedback_signals fs ON fs.id = rt.feedback_signal_id
+            {where}
+            ORDER BY rt.created_at DESC
+        """), params).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    items = []
+    for r in rows:
+        task = _task_to_dict(r[:13])
+        task["document_title"]    = r[13]
+        task["feedback_snippet"]  = (r[14] or "")[:100] if r[14] else None
+        items.append(task)
+    return {"tasks": items}
+
+
+@app.get("/review/tasks/{task_id}")
+def get_review_task(
+    task_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Full task detail including feedback, source version, and comments."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+
+    # Feedback detail
+    feedback = None
+    try:
+        fb_row = db.execute(text("""
+            SELECT fs.id, fs.query_id, fs.signal_type, fs.comment,
+                   fs.created_by, fs.created_by_role, fs.created_at_utc,
+                   fs.document_title, fs.answer_source, fs.factual_consistency_score,
+                   q.question
+            FROM feedback_signals fs
+            LEFT JOIN queries q ON q.id = fs.query_id
+            WHERE fs.id = :fid
+        """), {"fid": task["feedback_signal_id"]}).fetchone()
+        if fb_row:
+            feedback = {
+                "id":                       str(fb_row[0]),
+                "query_id":                 fb_row[1],
+                "signal_type":              fb_row[2],
+                "comment":                  fb_row[3],
+                "created_by":               fb_row[4],
+                "created_by_role":          fb_row[5],
+                "created_at_utc":           fb_row[6].isoformat() if fb_row[6] else None,
+                "document_title":           fb_row[7],
+                "answer_source":            fb_row[8],
+                "factual_consistency_score": fb_row[9],
+                "question":                 fb_row[10],
+            }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Source version info
+    source_version = None
+    if task.get("source_version_id"):
+        try:
+            ver_row = db.execute(
+                text(f"{_VERSION_SELECT} WHERE id = :vid"),
+                {"vid": task["source_version_id"]},
+            ).fetchone()
+            if ver_row:
+                source_version = _version_to_dict(ver_row)
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Comments
+    try:
+        comment_rows = db.execute(text("""
+            SELECT id, task_id, author, author_role, body, created_at
+            FROM review_comments
+            WHERE task_id = :tid
+            ORDER BY created_at ASC
+        """), {"tid": task_id}).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "task":           task,
+        "feedback":       feedback,
+        "source_version": source_version,
+        "comments":       [_comment_to_dict(r) for r in comment_rows],
+    }
+
+
+@app.post("/review/tasks/{task_id}/assign")
+def assign_review_task(
+    task_id: str,
+    body: AssignTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Assign a review task to a user (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] != "open":
+        raise HTTPException(status_code=400, detail=f"Task status is '{task['status']}'; only open tasks can be assigned")
+
+    try:
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'assigned', assigned_to = :assigned_to, assigned_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {"assigned_to": body.assigned_to, "tid": task_id}).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _task_to_dict(updated)
+
+
+@app.post("/review/tasks/{task_id}/comment", status_code=201)
+def add_review_comment(
+    task_id: str,
+    body: ReviewCommentRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Add a comment to a review task (custodian, officer, or authority)."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; comments are not allowed on resolved or dismissed tasks",
+        )
+
+    try:
+        comment_row = db.execute(text("""
+            INSERT INTO review_comments (task_id, author, author_role, body, created_at)
+            VALUES (:tid, :author, :author_role, :body, now())
+            RETURNING id, task_id, author, author_role, body, created_at
+        """), {
+            "tid":         task_id,
+            "author":      current_session.user_id,
+            "author_role": current_session.role,
+            "body":        body.body,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _comment_to_dict(comment_row)
+
+
+@app.post("/review/tasks/{task_id}/resolve")
+def resolve_review_task(
+    task_id: str,
+    body: ResolveTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Resolve a review task (custodian, officer, or authority). Separation of duties enforced."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    valid_resolution_types = {"new_version_published", "no_change_needed", "escalated", "duplicate"}
+    if body.resolution_type not in valid_resolution_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"resolution_type must be one of: {', '.join(sorted(valid_resolution_types))}",
+        )
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; only open, assigned, or in_review tasks can be resolved",
+        )
+
+    # Separation of duties: look up feedback submitter
+    try:
+        fb_row = db.execute(
+            text("SELECT created_by FROM feedback_signals WHERE id = :fid"),
+            {"fid": task["feedback_signal_id"]},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if fb_row and fb_row[0] == current_session.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Separation of duties: feedback submitter cannot resolve their own task",
+        )
+
+    # If publishing a new version, verify it exists
+    if body.resolution_type == "new_version_published":
+        if not body.new_version_id:
+            raise HTTPException(status_code=400, detail="new_version_id required when resolution_type is 'new_version_published'")
+        try:
+            ver_check = db.execute(
+                text("SELECT id FROM document_versions WHERE id = :vid"),
+                {"vid": body.new_version_id},
+            ).fetchone()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+        if not ver_check:
+            raise HTTPException(status_code=404, detail=f"document_versions id {body.new_version_id} not found")
+
+    decision_value = _RESOLUTION_TYPE_TO_DECISION.get(body.resolution_type, "no_change")
+    actor = current_session.user_id
+
+    try:
+        pub_row = db.execute(text("""
+            INSERT INTO publication_decisions
+                (review_task_id, old_version_id, new_version_id, decision, decided_by, decided_by_role, decided_at)
+            VALUES
+                (:tid, :old_vid, :new_vid, :decision, :decided_by, :decided_by_role, now())
+            RETURNING id, review_task_id, old_version_id, new_version_id,
+                      decision, decided_by, decided_by_role, decided_at
+        """), {
+            "tid":            task_id,
+            "old_vid":        task["source_version_id"],
+            "new_vid":        body.new_version_id,
+            "decision":       decision_value,
+            "decided_by":     actor,
+            "decided_by_role": current_session.role,
+        }).fetchone()
+
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'resolved',
+                resolution_type = :resolution_type,
+                resolution_note = :resolution_note,
+                resolved_by = :resolved_by,
+                resolved_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {
+            "resolution_type": body.resolution_type,
+            "resolution_note": body.resolution_note,
+            "resolved_by":     actor,
+            "tid":             task_id,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "task":                 _task_to_dict(updated),
+        "publication_decision": _pub_decision_to_dict(pub_row),
+    }
+
+
+@app.post("/review/tasks/{task_id}/dismiss")
+def dismiss_review_task(
+    task_id: str,
+    body: DismissTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Dismiss a review task (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; only open, assigned, or in_review tasks can be dismissed",
+        )
+
+    try:
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'dismissed',
+                resolution_note = :resolution_note,
+                resolved_by = :resolved_by,
+                resolved_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {
+            "resolution_note": body.resolution_note,
+            "resolved_by":     current_session.user_id,
+            "tid":             task_id,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _task_to_dict(updated)
+
+
+@app.get("/audit/chain/{feedback_signal_id}")
+def get_audit_chain(
+    feedback_signal_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Reconstruct full governance chain from a feedback signal (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        fb_row = db.execute(text("""
+            SELECT id, query_id, signal_type, comment, created_by, created_by_role,
+                   created_at_utc, document_title, answer_source, factual_consistency_score
+            FROM feedback_signals
+            WHERE id = :fid
+        """), {"fid": feedback_signal_id}).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not fb_row:
+        raise HTTPException(status_code=404, detail="Feedback signal not found")
+
+    feedback = {
+        "id":                       str(fb_row[0]),
+        "query_id":                 fb_row[1],
+        "signal_type":              fb_row[2],
+        "comment":                  fb_row[3],
+        "created_by":               fb_row[4],
+        "created_by_role":          fb_row[5],
+        "created_at_utc":           fb_row[6].isoformat() if fb_row[6] else None,
+        "document_title":           fb_row[7],
+        "answer_source":            fb_row[8],
+        "factual_consistency_score": fb_row[9],
+    }
+
+    try:
+        task_rows = db.execute(
+            text(f"{_TASK_SELECT} WHERE feedback_signal_id = :fid ORDER BY created_at ASC"),
+            {"fid": feedback_signal_id},
+        ).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    tasks_out = []
+    versions_seen: dict = {}
+
+    for task_row in task_rows:
+        task = _task_to_dict(task_row)
+
+        # Comments for this task
+        try:
+            comment_rows = db.execute(text("""
+                SELECT id, task_id, author, author_role, body, created_at
+                FROM review_comments
+                WHERE task_id = :tid
+                ORDER BY created_at ASC
+            """), {"tid": task["id"]}).fetchall()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+        # Publication decisions for this task
+        try:
+            pd_rows = db.execute(text("""
+                SELECT id, review_task_id, old_version_id, new_version_id,
+                       decision, decided_by, decided_by_role, decided_at
+                FROM publication_decisions
+                WHERE review_task_id = :tid
+                ORDER BY decided_at ASC
+            """), {"tid": task["id"]}).fetchall()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+        decisions = []
+        for pd in pd_rows:
+            decisions.append(_pub_decision_to_dict(pd))
+            for vid in (pd[2], pd[3]):  # old_version_id, new_version_id
+                if vid and vid not in versions_seen:
+                    try:
+                        vrow = db.execute(
+                            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+                            {"vid": vid},
+                        ).fetchone()
+                        if vrow:
+                            versions_seen[vid] = _version_to_dict(vrow)
+                    except Exception:
+                        pass
+
+        task["comments"]             = [_comment_to_dict(r) for r in comment_rows]
+        task["publication_decisions"] = decisions
+        tasks_out.append(task)
+
+    return {
+        "feedback":     feedback,
+        "review_tasks": tasks_out,
+        "versions":     versions_seen,
     }
 
 
