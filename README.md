@@ -1,62 +1,47 @@
 # Keystone Gov
 
-Authorization and audit subsystem for Keystone AI.
+Core API engine for Keystone AI. Governed procedure retrieval with evidence-backed answers, query-time access control, and tamper-evident audit logging.
 
-Runs fully on customer infrastructure. No external API calls. Air-gap compatible.
+Runs entirely on customer infrastructure. No external API calls. Air-gap compatible.
 
-## Current scope
+## What it does
 
-`keystone-gov` contains the governance behavior behind the current KDAT-001A proof.
+- **Retrieval pipeline**: Hybrid search (FTS + vector via pgvector) with LLM synthesis (Ollama)
+- **Query-time ACL**: Role-based content filtering enforced before the LLM sees any evidence
+- **Fail-closed behavior**: Refuses when evidence is insufficient, jurisdiction is wrong, or input is flagged
+- **Factual consistency scoring**: HHEM-2.1-Open scores every LLM-generated answer
+- **Feedback capture**: Thumbs up/down with auto-creation of review tasks on negative signals
+- **Document version tracking**: Create, approve (with separation of duties), temporal lookup ("which version was active on date X?")
+- **Review workflow**: Feedback -> review task -> assign -> comment -> resolve/dismiss -> publication decision
+- **Audit trail**: HMAC-SHA256 hash-chained audit log, tamper-evident, verifiable per-entry
+- **Evidence export**: Cryptographically signed evidence bundles for compliance review
 
-Today it covers:
-- Authentication for demo use
-- Query-time ACL filtering
-- Audit logging for every query
-- Hash-chained audit verification
-- Admin-only audit endpoints
+## Architecture
 
-## Proven today in KDAT-001A
+- **Framework**: FastAPI (Python 3.12)
+- **Database**: PostgreSQL 16 + pgvector
+- **Inference**: Ollama (qwen2.5:7b-instruct for generation, nomic-embed-text for embeddings)
+- **Auth**: Password-based demo sessions + Cloudflare Access (production)
+- **Two DB roles**: keystone (owner, migrations) and keystone_app (runtime, restricted privileges)
 
-- Admin-only content is filtered out before the LLM sees it
-- Unauthorized users receive fail-closed or permitted-only results
-- Every query writes an audit entry
-- Audit integrity can be verified through an HMAC-SHA256 hash chain
-- Policy enforcement happens outside the model
+## Branches
 
-## Important boundary
+| Branch | Purpose |
+|--------|---------|
+| main | Last stable release (v0.4.2-compliance) |
+| dev/keystone-next | Active development (v0.5.1-review) |
 
-Tamper-evident does **not** mean production-grade immutability.
+## Current deployment
 
-Current proof:
-- Detects row modification if the HMAC key remains confidential
+- demo.getkeystone.ai runs v0.5.1-review (Alberta OHS corpus, 54 documents)
+- lrfd.getkeystone.ai runs v0.3.1 (frozen pilot)
 
-Not yet proven:
-- Append-only DB privileges
-- External verifier
-- WORM storage anchoring
-- Key management via Vault/HSM
+## KDAT milestones delivered
 
-## Current authorization model
-
-KDAT-001A uses a simple demo model:
-- Static JWT-based auth
-- Binary ACL pattern (`public` / `admin`)
-- Query-time filtering after retrieval and before generation
-
-## Planned next
-
-- OIDC / enterprise identity integration
-- Group and attribute-based authorization
-- Harder audit guarantees
-- Adversarial ACL test suite
-- User activity views and export controls
-
-## Development status
-
-🚧 Active Development
-
-Current milestone: KDAT-001A governance proof  
-Next milestone: KDAT-001B validation and adversarial testing
+101 milestones tracked. Key recent milestones:
+- KDAT-096: Document version tracking schema + 5 API endpoints
+- KDAT-098: Review workflow + 7 API endpoints + feedback auto-task
+- KDAT-100: Governed learning loop end-to-end (46/46 tests)
 
 ## License
 
@@ -68,7 +53,7 @@ Keystone Gov is licensed under the [Business Source License 1.1](LICENSE).
 
 **Production use requires a commercial license.**
 
-**Change Date:** 2030-01-01  
+**Change Date:** 2030-01-01
 After this date, the license automatically converts to Apache License 2.0.
 
 For commercial licensing: arnaldo@getkeystone.ai
