@@ -91,7 +91,7 @@ _SCENARIO_MIN_LEVEL: dict[str, int] = {
 }
 _ROLE_LEVEL: dict[str, int] = {
     "member": 0,
-    "custodian": 0,
+    "custodian": 1,
     "officer": 1,
     "authority": 2,
 }
