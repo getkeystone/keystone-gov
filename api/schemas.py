@@ -110,3 +110,21 @@ class DocumentVersionResponse(BaseModel):
 class CreateVersionRequest(BaseModel):
     doc_id: int
     change_summary: Optional[str] = None
+
+
+class AssignTaskRequest(BaseModel):
+    assigned_to: str
+
+
+class ReviewCommentRequest(BaseModel):
+    body: str = Field(..., max_length=2000)
+
+
+class ResolveTaskRequest(BaseModel):
+    resolution_type: str
+    resolution_note: Optional[str] = None
+    new_version_id: Optional[int] = None
+
+
+class DismissTaskRequest(BaseModel):
+    resolution_note: str = Field(..., max_length=2000)
