@@ -88,3 +88,25 @@ class MeResponse(BaseModel):
     cf_enabled: bool
     sim_role: Optional[str] = None
     sim_enabled: bool = False
+
+
+class DocumentVersionResponse(BaseModel):
+    id: int
+    doc_id: int
+    version_number: int
+    status: str
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    supersedes_version_id: Optional[int] = None
+    content_hash: Optional[str] = None
+    file_path: Optional[str] = None
+    change_summary: Optional[str] = None
+    created_by: str
+    approved_by: Optional[str] = None
+    published_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CreateVersionRequest(BaseModel):
+    doc_id: int
+    change_summary: Optional[str] = None
