@@ -111,3 +111,32 @@ class UserManagementEvent(Base):
     old_value     = Column(String)
     new_value     = Column(String)
     note          = Column(String)
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(Integer, nullable=False, index=True)
+    version_number = Column(Integer, nullable=False, default=1)
+    status = Column(String, nullable=False, default="draft")
+    effective_from = Column(DateTime(timezone=True))
+    effective_to = Column(DateTime(timezone=True))
+    supersedes_version_id = Column(Integer)
+    content_hash = Column(String)
+    file_path = Column(String)
+    change_summary = Column(Text)
+    created_by = Column(String, nullable=False)
+    approved_by = Column(String)
+    published_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True))
+
+
+class VersionEvent(Base):
+    __tablename__ = "version_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String, nullable=False)
+    actor = Column(String, nullable=False)
+    actor_role = Column(String, nullable=False)
+    detail = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True))

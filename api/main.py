@@ -39,6 +39,8 @@ from models import AuditEntry, Document, ManagedUser, Query, Session, User, User
 from schemas import (
     AuditResponse,
     AuditVerifyResponse,
+    CreateVersionRequest,
+    DocumentVersionResponse,
     GuidanceResponse,
     LoginRequest,
     LoginResponse,
@@ -4173,6 +4175,319 @@ def get_feedback(
     if nullable:
         return signal
     return signal
+
+
+# ---------------------------------------------------------------------------
+# Document Version Tracking
+# ---------------------------------------------------------------------------
+
+_VERSION_CREATE_ROLES = {"custodian", "authority"}
+_VERSION_APPROVE_ROLES = {"authority"}
+
+
+def _version_to_dict(row: tuple) -> dict:
+    """Convert a document_versions SELECT row to dict.
+
+    Columns (positional):
+      0  id, 1 doc_id, 2 version_number, 3 status,
+      4  effective_from, 5 effective_to, 6 supersedes_version_id,
+      7  content_hash, 8 file_path, 9 change_summary,
+      10 created_by, 11 approved_by, 12 published_at, 13 created_at
+    """
+    (vid, doc_id, version_number, status,
+     effective_from, effective_to, supersedes_version_id,
+     content_hash, file_path, change_summary,
+     created_by, approved_by, published_at, created_at) = row
+    return {
+        "id":                    vid,
+        "doc_id":                doc_id,
+        "version_number":        version_number,
+        "status":                status,
+        "effective_from":        effective_from.isoformat() if effective_from else None,
+        "effective_to":          effective_to.isoformat() if effective_to else None,
+        "supersedes_version_id": supersedes_version_id,
+        "content_hash":          content_hash,
+        "file_path":             file_path,
+        "change_summary":        change_summary,
+        "created_by":            created_by,
+        "approved_by":           approved_by,
+        "published_at":          published_at.isoformat() if published_at else None,
+        "created_at":            created_at.isoformat() if created_at else None,
+    }
+
+
+_VERSION_SELECT = """
+    SELECT id, doc_id, version_number, status,
+           effective_from, effective_to, supersedes_version_id,
+           content_hash, file_path, change_summary,
+           created_by, approved_by, published_at, created_at
+    FROM document_versions
+"""
+
+
+@app.get("/versions/{doc_id}")
+def list_versions(
+    doc_id: int,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """List all versions for a corpus document, ordered by version_number desc."""
+    try:
+        doc_row = db.execute(
+            text("SELECT id FROM corpus_documents WHERE id = :doc_id"),
+            {"doc_id": doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not doc_row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        rows = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id ORDER BY version_number DESC"),
+            {"doc_id": doc_id},
+        ).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    return {"doc_id": doc_id, "versions": [_version_to_dict(r) for r in rows]}
+
+
+@app.get("/versions/{doc_id}/current")
+def get_current_version(
+    doc_id: int,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Get the currently active version for a document."""
+    try:
+        row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id AND status = 'active'"),
+            {"doc_id": doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        raise HTTPException(status_code=404, detail="No active version for this document")
+    return _version_to_dict(row)
+
+
+@app.get("/versions/{doc_id}/at/{as_of}")
+def get_version_at(
+    doc_id: int,
+    as_of: str,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Get the version that was active at a specific point in time."""
+    try:
+        as_of_dt = datetime.fromisoformat(as_of)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid as_of datetime: {as_of!r}")
+    try:
+        row = db.execute(
+            text(f"""
+                {_VERSION_SELECT}
+                WHERE doc_id = :doc_id
+                  AND effective_from <= :as_of
+                  AND (effective_to IS NULL OR effective_to > :as_of)
+            """),
+            {"doc_id": doc_id, "as_of": as_of_dt},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No version active at {as_of}")
+    return _version_to_dict(row)
+
+
+@app.post("/versions", status_code=201)
+def create_version(
+    body: CreateVersionRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Create a new draft version for a document (custodian or authority)."""
+    if current_session.role not in _VERSION_CREATE_ROLES:
+        raise HTTPException(status_code=403, detail="custodian or authority role required")
+
+    # Verify corpus document exists
+    try:
+        doc_row = db.execute(
+            text("SELECT id, sha256 FROM corpus_documents WHERE id = :doc_id"),
+            {"doc_id": body.doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not doc_row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc_sha256 = doc_row[1]
+
+    # Find next version_number
+    try:
+        max_row = db.execute(
+            text("SELECT MAX(version_number) FROM document_versions WHERE doc_id = :doc_id"),
+            {"doc_id": body.doc_id},
+        ).fetchone()
+        next_version = (max_row[0] or 0) + 1
+
+        actor = current_session.email
+
+        new_ver = db.execute(
+            text("""
+                INSERT INTO document_versions
+                    (doc_id, version_number, status, content_hash, change_summary, created_by, created_at)
+                VALUES
+                    (:doc_id, :version_number, 'draft', :content_hash, :change_summary, :created_by, now())
+                RETURNING id, doc_id, version_number, status,
+                          effective_from, effective_to, supersedes_version_id,
+                          content_hash, file_path, change_summary,
+                          created_by, approved_by, published_at, created_at
+            """),
+            {
+                "doc_id":         body.doc_id,
+                "version_number": next_version,
+                "content_hash":   doc_sha256,
+                "change_summary": body.change_summary,
+                "created_by":     actor,
+            },
+        ).fetchone()
+
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'created', :actor, :actor_role, now())
+            """),
+            {
+                "version_id": new_ver[0],
+                "actor":      actor,
+                "actor_role": current_session.role,
+            },
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _version_to_dict(new_ver)
+
+
+@app.post("/versions/{version_id}/approve")
+def approve_version(
+    version_id: int,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Approve a version, activating it and superseding the previous active version."""
+    if current_session.role not in _VERSION_APPROVE_ROLES:
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        ver_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+            {"vid": version_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not ver_row:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    ver = _version_to_dict(ver_row)
+
+    # Separation of duties: approver must not be the creator
+    if ver["created_by"] == current_session.email:
+        raise HTTPException(
+            status_code=403,
+            detail="Separation of duties: version creator cannot approve their own version",
+        )
+
+    if ver["status"] not in ("draft", "pending_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Version status is '{ver['status']}'; only draft or pending_review can be approved",
+        )
+
+    actor = current_session.email
+    actor_role = current_session.role
+
+    try:
+        # Find current active version for this doc (if any)
+        old_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id AND status = 'active'"),
+            {"doc_id": ver["doc_id"]},
+        ).fetchone()
+        old_ver = _version_to_dict(old_row) if old_row else None
+
+        if old_ver:
+            # Supersede the old active version
+            db.execute(
+                text("""
+                    UPDATE document_versions
+                    SET status = 'superseded', effective_to = now()
+                    WHERE id = :old_id
+                """),
+                {"old_id": old_ver["id"]},
+            )
+            db.execute(
+                text("""
+                    INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                    VALUES (:version_id, 'superseded', :actor, :actor_role, now())
+                """),
+                {"version_id": old_ver["id"], "actor": actor, "actor_role": actor_role},
+            )
+
+        # Activate the new version
+        db.execute(
+            text("""
+                UPDATE document_versions
+                SET status = 'active',
+                    effective_from = now(),
+                    approved_by = :approved_by,
+                    published_at = now(),
+                    supersedes_version_id = :supersedes_id
+                WHERE id = :vid
+            """),
+            {
+                "approved_by":    actor,
+                "supersedes_id":  old_ver["id"] if old_ver else None,
+                "vid":            version_id,
+            },
+        )
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'approved', :actor, :actor_role, now())
+            """),
+            {"version_id": version_id, "actor": actor, "actor_role": actor_role},
+        )
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'published', :actor, :actor_role, now())
+            """),
+            {"version_id": version_id, "actor": actor, "actor_role": actor_role},
+        )
+        db.commit()
+
+        # Reload activated version
+        new_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+            {"vid": version_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "version":    _version_to_dict(new_row),
+        "superseded": old_ver,
+    }
 
 
 def _build_incident_files(
