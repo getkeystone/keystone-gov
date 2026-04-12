@@ -59,6 +59,32 @@ DATABASE_URL = (
 CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "/srv/keystone-corpus"))
 ACTIVE_DIR  = CORPUS_ROOT / "active"
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _should_update_field(
+    db_val: str,
+    new_val: str,
+    auto_defaults: set,
+    from_sidecar: bool,
+) -> bool:
+    """Return True if the field should be overwritten in the DB.
+
+    A field is updated only when the stored value is empty, is still one of
+    the known auto-derived defaults, or the new value comes explicitly from a
+    sidecar file.  Any value that was manually set in the DB (and is neither
+    empty nor a default) is preserved, unless a sidecar explicitly overrides it.
+    """
+    if not db_val:
+        return True            # DB field is empty — always set
+    if db_val == new_val:
+        return False           # no change regardless
+    if db_val in auto_defaults:
+        return True            # still carrying the auto-derived default
+    if from_sidecar:
+        return True            # sidecar explicitly provides a new value
+    return False               # manually-set value — preserve it
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -138,7 +164,10 @@ def main() -> None:
         stat  = fpath.stat()
         size  = stat.st_size
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        title = fpath.stem.replace("_", " ").replace("-", " ")
+        # Filename-derived title — used as the "auto default" sentinel.
+        # Any DB title that still matches this was never manually edited.
+        _filename_derived_title = fpath.stem.replace("_", " ").replace("-", " ")
+        title = _filename_derived_title
 
         # ── Read optional metadata sidecar ────────────────────────────────────
         # Convention: <filename>.metadata.json  (e.g. report.pdf.metadata.json)
@@ -174,6 +203,12 @@ def main() -> None:
             except Exception as _exc:
                 print(f"  WARN [{rel}] metadata parse error: {_exc}", file=sys.stderr)
 
+        # Track whether each protected field came from a sidecar (explicit)
+        # or was auto-derived from filename/path.  Used by _should_update_field.
+        _title_from_sidecar  = bool(meta_title)
+        _domain_from_sidecar = bool(meta_domain)
+        _ck_from_sidecar     = bool(meta_content_kind)
+
         # Override filename-derived title with sidecar title when present.
         if meta_title:
             title = meta_title
@@ -207,10 +242,19 @@ def main() -> None:
                 _s_title   = _sr[6] or ""
                 _updates: list[str] = []
                 _update_vals: list  = []
-                if _s_domain != domain:
-                    _updates.append("domain=%s");          _update_vals.append(domain)
-                if _s_ck != content_kind:
-                    _updates.append("content_kind=%s");    _update_vals.append(content_kind)
+                # domain, content_kind, title: only overwrite if the current DB
+                # value is empty or still the auto-derived default, or if a
+                # sidecar file explicitly provides a new value.
+                if _should_update_field(_s_domain, domain, {"fire_ops"}, _domain_from_sidecar):
+                    if _s_domain != domain:
+                        _updates.append("domain=%s");       _update_vals.append(domain)
+                if _should_update_field(_s_ck, content_kind, {"procedure"}, _ck_from_sidecar):
+                    if _s_ck != content_kind:
+                        _updates.append("content_kind=%s"); _update_vals.append(content_kind)
+                if _should_update_field(_s_title, title, {_filename_derived_title}, _title_from_sidecar):
+                    if _s_title != title:
+                        _updates.append("title=%s");        _update_vals.append(title)
+                # owner, dates, status: always sync with sidecar (no manual-set risk)
                 if _s_owner != meta_owner:
                     _updates.append("owner=%s");           _update_vals.append(meta_owner)
                 if _s_eff != meta_eff:
@@ -219,8 +263,6 @@ def main() -> None:
                     _updates.append("review_date=%s");     _update_vals.append(meta_rev)
                 if _s_status != meta_status:
                     _updates.append("status_override=%s"); _update_vals.append(meta_status)
-                if _s_title != title:
-                    _updates.append("title=%s");           _update_vals.append(title)
                 if _updates:
                     _update_vals.append(doc_id)
                     cur.execute(
@@ -370,14 +412,27 @@ def main() -> None:
 
         if action == "updated":
             cur.execute("DELETE FROM corpus_chunks WHERE doc_id = %s", (doc_id,))
+            # Read current protected fields before overwriting so we can
+            # preserve manually-set title, domain, and content_kind.
+            cur.execute(
+                "SELECT title, domain, content_kind FROM corpus_documents WHERE id = %s",
+                (doc_id,),
+            )
+            _prev = cur.fetchone() or ("", "fire_ops", "procedure")
+            _prev_title, _prev_domain, _prev_ck = (
+                _prev[0] or "", _prev[1] or "", _prev[2] or ""
+            )
+            _write_title  = title        if _should_update_field(_prev_title,  title,        {_filename_derived_title}, _title_from_sidecar)  else _prev_title
+            _write_domain = domain       if _should_update_field(_prev_domain, domain,       {"fire_ops"},               _domain_from_sidecar) else _prev_domain
+            _write_ck     = content_kind if _should_update_field(_prev_ck,     content_kind, {"procedure"},              _ck_from_sidecar)     else _prev_ck
             cur.execute(
                 """UPDATE corpus_documents
                       SET sha256=%s, size_bytes=%s, mtime_utc=%s, mime=%s, title=%s,
                           owner=%s, effective_date=%s, review_date=%s, status_override=%s,
                           domain=%s, content_kind=%s
                     WHERE id=%s""",
-                (sha, size, mtime, mime, title,
-                 meta_owner, meta_eff, meta_rev, meta_status, domain, content_kind, doc_id),
+                (sha, size, mtime, mime, _write_title,
+                 meta_owner, meta_eff, meta_rev, meta_status, _write_domain, _write_ck, doc_id),
             )
         else:
             cur.execute(

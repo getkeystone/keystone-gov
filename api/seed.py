@@ -5,6 +5,7 @@ Do not substitute real agency names without written permission from that agency.
 """
 import uuid
 from datetime import datetime, timezone
+from sqlalchemy import text
 from sqlalchemy.orm import Session as DBSession
 
 from audit import compute_entry_hash
@@ -255,16 +256,10 @@ DEMO_SOURCES = [
 
 def seed_demo_data(db: DBSession) -> None:
     """Idempotent: only seeds if no data exists."""
-    if db.query(User).count() > 0:
+    # Use raw SQL count to avoid selecting password_hash (keystone_app has
+    # column-level SELECT restricted to id, username, role — not password_hash).
+    if db.execute(text("SELECT count(*) FROM users")).scalar() > 0:
         return
-
-    # Demo users
-    users = [
-        User(id=str(uuid.uuid4()), username="demo", role="member", password_hash=hash_password("demo")),
-        User(id=str(uuid.uuid4()), username="officer", role="officer", password_hash=hash_password("officer")),
-        User(id=str(uuid.uuid4()), username="admin", role="authority", password_hash=hash_password("admin")),
-    ]
-    db.add_all(users)
 
     # Documents (source fixtures)
     for src in DEMO_SOURCES:

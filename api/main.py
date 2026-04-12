@@ -1,19 +1,28 @@
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+# ── Structured logging ──────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("keystone.api")
+
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query as QueryParam, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query as QueryParam, Request, Response, UploadFile
 from pydantic import BaseModel
 from cryptography.hazmat.primitives import serialization as _crypto_ser
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -24,16 +33,23 @@ from sqlalchemy.orm import Session as DBSession
 
 from audit import compute_entry_hash, verify_entry, validate_hmac_key
 from auth import verify_password
+from input_sanitizer import check_injection
 from database import Base, SessionLocal, engine, get_db
 from models import AuditEntry, Document, ManagedUser, Query, Session, User, UserManagementEvent
 from schemas import (
+    AssignTaskRequest,
     AuditResponse,
     AuditVerifyResponse,
+    CreateVersionRequest,
+    DismissTaskRequest,
+    DocumentVersionResponse,
     GuidanceResponse,
     LoginRequest,
     LoginResponse,
     QueryRequest,
     QueryResponse,
+    ReviewCommentRequest,
+    ResolveTaskRequest,
     SourceResponse,
 )
 from cf_identity import (
@@ -56,9 +72,12 @@ from ingest_lib import (
 )
 from procedure_parse import parse_procedure, procedure_quality
 from requirements_parse import make_requirements_summary, parse_requirements
+from reranker import rerank_chunks
 from seed import DEMO_QUERIES, seed_demo_data
 from text_clean import clean_lines, make_summary
+import hhem_scorer
 import ollama_client
+from compliance import router as compliance_router
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -72,7 +91,7 @@ _SCENARIO_MIN_LEVEL: dict[str, int] = {
 }
 _ROLE_LEVEL: dict[str, int] = {
     "member": 0,
-    "custodian": 0,
+    "custodian": 1,
     "officer": 1,
     "authority": 2,
 }
@@ -533,6 +552,45 @@ _QUERY_SYNONYMS: dict[str, list[str]] = {
     # ── Structural ─────────────────────────────────────────────────────────────
     'collapse':    ['collapse', 'zone', 'structural'],
     'structural':  ['structural', 'triage', 'collapse'],
+    # ── OHS / Industrial safety ────────────────────────────────────────────────
+    # Abbreviations and common terms from Alberta OHS Code
+    'lel':         ['lel', 'lower explosive limit', 'flammable', 'explosive'],
+    'uel':         ['uel', 'upper explosive limit', 'flammable', 'explosive'],
+    'ppe':         ['ppe', 'personal protective equipment', 'protection'],
+    'oel':         ['oel', 'occupational exposure limit', 'exposure limit'],
+    'twas':        ['twa', 'time weighted average', 'exposure limit'],
+    'twa':         ['twa', 'time weighted average', 'exposure limit'],
+    'stel':        ['stel', 'short term exposure limit', 'exposure limit'],
+    'loto':        ['loto', 'lockout', 'tagout', 'hazardous energy', 'isolation'],
+    'lockout':     ['lockout', 'loto', 'tagout', 'hazardous energy'],
+    'tagout':      ['tagout', 'loto', 'lockout', 'hazardous energy'],
+    'scba':        ['scba', 'self contained breathing', 'breathing apparatus', 'respirator'],
+    'sar':         ['sar', 'supplied air respirator', 'respirator'],
+    'whmis':       ['whmis', 'hazardous materials', 'workplace hazardous'],
+    'sds':         ['sds', 'safety data sheet', 'msds'],
+    'msds':        ['msds', 'material safety data sheet', 'sds'],
+    'h2s':         ['h2s', 'hydrogen sulfide', 'hydrogen sulphide', 'sour gas'],
+    'confined':    ['confined', 'confined space', 'restricted space'],
+    'fall':        ['fall', 'fall protection', 'fall arrest', 'guardrail'],
+    'harness':     ['harness', 'fall arrest', 'full body harness', 'lanyard'],
+    'lanyard':     ['lanyard', 'harness', 'fall arrest'],
+    'guardrail':   ['guardrail', 'guard rail', 'fall protection', 'barrier'],
+    'scaffold':    ['scaffold', 'scaffolding', 'scaffolds', 'platform'],
+    'scaffolding': ['scaffolding', 'scaffold', 'scaffolds', 'platform'],
+    'trench':      ['trench', 'excavation', 'shoring', 'trenching'],
+    'excavation':  ['excavation', 'trench', 'shoring', 'excavating'],
+    'shoring':     ['shoring', 'trench', 'excavation'],
+    'ventilation': ['ventilation', 'ventilating', 'airflow', 'air supply'],
+    'noise':       ['noise', 'hearing', 'decibel', 'dba', 'audiometric'],
+    'hearing':     ['hearing', 'noise', 'decibel', 'audiometric'],
+    'crane':       ['crane', 'hoist', 'rigging', 'lifting'],
+    'hoist':       ['hoist', 'crane', 'rigging', 'lifting'],
+    'rigging':     ['rigging', 'crane', 'hoist', 'sling'],
+    'chemical':    ['chemical', 'hazardous', 'toxic', 'substance'],
+    'hazardous':   ['hazardous', 'chemical', 'toxic', 'dangerous'],
+    'impairment':  ['impairment', 'impaired', 'fitness', 'duty'],
+    'heights':     ['heights', 'height', 'fall protection', 'elevated'],
+    'height':      ['height', 'heights', 'fall protection', 'elevated'],
 }
 
 _EVIDENCE_THRESHOLD = 1
@@ -558,17 +616,14 @@ _SUPPORTED_DOC_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
 # approved guidance.  Prevents unrelated documents from being approved.
 # ---------------------------------------------------------------------------
 
-# Minimum fraction of question tokens that must appear in the excerpt.
-# Example: "cpr electric shock" vs MAYDAY excerpt → 0/3 = 0.0 → refusal.
-#          "MAYDAY procedure"  vs MAYDAY excerpt → 1/2 = 0.5 → approved.
-# Raised from 0.12 to 0.20: long questions now require at least 2 matching
-# tokens instead of 1, preventing single-word coincidences from passing.
-_RELEVANCE_THRESHOLD = 0.20
+# Relevance gate disabled — will be replaced by HHEM hallucination scoring
+# (KDAT-086). Token-overlap caused over-refusal on regulatory text where
+# question vocabulary diverges from statute language.
+# Gate code and _relevance_score function are preserved for future reference.
+_RELEVANCE_THRESHOLD = 0.0
 
-# Tighter threshold applied when an OR-expansion FTS result is being evaluated
-# in operational mode.  OR expansion already signals that no AND match existed;
-# requiring stronger overlap prevents off-domain content from passing.
-_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.30
+# Disabled alongside _RELEVANCE_THRESHOLD (was 0.18).
+_RELEVANCE_THRESHOLD_OR_OPERATIONAL = 0.0
 
 # Multi-answer configuration.
 # Maximum number of distinct-document answers to return (including primary).
@@ -581,12 +636,10 @@ _MULTI_ANSWER_STRONG_THRESHOLD: float = 0.85
 _MULTI_ANSWER_RELATED_THRESHOLD: float = 0.72
 
 # KDAT-064d: Hybrid retrieval weights.
-# FTS is weighted higher because exact-term matching is authoritative for
-# procedure names, equipment codes, and LRFD-specific terminology.
-# Vector search adds semantic recall for paraphrased queries and near-miss
-# vocabulary where the author used different words than the questioner.
-_HYBRID_W_FTS     = 0.60   # FTS normalized score weight
-_HYBRID_W_VEC     = 0.40   # vector cosine similarity weight
+# Equal weight — regulatory text benefits from semantic matching alongside
+# keyword matching (was 60/40 FTS/vector).
+_HYBRID_W_FTS     = 0.50   # FTS normalized score weight
+_HYBRID_W_VEC     = 0.50   # vector cosine similarity weight
 # Minimum raw cosine similarity for a vector row to participate in the merge.
 # Rows below this floor are dropped before normalization so that a batch of
 # uniformly low-similarity results cannot inflate after min-max scaling and
@@ -598,18 +651,26 @@ _HYBRID_VEC_FLOOR = 0.20
 # The LLM is called AFTER all policy gates pass and sees only ACL-filtered,
 # status-filtered, reranked chunks.  It never runs on refused queries.
 _LLM_SYSTEM_PROMPT = (
-    "You are an operational procedure assistant for a fire department. "
+    "You are a safety procedure assistant. "
     "Answer the question using ONLY the evidence provided below. "
-    "Do not use any other knowledge.\n\n"
+    "Do not use any prior knowledge.\n\n"
     "Rules:\n"
-    "- Cite the source document name and page for each claim\n"
-    "- If the evidence does not contain enough information, say "
-    "\"The available evidence does not fully address this question\"\n"
-    "- Keep the answer concise and actionable\n"
-    "- Use clear, direct language appropriate for emergency responders\n"
-    "- Do not speculate or add information beyond the evidence\n"
-    "- If the evidence contains numbered steps, preserve the step "
-    "numbers in your answer"
+    "- State the answer directly and concisely. Do not add a disclaimer or "
+    "preamble when the evidence supports a clear answer.\n"
+    "- Every factual claim must cite the source document title and page.\n"
+    "- If the evidence contains numbered steps, preserve the step numbers and order.\n"
+    "- The evidence may come from regulatory explanation guides, training manuals, "
+    "codes of practice, or safety supplements. All of these are valid sources. "
+    "Regulatory explanation guides explain legal requirements through commentary "
+    "and examples — extract the concrete requirements from them.\n"
+    "- If the evidence discusses the topic but uses indirect or formal language, "
+    "extract and state the relevant requirements clearly. Do not hedge when the "
+    "evidence contains information that answers the question, even partially.\n"
+    "- Only say \"The available evidence does not address this question.\" when "
+    "the evidence is truly about a completely different topic and contains NO "
+    "information relevant to the question.\n"
+    "- Do not speculate or add information beyond the evidence.\n"
+    "- Use clear, direct language appropriate for workplace safety."
 )
 
 
@@ -626,6 +687,41 @@ def _build_evidence_pack(top5_rows: list) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _validate_llm_output(answer: str, evidence_titles: list[str]) -> str:
+    """
+    Basic output validation: check that the LLM didn't
+    fabricate document references not in the evidence pack.
+    This is a lightweight check, not a full citation parser.
+    """
+    # If the answer mentions phrases that suggest injection got through,
+    # return a safe fail-closed response instead.
+    injection_signals = [
+        'all documents in', 'list of documents',
+        'here are the documents', 'document titles:',
+        'i have access to', 'my instructions',
+        'system prompt', 'i was told to',
+    ]
+    answer_lower = answer.lower()
+    for signal in injection_signals:
+        if signal in answer_lower:
+            logger.warning("LLM output injection signal detected: %r", signal)
+            return ("The available evidence does not fully address "
+                    "this question.")
+    # Warn if the response mentions document titles not in the evidence pack.
+    # This can indicate hallucination or corpus leakage; does not block the response.
+    if evidence_titles:
+        evidence_titles_lower = {t.lower() for t in evidence_titles}
+        # Look for quoted or bracketed strings that look like document titles
+        import re as _re
+        cited = _re.findall(r'\[Source:\s*([^\],]+)', answer) + _re.findall(r'"([^"]{10,80})"', answer)
+        for title in cited:
+            if title.strip().lower() not in evidence_titles_lower:
+                logger.warning(
+                    "LLM output references title not in evidence pack: %r", title[:120]
+                )
+    return answer
+
+
 def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     """Attempt LLM synthesis from evidence pack.  Mutates guidance in-place.
 
@@ -636,12 +732,23 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
       guidance["confidence"]["gen_latency_ms"]  — wall-clock ms for generate()
       guidance["confidence"]["evidence_titles"] — titles of chunks fed to LLM
     """
+    from input_sanitizer import sanitize_query_for_llm
     evidence = _build_evidence_pack(top5)
-    user_prompt = f"Question: {question}\n\nEvidence:\n{evidence}"
+    safe_question = sanitize_query_for_llm(question)
+    user_prompt = (
+        "[USER QUESTION]\n"
+        f"{safe_question}\n"
+        "[/USER QUESTION]\n\n"
+        "[EVIDENCE FROM APPROVED DOCUMENTS]\n"
+        f"{evidence}\n"
+        "[/EVIDENCE FROM APPROVED DOCUMENTS]"
+    )
     t0 = time.monotonic()
     answer = ollama_client.generate(_LLM_SYSTEM_PROMPT, user_prompt)
     gen_ms = int((time.monotonic() - t0) * 1000)
+    evidence_titles = [row[1] for row in top5]
     if answer:
+        answer = _validate_llm_output(answer, evidence_titles)
         guidance["answer"] = answer
         guidance["answer_source"] = "llm"
     else:
@@ -650,7 +757,41 @@ def _add_llm_answer(guidance: dict, question: str, top5: list) -> None:
     conf = guidance.setdefault("confidence", {})
     conf["gen_model"]       = ollama_client.GEN_MODEL
     conf["gen_latency_ms"]  = gen_ms
-    conf["evidence_titles"] = [row[1] for row in top5]
+    conf["evidence_titles"] = evidence_titles
+
+
+_LLM_HEDGE_PHRASES = [
+    "does not address this question",
+    "does not fully address this question",
+    "does not address the specific",
+    "does not directly address",
+    "does not contain relevant information",
+    "cannot be answered from the evidence",
+    "no relevant information",
+    "cannot find any relevant",
+    "not relevant to",
+    "the evidence does not",
+    "no information about",
+    "the provided evidence does not",
+]
+
+_LLM_REFUSAL_ON_HEDGE = {
+    "type": "refusal",
+    "reasonCode": "INSUFFICIENT_EVIDENCE",
+    "title": "No relevant guidance found",
+    "message": (
+        "The available documents do not contain relevant guidance for this question. "
+        "Ask about a specific safety procedure, regulation, or hazard covered in the corpus."
+    ),
+    "safeNextStep": "Consult your supervisor or safety officer for guidance outside the corpus.",
+    "hiddenSource": False,
+}
+
+
+def _llm_hedges(answer: str) -> bool:
+    """Return True if the LLM answer signals that the evidence is irrelevant."""
+    lower = answer.lower()
+    return any(phrase in lower for phrase in _LLM_HEDGE_PHRASES)
 
 
 _NO_RELEVANT_PROCEDURE_REFUSAL = {
@@ -1052,8 +1193,12 @@ def _corpus_fts_retrieve(
             db.rollback()
             _vec_rows = []
 
+    # When OR-expansion fires, FTS results are noisy (AND matched nothing);
+    # vector search is the more reliable signal in that case.
+    _w_fts = 0.30 if _used_or_fts else _HYBRID_W_FTS
+    _w_vec = 0.70 if _used_or_fts else _HYBRID_W_VEC
     rows, _retrieval_source = _hybrid_merge(
-        rows, _vec_rows, _HYBRID_W_FTS, _HYBRID_W_VEC, _HYBRID_VEC_FLOOR
+        rows, _vec_rows, _w_fts, _w_vec, _HYBRID_VEC_FLOOR
     )
     # ── End hybrid block ──────────────────────────────────────────────────────
 
@@ -1120,157 +1265,24 @@ def _corpus_fts_retrieve(
         db.rollback()
         _content_kind_map = {}
 
-    # Rerank: penalize TOC/front-matter chunks, boost procedural content.
-    # Procedure-kind docs receive a mild ×1.15 boost on the default path
-    # (before any intent-specific secondary sort overrides this ranking).
-    reranked = sorted(
-        rows,
-        key=lambda r: _rerank_score(r[2], r[3], r[4]) * (
-            1.15 if _content_kind_map.get(r[0], "procedure") == "procedure" else 1.0
-        ),
-        reverse=True,
-    )
-
-    # Intent-based secondary rerank: if the question is about treating an
-    # electric-shock victim (electrical_injury intent), penalize AED shock-
-    # delivery chunks and boost electrical-injury treatment chunks so that
-    # CPR/first-aid content ranks above AED-operation content.
-    if _ELECTRICAL_INJURY_INTENT.search(question):
-        def _intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            base = _rerank_score(ci, txt, rank)
-            if _AED_DELIVERY_MARKERS.search(txt):
-                base *= 0.25  # penalize AED shock-delivery content
-            if _ELECTRICAL_INJURY_MARKERS.search(txt):
-                base *= 1.60  # boost electrical-injury treatment content
-            return base
-        reranked = sorted(rows, key=_intent_score, reverse=True)
-
-    # CPR intent: boost chunks with CPR procedure keywords; penalize MAYDAY/fire-ops chunks
-    # that match on "shock" or "rescue" but are not about CPR.
-    if _CPR_INTENT.search(question):
-        def _cpr_intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            base = _rerank_score(ci, txt, rank)
-            if _CPR_PROCEDURE_MARKERS.search(txt):
-                base *= 2.0   # strong boost for CPR procedure content
-            if _MAYDAY_CONTENT_MARKERS.search(txt) and not _CPR_PROCEDURE_MARKERS.search(txt):
-                base *= 0.15  # penalize MAYDAY content without CPR keywords
-            return base
-        reranked = sorted(reranked, key=_cpr_intent_score, reverse=True)
-
-        # Must-have gate: if the top candidate has no CPR keywords, scan the
-        # candidate pool for any chunk that does and promote it.
-        if not _CPR_PROCEDURE_MARKERS.search(reranked[0][3]):
-            cpr_hits = [r for r in reranked if _CPR_PROCEDURE_MARKERS.search(r[3])]
-            if cpr_hits:
-                reranked = cpr_hits + [r for r in reranked if r not in cpr_hits]
-
-    # Requirements intent: detect and promote spec-data chunks; penalize
-    # pointer-only and caution-list chunks.
-    #
-    # Signals applied (cumulative):
-    #   HEADING + SPEC DATA   → ×2.0  (authoritative spec section w/ numeric data)
-    #   HEADING only          → ×1.35 (may be a safety-intro heading — mild boost)
-    #   SPEC DATA only        → ×1.50 + digit-density penalty bypassed
-    #   POINTER, no SPEC DATA → ×0.20 (chunk redirects; actual data is elsewhere)
-    #   CAUTION ≥2, no SPEC   → ×0.30 (pure warning list matched on "require")
-    #
-    # For SPEC DATA chunks the digit-density penalty in _rerank_score is
-    # intentionally skipped so that numeric spec lists (41 amps, 60 amps,
-    # 12 VDC …) are not demoted by the TOC/front-matter digit guard.
-    if _REQUIREMENTS_INTENT.search(question):
-        def _req_intent_score(row: tuple) -> float:
-            _ri, _ti, ci, txt, rank, _pg, _dom = row
-            has_spec = bool(_SPEC_DATA_SIGNAL.search(txt))
-            # Count spec-data lines to detect a spec table.
-            n_spec_lines = len([l for l in txt.split("\n") if _SPEC_DATA_SIGNAL.search(l)])
-            spec_table = n_spec_lines >= 3
-            # Score selection:
-            #   spec table  → skip front-matter AND digit-density penalties
-            #   spec data   → skip digit-density penalty only
-            #   plain chunk → standard scorer
-            if spec_table:
-                base = _rerank_score_spec_table(ci, txt, rank)
-            elif has_spec:
-                base = _rerank_score_no_digit_penalty(ci, txt, rank)
-            else:
-                base = _rerank_score(ci, txt, rank)
-            has_heading = bool(_REQUIREMENTS_HEADING_SIGNAL.search(txt))
-            if has_heading and has_spec:
-                base *= 1.70  # heading + spec: good signal but not stronger than
-                              # a spec-dense chunk where the REQUIREMENTS text IS
-                              # the content (not an intro section that contains a
-                              # spec table mid-chunk alongside other topics)
-            elif has_heading:
-                base *= 1.35  # heading alone (could be a safety-section title)
-            elif has_spec:
-                base *= 1.50  # numeric spec data without a heading still valuable
-            caution_count = len(_SAFETY_CAUTION_DENSE.findall(txt))
-            if caution_count >= 2 and not has_spec:
-                base *= 0.30  # penalize pure caution/warning lists
-            if _POINTER_SIGNAL.search(txt) and not has_spec:
-                base *= 0.20  # strongly penalize redirect-only chunks
-            # Strong boost for chunks where spec data is stated inline as
-            # "requires 41 amps" / "requires 60 amps" — the primary-purpose
-            # spec section format.  Chunks that embed a spec table inside a
-            # CAUTION block use tabular notation ("2001 12 VDC 41") and
-            # produce zero matches here, so they do NOT receive this boost.
-            n_explicit = len(_EXPLICIT_REQUIRES_SPEC.findall(txt))
-            if n_explicit > 0:
-                base *= 1.0 + min(n_explicit * 2.0, 8.0)
-            # content_kind boost: docs tagged 'requirements' in corpus metadata
-            # receive a ×1.35 multiplier to prefer authoritative spec sections
-            # when the operator has explicitly labelled the document.
-            if _content_kind_map.get(_ri, "procedure") == "requirements":
-                base *= 1.35
-            return base
-
-        reranked = sorted(reranked, key=_req_intent_score, reverse=True)
-
-        # Spec-data document fallback: if the top candidate has pointer
-        # language ("Refer to Section X") — regardless of whether it also has
-        # some embedded spec data — query the same matched documents for a
-        # chunk where spec data is the primary content.  Also triggers for
-        # spec-less, caution-dense top candidates.
-        # A pointer chunk always redirects; the real spec section is elsewhere.
-        _top_has_spec = bool(_SPEC_DATA_SIGNAL.search(reranked[0][3]))
-        _top_is_pointer = bool(_POINTER_SIGNAL.search(reranked[0][3]))
-        _top_cautions = len(_SAFETY_CAUTION_DENSE.findall(reranked[0][3]))
-        if _top_is_pointer or (not _top_has_spec and _top_cautions >= 2):
-            _req_docs = list({r[0] for r in reranked[:8]})
-            try:
-                _spec_rows = db.execute(
-                    text("""
-                        SELECT cd.rel_path, cd.title, cc.chunk_index, cc.text,
-                               CAST(0.001 AS FLOAT) AS rank, cc.page, cd.domain
-                        FROM corpus_chunks cc
-                        JOIN corpus_documents cd ON cd.id = cc.doc_id
-                        WHERE cd.rel_path = ANY(:docs)
-                          AND (   cc.text ~* '[0-9]+[[:space:]]*(amps?|vdc|vac|psi|gpm|kPa)'
-                               OR cc.text ~* 'minimum[[:space:]]+(?:service|flow|pressure)'
-                               OR cc.text ~* 'requires?[[:space:]]+[0-9]+[[:space:]]*(amps?|vdc|psi|gpm)')
-                        ORDER BY cd.rel_path, cc.chunk_index ASC
-                        LIMIT 80
-                    """),
-                    {"docs": _req_docs},
-                ).fetchall()
-            except Exception:
-                db.rollback()
-                _spec_rows = []
-            if _spec_rows:
-                _spec_reranked = sorted(
-                    _spec_rows,
-                    key=lambda r: _req_intent_score(r),
-                    reverse=True,
-                )
-                _existing_keys = {(r[0], r[2]) for r in reranked}
-                _new_spec = [
-                    r for r in _spec_reranked
-                    if (r[0], r[2]) not in _existing_keys
-                ]
-                if _new_spec:
-                    reranked = _new_spec + list(reranked)
+    # ── Rerank: generic quality filter before LLM evidence pack ──────────────
+    # LRFD-specific reranker removed in dev/keystone-next.
+    # See feature/pilot-enhancements for original fire-service intent detection
+    # (electrical_injury, CPR, MAYDAY, requirements), domain routing, and
+    # synonym boosting.
+    _chunk_dicts = [
+        {
+            'rel_path': r[0], 'title': r[1], 'chunk_index': r[2],
+            'text': r[3], 'score': r[4], 'page': r[5], 'domain': r[6],
+        }
+        for r in rows
+    ]
+    _reranked_dicts = rerank_chunks(_chunk_dicts, question, top_k=len(rows))
+    reranked = [
+        (d['rel_path'], d['title'], d['chunk_index'], d['text'],
+         d['score'], d['page'], d['domain'])
+        for d in _reranked_dicts
+    ]
 
     top_rel, top_title, top_chunk, top_text, _fts_rank, top_page, _top_domain = reranked[0]
     _top_content_kind: str = _content_kind_map.get(top_rel, "procedure")
@@ -1313,10 +1325,10 @@ def _corpus_fts_retrieve(
                     _top_domain = db.execute(
                         text("SELECT domain FROM corpus_documents WHERE rel_path = :rel"),
                         {"rel": top_rel},
-                    ).scalar() or "fire_ops"
+                    ).scalar() or "general"
                 except Exception:
                     db.rollback()
-                    _top_domain = "fire_ops"
+                    _top_domain = "general"
                 _top_content_kind = _content_kind_map.get(top_rel, "procedure")
                 _used_fallback = True
                 _fts_rank = _BASE
@@ -1506,6 +1518,8 @@ def _corpus_fts_retrieve(
     if _used_fallback:
         _reason_parts.append(f"document fallback (initial top was TOC-like)")
     _reason_parts.append(f"FTS rank {_fts_rank:.4f}; rerank {_rerank_val:.4f}")
+    if _reranked_dicts:
+        _reason_parts.append(_reranked_dicts[0].get('rerank_reason', ''))
 
     # ── Prompt 3: Apply procedure quality decision ────────────────────────────
     _pq_notice: str | None = None
@@ -1555,73 +1569,36 @@ def _corpus_fts_retrieve(
             or (_req_evidence is not None and _req_evidence["spec_table_like"])
         )
     )
-    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] in ("weak", "reject") and not _is_spec_answer:
+    # dev/keystone-next: loosened from ("weak", "reject") → "reject" only.
+    # "weak" quality is normal for a general procedure corpus; refusing on it
+    # is too aggressive outside the LRFD fire-service context.  KDAT-086.
+    if mode == "operational" and _top_domain != "medical_emr" and _pq["decision"] == "reject" and not _is_spec_answer:
         return {
             "type": "refusal",
             "reasonCode": "LOW_CONFIDENCE",
-            "title": "Reference material found — not an approved LRFD protocol",
+            "title": "Reference material found — not an approved departmental procedure",
             "message": (
-                "Reference material was found but could not be confirmed as an approved LRFD procedure. "
+                "Reference material was found but could not be confirmed as an approved departmental procedure. "
                 "The matched content did not have sufficient procedural structure for operational use."
             ),
-            "safeNextStep": "Consult your training officer or supervisor for the current approved protocol.",
+            "safeNextStep": "Consult your supervisor for the current approved procedure.",
             "hiddenSource": False,
         }, "refused", [], []
 
     # ── Policy gate A2: operational scope guard ───────────────────────────────
-    # Enforce that operational queries retrieve the correct content_kind.
-    #
-    # Case 1: requirements-intent question but top doc is NOT content_kind=requirements
-    #         → refuse; user should check requirements corpus.
-    # Case 2: top doc IS content_kind=requirements but question has NO requirements
-    #         intent → refuse with hint to rephrase using requirements wording.
-    #
-    # Neither check fires for medical_emr (Gate B handles that path) or spec
-    # answers where the text itself contains spec data despite content_kind.
+    # DISABLED for dev/keystone-next: LRFD content_kind guard.
+    # All 85 docs in the dev corpus are content_kind='procedure'; there is no
+    # requirements corpus, so this gate produces only false refusals.
+    # Re-enable when content_kind taxonomy is implemented for the target
+    # corpus.  See KDAT-086 notes.
     _has_req_intent = bool(_REQUIREMENTS_INTENT.search(question))
-    if mode == "operational" and _top_domain != "medical_emr":
-        if _has_req_intent and _top_content_kind != "requirements" and not _is_spec_answer:
-            return {
-                "type": "refusal",
-                "reasonCode": "NO_REQUIREMENTS_FOUND",
-                "title": "No requirements document found",
-                "message": (
-                    "Your question asks for specifications or requirements, but no "
-                    "requirements document matched. The closest match is a procedure "
-                    "document which may not contain the data you need."
-                ),
-                "safeNextStep": (
-                    "Check the requirements section of the corpus or consult the "
-                    "apparatus manufacturer documentation."
-                ),
-                "hiddenSource": False,
-            }, "refused", [], []
-        if not _has_req_intent and _top_content_kind == "requirements" and not _is_spec_answer:
-            return {
-                "type": "refusal",
-                "reasonCode": "LOW_CONFIDENCE",
-                "title": "Low confidence — guidance withheld",
-                "message": (
-                    "The best matching document is a requirements/specifications sheet, "
-                    "not an operational procedure. If you need electrical or installation "
-                    "requirements, try rephrasing with requirements wording "
-                    "(e.g. 'What are the electrical requirements for …')."
-                ),
-                "safeNextStep": "Consult your supervisor or training officer for the current procedure.",
-                "hiddenSource": False,
-            }, "refused", [], []
 
     # ── Policy gate B: medical_emr domain → medical_reference card ──────────
-    # Operational/training queries that retrieve medical_emr documents are
-    # allowed during the pilot but must never show as "Approved Guidance".
-    # They are returned as type="medical_reference" — a distinct card type
-    # that carries a hard banner and no "approved" label.
-    # Exception: operational + "reject" quality only → fail-closed LOW_CONFIDENCE_MEDICAL.
-    # "Weak" quality is NOT refused here because EMR textbooks are narrative/
-    # explanatory prose; the procedure parser rates them as "weak" even when
-    # they contain directly relevant medical guidance.  The relevance gate
-    # (above) already ensures off-topic content is withheld.
-    if _top_domain == "medical_emr" and mode != "medical_reference":
+    # DISABLED for dev/keystone-next: no medical_emr documents exist in the
+    # dev corpus.  This gate can never fire and its card-type conversion would
+    # shadow future procedure results if a stale domain tag slipped through.
+    # Re-enable when a medical_emr sub-corpus is ingested.  See KDAT-086.
+    if False and _top_domain == "medical_emr" and mode != "medical_reference":
         # RC1 fix: OR expansion in non-medical modes is off-domain leakage.
         # AND-matched EMR content in training/operational is still allowed through
         # (e.g. a fire-ops query that genuinely AND-matches an EMR document).
@@ -1644,16 +1621,16 @@ def _corpus_fts_retrieve(
                     "Imprecise medical guidance could cause harm — this result has been withheld."
                 ),
                 "safeNextStep": (
-                    "Contact medical control or your Medical Director for guidance. "
+                    "Contact your safety officer or supervisor for guidance. "
                     "Do not act on unverified medical information."
                 ),
                 "hiddenSource": False,
             }, "refused", [], []
         # Allowed — build a medical_reference guidance card (not "approved").
         _emr_disclaimer = (
-            "Reference material found — NOT an approved LRFD protocol. "
-            "This is EMR reference content only. "
-            "Follow medical control direction and your agency's standing orders."
+            "Reference material found — NOT an approved departmental procedure. "
+            "This is medical reference content only. "
+            "Follow your organization's protocols and the direction of qualified medical personnel."
         )
         top5 = reranked[:5]
         medref_sources = [
@@ -1722,6 +1699,46 @@ def _corpus_fts_retrieve(
         if _medref_answers:
             medref_guidance["answers"] = _medref_answers
         _add_llm_answer(medref_guidance, question, top5)
+        # Targeted hedge-only refusal: if the LLM produced ONLY a hedge
+        # phrase with no substantive content, convert to refusal.
+        # This catches off-topic queries where the LLM correctly refuses
+        # but the pipeline still marks "approved."
+        # Full hedge gate disabled pending HHEM (KDAT-086).
+        _medref_answer = medref_guidance.get("answer", "")
+        if _medref_answer and _llm_hedges(_medref_answer) and len(_medref_answer.strip()) < 120:
+            # Check if the retrieved content is actually relevant to the query
+            # before falling back to deterministic. Off-topic queries should
+            # still be refused even when the LLM hedges.
+            _query_terms = {
+                w for w in re.findall(r'[a-z0-9]+', question.lower())
+                if len(w) > 2 and w not in {'the', 'what', 'how', 'are', 'for',
+                    'does', 'with', 'from', 'this', 'that', 'which', 'when',
+                    'where', 'who', 'whom', 'have', 'has', 'had', 'was', 'were',
+                    'been', 'being', 'will', 'would', 'could', 'should', 'can',
+                    'may', 'might', 'shall', 'must', 'need', 'required'}
+            }
+            _top_text_lower = medref_guidance.get("summary", "").lower()
+            _top_title_lower = medref_guidance.get("document", {}).get("title", "").lower()
+            # Also check the top chunk text for term overlap
+            _top_chunk_text = ""
+            if top5:
+                _top_chunk_text = top5[0][3].lower()[:500]  # top5 row[3] is chunk text
+            _combined = _top_text_lower + " " + _top_title_lower + " " + _top_chunk_text
+            _term_hits = sum(1 for t in _query_terms if t in _combined)
+
+            if _term_hits >= 2:
+                logger.info(
+                    "LLM hedge-only answer detected (%d chars, %d term hits) — falling back to deterministic",
+                    len(_medref_answer.strip()), _term_hits,
+                )
+                medref_guidance["answer"] = medref_guidance.get("summary", "")
+                medref_guidance["answer_source"] = "deterministic"
+            else:
+                logger.info(
+                    "LLM hedge-only answer detected (%d chars, %d term hits) — refusing (low relevance)",
+                    len(_medref_answer.strip()), _term_hits,
+                )
+                return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
         return medref_guidance, "allowed", medref_sources, medref_citations
 
     # ── Policy gate C: medical_reference mode → reference card ───────────────
@@ -1735,12 +1752,12 @@ def _corpus_fts_retrieve(
                 "reasonCode": "NO_RELEVANT_PROCEDURE",
                 "title": "No medical reference document found",
                 "message": "No medical EMR document matched your question.",
-                "safeNextStep": "Use approved medical protocols or medical control.",
+                "safeNextStep": "Use your organization's approved medical or emergency protocols.",
                 "hiddenSource": False,
             }, "refused", [], []
         _emr_disclaimer = (
-            "Reference material found — NOT an approved operational protocol. "
-            "Follow your agency's standing orders and medical director guidance."
+            "Reference material found — NOT an approved operational procedure. "
+            "Follow your organization's protocols and the direction of qualified medical personnel."
         )
         top5 = reranked[:5]
         ref_sources = [
@@ -1949,6 +1966,86 @@ def _corpus_fts_retrieve(
     if _multi_answers:
         guidance["answers"] = _multi_answers
     _add_llm_answer(guidance, question, top5)
+
+    # ── Stage 4: HHEM hallucination trust check (KDAT-086) ───────────────────
+    _llm_answer = guidance.get("answer", "")
+
+    # Targeted hedge-only refusal: if the LLM produced ONLY a hedge
+    # phrase with no substantive content, convert to refusal.
+    # This catches off-topic queries where the LLM correctly refuses
+    # but the pipeline still marks "approved."
+    # Full hedge gate disabled pending HHEM (KDAT-086).
+    if _llm_answer and _llm_hedges(_llm_answer) and len(_llm_answer.strip()) < _HEDGE_ONLY_MIN_CHARS:
+        # Check if the retrieved content is actually relevant to the query
+        # before falling back to deterministic. Off-topic queries should
+        # still be refused even when the LLM hedges.
+        _query_terms = {
+            w for w in re.findall(r'[a-z0-9]+', question.lower())
+            if len(w) > 2 and w not in {'the', 'what', 'how', 'are', 'for',
+                'does', 'with', 'from', 'this', 'that', 'which', 'when',
+                'where', 'who', 'whom', 'have', 'has', 'had', 'was', 'were',
+                'been', 'being', 'will', 'would', 'could', 'should', 'can',
+                'may', 'might', 'shall', 'must', 'need', 'required'}
+        }
+        _top_text_lower = guidance.get("summary", "").lower()
+        _top_title_lower = guidance.get("document", {}).get("title", "").lower()
+        # Also check the top chunk text for term overlap
+        _top_chunk_text = ""
+        if top5:
+            _top_chunk_text = top5[0][3].lower()[:500]  # top5 row[3] is chunk text
+        _combined = _top_text_lower + " " + _top_title_lower + " " + _top_chunk_text
+        _term_hits = sum(1 for t in _query_terms if t in _combined)
+
+        if _term_hits >= _HEDGE_ONLY_TERM_HITS:
+            logger.info(
+                "LLM hedge-only answer detected (%d chars, %d term hits) — falling back to deterministic",
+                len(_llm_answer.strip()), _term_hits,
+            )
+            guidance["answer"] = guidance.get("summary", "")
+            guidance["answer_source"] = "deterministic"
+            _llm_answer = guidance["answer"]
+        else:
+            logger.info(
+                "LLM hedge-only answer detected (%d chars, %d term hits) — refusing (low relevance)",
+                len(_llm_answer.strip()), _term_hits,
+            )
+            return {**_LLM_REFUSAL_ON_HEDGE}, "refused", [], []
+
+    if _llm_answer:
+        _premise = _build_evidence_pack(top5)
+        _hhem_score = hhem_scorer.score(_premise, _llm_answer)
+        _answer_source = guidance.get("answer_source", "llm")
+        _hhem_threshold = hhem_scorer.get_threshold(_answer_source)
+        guidance["factual_consistency_score"] = _hhem_score
+        logger.info(
+            "[keystone] HHEM score=%.4f threshold=%.2f answer_source=%s query_snippet=%r",
+            _hhem_score if _hhem_score is not None else -1.0,
+            _hhem_threshold,
+            _answer_source,
+            question[:80],
+        )
+        if _hhem_score is not None and _hhem_score < _hhem_threshold:
+            logger.info(
+                "[keystone] HHEM below threshold (%.4f < %.2f) answer_source=%s — LOW_FACTUAL_CONSISTENCY refusal",
+                _hhem_score,
+                _hhem_threshold,
+                _answer_source,
+            )
+            return {
+                "type": "refusal",
+                "reasonCode": "LOW_FACTUAL_CONSISTENCY",
+                "title": "Answer withheld — factual consistency check failed",
+                "message": (
+                    "The generated answer could not be verified against the source documents. "
+                    "The content may not accurately reflect the retrieved procedures."
+                ),
+                "safeNextStep": "Consult the source documents directly or contact your supervisor.",
+                "hiddenSource": False,
+                "factual_consistency_score": _hhem_score,
+            }, "refused", [], []
+    else:
+        guidance["factual_consistency_score"] = None
+
     return guidance, "allowed", sources, citations
 
 
@@ -2111,6 +2208,42 @@ _PUBLIC_ALLOW_DECISIONS = int(os.environ.get("PUBLIC_ALLOW_DECISIONS", "1"))
 _PUBLIC_DEMO_RESET_TOKEN: str = os.environ.get("PUBLIC_DEMO_RESET_TOKEN", "").strip()
 _PUBLIC_DEMO_RETENTION_HOURS: int = int(os.environ.get("PUBLIC_DEMO_RETENTION_HOURS", "24"))
 
+# ---------------------------------------------------------------------------
+# Per-deployment quality gate parameters
+# Defaults match the hardcoded values that were previously inline.
+# Override via deployment.yaml quality_gates section.
+# ---------------------------------------------------------------------------
+
+# Hedge-only refusal gate: if the LLM answer is both a hedge phrase AND shorter
+# than this limit, check term overlap before deciding to refuse or fall back.
+_HEDGE_ONLY_MIN_CHARS: int = 120
+
+# Minimum number of query terms that must appear in the top evidence before
+# falling back to deterministic instead of refusing.
+_HEDGE_ONLY_TERM_HITS: int = 2
+
+
+def _apply_quality_gates() -> None:
+    """Read quality_gates from deployment.yaml and apply overrides at startup."""
+    global _HEDGE_ONLY_MIN_CHARS, _HEDGE_ONLY_TERM_HITS
+    from deployment_config import CONFIG
+    gates = CONFIG.get("quality_gates", {})
+    if not gates:
+        return
+    if "hhem_threshold_llm" in gates:
+        hhem_scorer.configure(llm_threshold=float(gates["hhem_threshold_llm"]))
+    if "hhem_threshold_deterministic" in gates:
+        hhem_scorer.configure(deterministic_threshold=float(gates["hhem_threshold_deterministic"]))
+    if "hedge_only_min_chars" in gates:
+        _HEDGE_ONLY_MIN_CHARS = int(gates["hedge_only_min_chars"])
+        logger.info("[keystone] quality_gates: hedge_only_min_chars=%d", _HEDGE_ONLY_MIN_CHARS)
+    if "hedge_only_term_hits" in gates:
+        _HEDGE_ONLY_TERM_HITS = int(gates["hedge_only_term_hits"])
+        logger.info("[keystone] quality_gates: hedge_only_term_hits=%d", _HEDGE_ONLY_TERM_HITS)
+
+
+_apply_quality_gates()
+
 
 # ---------------------------------------------------------------------------
 # Evidence signing (Ed25519) — loaded once at startup
@@ -2164,7 +2297,8 @@ async def lifespan(app: FastAPI):
         Base.metadata.create_all(bind=engine)
         db = SessionLocal()
         try:
-            seed_demo_data(db)
+            if os.environ.get("SEED_DEMO_USERS", "").lower() == "true":
+                seed_demo_data(db)
         finally:
             db.close()
         _db_ready = True
@@ -2183,18 +2317,144 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[startup] seed_managed_users failed: {exc}", file=sys.stderr, flush=True)
     validate_hmac_key()
+    # ── Startup security warnings ────────────────────────────────────────────
+    _salt_val = os.environ.get("AUTH_PASSWORD_SALT", "")
+    if not _salt_val or _salt_val == "dev-salt-change-me":
+        logger.warning(
+            "SECURITY WARNING: AUTH_PASSWORD_SALT is not set or uses the insecure default "
+            "'dev-salt-change-me'. All password hashes use a known salt - set this env "
+            "var to a 32+ character random value before exposing this API publicly."
+        )
+    elif len(_salt_val) < 16:
+        logger.warning(
+            "SECURITY WARNING: AUTH_PASSWORD_SALT is too short (%d chars). "
+            "Use at least 32 random characters for production deployments.",
+            len(_salt_val),
+        )
     yield
 
 
 app = FastAPI(title="Keystone Gov API", version="0.2.0", lifespan=lifespan)
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# allow_credentials=False: API uses Bearer tokens in the Authorization header,
+# not cookies, so credentials mode is not needed.  The wildcard origin is safe
+# when credentials=False (no cross-origin cookie leakage).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+# Adds defensive HTTP headers to every response.  CSP and HSTS are handled
+# by Cloudflare/Caddy upstream; Cache-Control, XCTO, and XFO are set here.
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # API responses must not be cached by intermediaries.
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Global exception handlers — prevent internal detail leakage
+# ---------------------------------------------------------------------------
+# All HTTPExceptions with status >= 500 log the detail server-side but return
+# a generic message to the client.  Unhandled exceptions are also caught.
+
+@app.exception_handler(HTTPException)
+async def sanitised_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        # Log full detail server-side; return only a generic message to the client.
+        logger.error(
+            "HTTP %d at %s %s: %s",
+            exc.status_code, request.method, request.url.path, exc.detail,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": "An internal server error occurred."},
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception at %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred."},
+    )
+
+
+# ── Compliance router ─────────────────────────────────────────────────────────
+app.include_router(compliance_router)
+
+
+# ---------------------------------------------------------------------------
+# In-memory rate limiters
+# ---------------------------------------------------------------------------
+# Simple sliding-window counters.  Process-local only; acceptable for a
+# single-process deployment.  Not shared across workers.
+
+# Login rate limiter: 5 attempts per IP per 60 seconds.
+_LOGIN_RATE_LIMIT  = 5
+_LOGIN_RATE_WINDOW = 60  # seconds
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _check_login_rate_limit(ip: str) -> None:
+    """Raise 429 if the IP has exceeded the login attempt threshold."""
+    now = time.time()
+    with _login_lock:
+        window = _login_attempts.get(ip, [])
+        window = [t for t in window if now - t < _LOGIN_RATE_WINDOW]
+        if len(window) >= _LOGIN_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts. Please wait before trying again.",
+            )
+        window.append(now)
+        _login_attempts[ip] = window
+
+
+# Query rate limiter: 20 queries per session token per 60 seconds.
+_QUERY_RATE_LIMIT  = int(os.environ.get("QUERY_RATE_LIMIT", "20"))
+_QUERY_RATE_WINDOW = 60  # seconds
+_query_attempts: dict[str, list[float]] = {}
+_query_lock = threading.Lock()
+
+
+def _check_query_rate_limit(token: str) -> None:
+    """Raise 429 if the session token has exceeded the query threshold."""
+    now = time.time()
+    with _query_lock:
+        window = _query_attempts.get(token, [])
+        window = [t for t in window if now - t < _QUERY_RATE_WINDOW]
+        if len(window) >= _QUERY_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Query rate limit exceeded. Please wait before submitting again.",
+            )
+        window.append(now)
+        _query_attempts[token] = window
 
 
 # ---------------------------------------------------------------------------
@@ -2212,9 +2472,6 @@ app.add_middleware(
 #   - POST /decisions/*      (if PUBLIC_ALLOW_DECISIONS=1, default)
 #
 # Everything else (PATCH, DELETE, other POSTs) → 403 PUBLIC_DEMO_READ_ONLY.
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 
 @app.middleware("http")
@@ -2257,6 +2514,10 @@ async def public_demo_guard(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 
+# Sessions expire after this many hours of age (measured from created_at).
+SESSION_TTL_HOURS = 8
+
+
 def get_current_session(
     authorization: str | None = Header(default=None),
     db: DBSession = Depends(get_db),
@@ -2267,6 +2528,16 @@ def get_current_session(
     session = db.query(Session).filter(Session.token == token).first()
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    # ── Session TTL check ────────────────────────────────────────────────────
+    # Sessions older than SESSION_TTL_HOURS are expired.  The row is deleted
+    # so the next request fails fast (no DB row to find) and old tokens do not
+    # accumulate indefinitely.
+    if session.created_at:
+        age_seconds = (datetime.utcnow() - session.created_at).total_seconds()
+        if age_seconds > SESSION_TTL_HOURS * 3600:
+            db.delete(session)
+            db.commit()
+            raise HTTPException(status_code=401, detail="Session expired — please log in again")
     return session
 
 
@@ -2276,17 +2547,44 @@ def get_current_session(
 
 
 @app.get("/health")
-def health():
-    return {
+def health(request: Request):
+    from deployment_config import CONFIG
+    # Only expose build metadata to localhost or authenticated callers.
+    # Unauthenticated external requests get status/db/version only.
+    client_host = request.client.host if request.client else ""
+    _is_local = client_host in ("127.0.0.1", "::1", "localhost")
+    auth_header = request.headers.get("authorization", "")
+    _has_token = auth_header.startswith("Bearer ")
+    _show_build = _is_local or _has_token
+    result = {
         "status": "ok" if _db_ready else "degraded",
         "service": "keystone-gov-api",
         "db": _db_ready,
         "version": _VERSION,
-        "git_sha": _BUILD_SHA,
-        "build_ts": _BUILD_TS,
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "public_demo_mode": bool(_PUBLIC_DEMO_MODE),
+        "deployment_id": CONFIG.get("deployment", {}).get("id", "unknown"),
         **ollama_client.healthy(),
+    }
+    if _show_build:
+        result["git_sha"] = _BUILD_SHA
+        result["build_ts"] = _BUILD_TS
+    return result
+
+
+@app.get("/config")
+def get_deployment_config():
+    """Return deployment configuration for the console."""
+    from deployment_config import CONFIG
+    from compliance import get_checklist_summaries
+    return {
+        "deployment": CONFIG.get("deployment", {}),
+        "roles": CONFIG.get("roles", []),
+        "modes": CONFIG.get("modes", []),
+        "suggested_queries": CONFIG.get("suggested_queries", []),
+        "demo_credentials": CONFIG.get("demo_credentials", []),
+        "features": CONFIG.get("features", {}),
+        "checklists": get_checklist_summaries(),
     }
 
 
@@ -2378,7 +2676,16 @@ def public_reset(request: Request):
 
 
 @app.post("/auth/login", response_model=LoginResponse)
-def login(req: LoginRequest, db: DBSession = Depends(get_db)):
+def login(req: LoginRequest, request: Request, db: DBSession = Depends(get_db)):
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    # Brute-force protection: 5 attempts per IP per 60 seconds.
+    client_ip = (request.headers.get("X-Forwarded-For") or
+                 request.headers.get("X-Real-IP") or
+                 (request.client.host if request.client else "unknown"))
+    # Use only the first IP if X-Forwarded-For contains a chain.
+    client_ip = client_ip.split(",")[0].strip()
+    _check_login_rate_limit(client_ip)
+
     # Login endpoint is only available when CF Access is disabled or demo simulation is enabled.
     if get_cf_enabled() and not get_demo_sim_enabled():
         raise HTTPException(
@@ -2388,25 +2695,42 @@ def login(req: LoginRequest, db: DBSession = Depends(get_db)):
                 "reasonCode": "CF_AUTH_REQUIRED",
             },
         )
+
+    # ── Privileged user lookup via TAMPER_DATABASE_URL ───────────────────────
+    # keystone_app (DATABASE_URL) does not have SELECT on password_hash.
+    # Password verification must use the superuser connection.
+    _auth_url = os.environ.get("TAMPER_DATABASE_URL", "")
+    if not _auth_url:
+        raise HTTPException(status_code=500, detail="Authentication service unavailable")
+    _auth_engine = create_engine(_auth_url)
+    try:
+        with _auth_engine.connect() as _auth_conn:
+            _user_row = _auth_conn.execute(
+                text("SELECT id, username, role, password_hash FROM users WHERE username = :u"),
+                {"u": req.username},
+            ).first()
+    finally:
+        _auth_engine.dispose()
+
     # In public demo mode, authority login is disabled regardless of credentials.
-    if _PUBLIC_DEMO_MODE:
-        user_row = db.query(User).filter(User.username == req.username).first()
-        if user_row and user_row.role == "authority":
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "Authority login is disabled in public demo mode.",
-                    "reasonCode": "PUBLIC_ADMIN_DISABLED",
-                },
-            )
-    user = db.query(User).filter(User.username == req.username).first()
-    if not user or not verify_password(req.password, user.password_hash):
+    if _PUBLIC_DEMO_MODE and _user_row and _user_row.role == "authority":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Authority login is disabled in public demo mode.",
+                "reasonCode": "PUBLIC_ADMIN_DISABLED",
+            },
+        )
+
+    if not _user_row or not verify_password(req.password, _user_row.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    # Invalidate any existing sessions for this user before issuing a new one.
+    db.execute(text("DELETE FROM sessions WHERE user_id = :uid"), {"uid": _user_row.id})
     token = str(uuid.uuid4())
-    db.add(Session(token=token, user_id=user.id, username=user.username, role=user.role))
+    db.add(Session(token=token, user_id=_user_row.id, username=_user_row.username, role=_user_row.role))
     db.commit()
-    return LoginResponse(token=token, username=user.username, role=user.role)
+    return LoginResponse(token=token, username=_user_row.username, role=_user_row.role)
 
 
 @app.get("/auth/me")
@@ -2436,9 +2760,129 @@ def submit_query(
     db: DBSession = Depends(get_db),
     current_user: AppUser = Depends(get_current_user),
 ):
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    # 20 queries per session token per 60 seconds.  Protects GPU from abuse.
+    _check_query_rate_limit(current_user.user_id or current_user.email)
+
     # Role is ALWAYS derived from the authenticated session — request body value ignored.
     role = current_user.role
     role_level = _ROLE_LEVEL.get(role, 0)
+
+    # ── Prompt injection check ───────────────────────────────────────────────
+    # Fail-closed: if the query matches an injection pattern, return a policy
+    # refusal and log it in the audit trail without exposing any corpus data.
+    _is_safe, _injection_reason = check_injection(req.question)
+    if not _is_safe:
+        _inj_query_id = str(uuid.uuid4())
+        _inj_now = datetime.now(timezone.utc).isoformat()
+        _inj_guidance = {
+            "type": "refusal",
+            "reasonCode": "INPUT_REJECTED",
+            "title": "Query could not be processed",
+            "message": "This query was flagged and could not be processed. "
+                       "Please rephrase your question about a specific safety procedure or equipment.",
+            "safeNextStep": "Ask about a specific procedure, equipment type, or hazard by name.",
+            "hiddenSource": False,
+        }
+        _inj_last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
+        _inj_prev_hash = _inj_last.entry_hash if _inj_last else ""
+        _inj_entry_hash = compute_entry_hash(
+            _inj_query_id, _inj_now, role, req.mode, "refused", _inj_prev_hash
+        )
+        db.add(Query(
+            id=_inj_query_id,
+            question="[REDACTED — injection pattern detected]",
+            role=role,
+            mode=req.mode,
+            scenario_key="policy_refusal",
+            guidance_json=_inj_guidance,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(AuditEntry(
+            id=str(uuid.uuid4()),
+            query_id=_inj_query_id,
+            receipt_id=f"receipt-{_inj_query_id[:8]}",
+            timestamp=_inj_now,
+            role_used=role,
+            mode_used=req.mode,
+            policy_outcome="refused",
+            sources_considered_json=[],
+            citations_returned_json=[],
+            prev_hash=_inj_prev_hash,
+            entry_hash=_inj_entry_hash,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            simulated_role_used=current_user.sim_role,
+        ))
+        db.commit()
+        return QueryResponse(query_id=_inj_query_id, scenario_key="policy_refusal")
+
+    # ── Jurisdiction guard — refuse queries about non-Alberta regulations ────
+    # The corpus covers Alberta OHS only. Queries explicitly referencing
+    # other jurisdictions (OSHA, US, UK HSE, EU, Australian WHS, etc.)
+    # should be refused rather than returning Alberta content that doesn't
+    # apply to the queried jurisdiction.
+    _NON_ALBERTA_SIGNALS = {
+        'osha', 'niosh', 'united states', 'u.s.', 'us federal',
+        'uk', 'hse uk', 'british', 'england',
+        'european', 'eu directive',
+        'australian', 'safe work australia', 'worksafe',
+        'ontario', 'british columbia', 'quebec', 'saskatchewan',
+        'manitoba', 'nova scotia',
+    }
+    _q_lower = req.question.lower()
+    _jurisdiction_match = [s for s in _NON_ALBERTA_SIGNALS if s in _q_lower]
+    if _jurisdiction_match:
+        _jur_query_id = str(uuid.uuid4())
+        _jur_now = datetime.now(timezone.utc).isoformat()
+        _jur_guidance = {
+            "type": "refusal",
+            "reasonCode": "JURISDICTION_MISMATCH",
+            "title": "Query references a jurisdiction not covered by this corpus",
+            "message": (
+                f"This corpus covers Alberta OHS regulations only. "
+                f"Your query appears to reference: {', '.join(_jurisdiction_match)}. "
+                f"Consult the relevant jurisdiction's regulatory authority."
+            ),
+            "safeNextStep": "Rephrase your question for Alberta OHS, or consult the relevant jurisdiction directly.",
+            "hiddenSource": False,
+        }
+        _jur_last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
+        _jur_prev_hash = _jur_last.entry_hash if _jur_last else ""
+        _jur_entry_hash = compute_entry_hash(
+            _jur_query_id, _jur_now, role, req.mode, "refused", _jur_prev_hash
+        )
+        db.add(Query(
+            id=_jur_query_id,
+            question=req.question,
+            role=role,
+            mode=req.mode,
+            scenario_key="policy_refusal",
+            guidance_json=_jur_guidance,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(AuditEntry(
+            id=str(uuid.uuid4()),
+            query_id=_jur_query_id,
+            receipt_id=f"receipt-{_jur_query_id[:8]}",
+            timestamp=_jur_now,
+            role_used=role,
+            mode_used=req.mode,
+            policy_outcome="refused",
+            sources_considered_json=[],
+            citations_returned_json=[],
+            prev_hash=_jur_prev_hash,
+            entry_hash=_jur_entry_hash,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            simulated_role_used=current_user.sim_role,
+        ))
+        db.commit()
+        return QueryResponse(query_id=_jur_query_id, scenario_key="policy_refusal")
 
     # medical_reference mode always forces domain_filter to medical_emr only.
     # This is a defense-in-depth guard — the FTS gate in _corpus_fts_retrieve
@@ -3250,6 +3694,10 @@ class OperatorDecisionBody(BaseModel):
 class ReviewBody(BaseModel):
     supervisor_reviewed: bool = True
 
+class FeedbackRequest(BaseModel):
+    signal_type: str
+    comment: "str | None" = None
+
 class CreateCaseBody(BaseModel):
     title: str
     summary: str = ""
@@ -3611,6 +4059,1052 @@ def review_operator_decision(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB error: {exc}")
     return {"reviewed": True, "query_id": query_id, "supervisor": current_session.username}
+
+
+# ---------------------------------------------------------------------------
+# Feedback signals (KDAT-B)
+# ---------------------------------------------------------------------------
+
+_FEEDBACK_SIGNAL_VALUES = {"helpful", "not_helpful"}
+
+
+@app.post("/feedback/{query_id}", status_code=201)
+def create_feedback(
+    query_id: str,
+    body: FeedbackRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Record a helpfulness signal for a query result."""
+    if body.signal_type not in _FEEDBACK_SIGNAL_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"signal_type must be one of: {', '.join(sorted(_FEEDBACK_SIGNAL_VALUES))}",
+        )
+    # One feedback entry per user per query
+    try:
+        existing = db.execute(
+            text("SELECT id FROM feedback_signals WHERE query_id = :qid AND created_by = :uid"),
+            {"qid": query_id, "uid": current_session.user_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if existing:
+        raise HTTPException(status_code=409, detail="Feedback already submitted for this query")
+    # Fetch guidance metadata from the stored query
+    q = db.query(Query).filter(Query.id == query_id).first()
+    if not q:
+        raise HTTPException(status_code=404, detail="Query not found")
+    guidance = q.guidance_json or {}
+    doc_title  = (guidance.get("document") or {}).get("title")
+    ans_source = guidance.get("answer_source")
+    fcs        = guidance.get("factual_consistency_score")
+    try:
+        row = db.execute(text("""
+            INSERT INTO feedback_signals
+                (query_id, signal_type, comment, created_by, created_by_role,
+                 document_title, answer_source, factual_consistency_score)
+            VALUES (:query_id, :signal_type, :comment, :user_id, :role,
+                    :doc_title, :answer_source, :fcs)
+            RETURNING id, created_at_utc
+        """), {
+            "query_id":     query_id,
+            "signal_type":  body.signal_type,
+            "comment":      body.comment,
+            "user_id":      current_session.user_id,
+            "role":         current_session.role,
+            "doc_title":    doc_title,
+            "answer_source": ans_source,
+            "fcs":          fcs,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Auto-create review task for not_helpful feedback
+    review_task_id = None
+    if body.signal_type == "not_helpful":
+        try:
+            # Find the document referenced in the query guidance
+            _guidance = q.guidance_json or {}
+            _doc_info = _guidance.get("document") or {}
+            _doc_title = _doc_info.get("title") or doc_title
+            # Try to find corpus_documents row by title
+            _corpus_doc = None
+            if _doc_title:
+                _corpus_doc = db.execute(
+                    text("SELECT id FROM corpus_documents WHERE title = :title LIMIT 1"),
+                    {"title": _doc_title}
+                ).fetchone()
+            # Try to find active version for this document
+            _source_version_id = None
+            if _corpus_doc:
+                _ver_row = db.execute(
+                    text("SELECT id FROM document_versions WHERE doc_id = :did AND status = 'active' LIMIT 1"),
+                    {"did": _corpus_doc[0]}
+                ).fetchone()
+                _source_version_id = _ver_row[0] if _ver_row else None
+            _task_row = db.execute(text("""
+                INSERT INTO review_tasks (feedback_signal_id, doc_id, source_version_id, status)
+                VALUES (:fid, :did, :vid, 'open')
+                RETURNING id
+            """), {
+                "fid": str(row[0]),
+                "did": _corpus_doc[0] if _corpus_doc else 0,
+                "vid": _source_version_id,
+            }).fetchone()
+            db.commit()
+            review_task_id = str(_task_row[0]) if _task_row else None
+        except Exception:
+            # Migration 24 may not yet be applied; degrade gracefully
+            db.rollback()
+            review_task_id = None
+
+    return {
+        "id":                       str(row[0]),
+        "query_id":                 query_id,
+        "signal_type":              body.signal_type,
+        "comment":                  body.comment,
+        "created_by":               current_session.user_id,
+        "created_by_role":          current_session.role,
+        "created_at_utc":           row[1].isoformat() if row[1] else None,
+        "document_title":           doc_title,
+        "answer_source":            ans_source,
+        "factual_consistency_score": fcs,
+        "review_task_id":           review_task_id,
+    }
+
+
+@app.get("/feedback/{query_id}")
+def get_feedback(
+    query_id: str,
+    nullable: int = 0,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Return the most recent feedback signal for a query.
+
+    nullable=0 (default): 404 when no feedback exists.
+    nullable=1: always 200; body is null when no feedback has been recorded.
+    """
+    try:
+        row = db.execute(text("""
+            SELECT id, query_id, signal_type, comment, created_by, created_by_role,
+                   created_at_utc, document_title, answer_source, factual_consistency_score
+            FROM feedback_signals
+            WHERE query_id = :qid
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+        """), {"qid": query_id}).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        if nullable:
+            return None
+        raise HTTPException(status_code=404, detail="No feedback recorded for this query")
+    signal = {
+        "id":                       str(row[0]),
+        "query_id":                 row[1],
+        "signal_type":              row[2],
+        "comment":                  row[3],
+        "created_by":               row[4],
+        "created_by_role":          row[5],
+        "created_at_utc":           row[6].isoformat() if row[6] else None,
+        "document_title":           row[7],
+        "answer_source":            row[8],
+        "factual_consistency_score": row[9],
+    }
+    if nullable:
+        return signal
+    return signal
+
+
+# ---------------------------------------------------------------------------
+# Document Version Tracking
+# ---------------------------------------------------------------------------
+
+_VERSION_CREATE_ROLES = {"custodian", "authority"}
+_VERSION_APPROVE_ROLES = {"authority"}
+
+
+def _version_to_dict(row: tuple) -> dict:
+    """Convert a document_versions SELECT row to dict.
+
+    Columns (positional):
+      0  id, 1 doc_id, 2 version_number, 3 status,
+      4  effective_from, 5 effective_to, 6 supersedes_version_id,
+      7  content_hash, 8 file_path, 9 change_summary,
+      10 created_by, 11 approved_by, 12 published_at, 13 created_at
+    """
+    (vid, doc_id, version_number, status,
+     effective_from, effective_to, supersedes_version_id,
+     content_hash, file_path, change_summary,
+     created_by, approved_by, published_at, created_at) = row
+    return {
+        "id":                    vid,
+        "doc_id":                doc_id,
+        "version_number":        version_number,
+        "status":                status,
+        "effective_from":        effective_from.isoformat() if effective_from else None,
+        "effective_to":          effective_to.isoformat() if effective_to else None,
+        "supersedes_version_id": supersedes_version_id,
+        "content_hash":          content_hash,
+        "file_path":             file_path,
+        "change_summary":        change_summary,
+        "created_by":            created_by,
+        "approved_by":           approved_by,
+        "published_at":          published_at.isoformat() if published_at else None,
+        "created_at":            created_at.isoformat() if created_at else None,
+    }
+
+
+_VERSION_SELECT = """
+    SELECT id, doc_id, version_number, status,
+           effective_from, effective_to, supersedes_version_id,
+           content_hash, file_path, change_summary,
+           created_by, approved_by, published_at, created_at
+    FROM document_versions
+"""
+
+
+@app.get("/versions/{doc_id}")
+def list_versions(
+    doc_id: int,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """List all versions for a corpus document, ordered by version_number desc."""
+    try:
+        doc_row = db.execute(
+            text("SELECT id FROM corpus_documents WHERE id = :doc_id"),
+            {"doc_id": doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not doc_row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        rows = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id ORDER BY version_number DESC"),
+            {"doc_id": doc_id},
+        ).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    return {"doc_id": doc_id, "versions": [_version_to_dict(r) for r in rows]}
+
+
+@app.get("/versions/{doc_id}/current")
+def get_current_version(
+    doc_id: int,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Get the currently active version for a document."""
+    try:
+        row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id AND status = 'active'"),
+            {"doc_id": doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        raise HTTPException(status_code=404, detail="No active version for this document")
+    return _version_to_dict(row)
+
+
+@app.get("/versions/{doc_id}/at/{as_of}")
+def get_version_at(
+    doc_id: int,
+    as_of: str,
+    db: DBSession = Depends(get_db),
+    _session: AppUser = Depends(get_current_user),
+):
+    """Get the version that was active at a specific point in time."""
+    try:
+        as_of_dt = datetime.fromisoformat(as_of)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid as_of datetime: {as_of!r}")
+    try:
+        row = db.execute(
+            text(f"""
+                {_VERSION_SELECT}
+                WHERE doc_id = :doc_id
+                  AND effective_from <= :as_of
+                  AND (effective_to IS NULL OR effective_to > :as_of)
+            """),
+            {"doc_id": doc_id, "as_of": as_of_dt},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No version active at {as_of}")
+    return _version_to_dict(row)
+
+
+@app.post("/versions", status_code=201)
+def create_version(
+    body: CreateVersionRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Create a new draft version for a document (custodian or authority)."""
+    if current_session.role not in _VERSION_CREATE_ROLES:
+        raise HTTPException(status_code=403, detail="custodian or authority role required")
+
+    # Verify corpus document exists
+    try:
+        doc_row = db.execute(
+            text("SELECT id, sha256 FROM corpus_documents WHERE id = :doc_id"),
+            {"doc_id": body.doc_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not doc_row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc_sha256 = doc_row[1]
+
+    # Find next version_number
+    try:
+        max_row = db.execute(
+            text("SELECT MAX(version_number) FROM document_versions WHERE doc_id = :doc_id"),
+            {"doc_id": body.doc_id},
+        ).fetchone()
+        next_version = (max_row[0] or 0) + 1
+
+        actor = current_session.email
+
+        new_ver = db.execute(
+            text("""
+                INSERT INTO document_versions
+                    (doc_id, version_number, status, content_hash, change_summary, created_by, created_at)
+                VALUES
+                    (:doc_id, :version_number, 'draft', :content_hash, :change_summary, :created_by, now())
+                RETURNING id, doc_id, version_number, status,
+                          effective_from, effective_to, supersedes_version_id,
+                          content_hash, file_path, change_summary,
+                          created_by, approved_by, published_at, created_at
+            """),
+            {
+                "doc_id":         body.doc_id,
+                "version_number": next_version,
+                "content_hash":   doc_sha256,
+                "change_summary": body.change_summary,
+                "created_by":     actor,
+            },
+        ).fetchone()
+
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'created', :actor, :actor_role, now())
+            """),
+            {
+                "version_id": new_ver[0],
+                "actor":      actor,
+                "actor_role": current_session.role,
+            },
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _version_to_dict(new_ver)
+
+
+@app.post("/versions/{version_id}/approve")
+def approve_version(
+    version_id: int,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Approve a version, activating it and superseding the previous active version."""
+    if current_session.role not in _VERSION_APPROVE_ROLES:
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        ver_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+            {"vid": version_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not ver_row:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    ver = _version_to_dict(ver_row)
+
+    # Separation of duties: approver must not be the creator
+    if ver["created_by"] == current_session.email:
+        raise HTTPException(
+            status_code=403,
+            detail="Separation of duties: version creator cannot approve their own version",
+        )
+
+    if ver["status"] not in ("draft", "pending_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Version status is '{ver['status']}'; only draft or pending_review can be approved",
+        )
+
+    actor = current_session.email
+    actor_role = current_session.role
+
+    try:
+        # Find current active version for this doc (if any)
+        old_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE doc_id = :doc_id AND status = 'active'"),
+            {"doc_id": ver["doc_id"]},
+        ).fetchone()
+        old_ver = _version_to_dict(old_row) if old_row else None
+
+        if old_ver:
+            # Supersede the old active version
+            db.execute(
+                text("""
+                    UPDATE document_versions
+                    SET status = 'superseded', effective_to = now()
+                    WHERE id = :old_id
+                """),
+                {"old_id": old_ver["id"]},
+            )
+            db.execute(
+                text("""
+                    INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                    VALUES (:version_id, 'superseded', :actor, :actor_role, now())
+                """),
+                {"version_id": old_ver["id"], "actor": actor, "actor_role": actor_role},
+            )
+
+        # Activate the new version
+        db.execute(
+            text("""
+                UPDATE document_versions
+                SET status = 'active',
+                    effective_from = now(),
+                    approved_by = :approved_by,
+                    published_at = now(),
+                    supersedes_version_id = :supersedes_id
+                WHERE id = :vid
+            """),
+            {
+                "approved_by":    actor,
+                "supersedes_id":  old_ver["id"] if old_ver else None,
+                "vid":            version_id,
+            },
+        )
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'approved', :actor, :actor_role, now())
+            """),
+            {"version_id": version_id, "actor": actor, "actor_role": actor_role},
+        )
+        db.execute(
+            text("""
+                INSERT INTO version_events (version_id, event_type, actor, actor_role, created_at)
+                VALUES (:version_id, 'published', :actor, :actor_role, now())
+            """),
+            {"version_id": version_id, "actor": actor, "actor_role": actor_role},
+        )
+        db.commit()
+
+        # Reload activated version
+        new_row = db.execute(
+            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+            {"vid": version_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "version":    _version_to_dict(new_row),
+        "superseded": old_ver,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Review Workflow
+# ---------------------------------------------------------------------------
+
+_REVIEW_MIN_ROLE_LEVEL = 1   # custodian (0), officer (1), authority (2)
+_RESOLUTION_TYPE_TO_DECISION = {
+    "new_version_published": "publish_new_version",
+    "no_change_needed":      "no_change",
+    "escalated":             "escalate",
+    "duplicate":             "no_change",
+}
+
+
+def _task_to_dict(row: tuple) -> dict:
+    """Convert a review_tasks SELECT row to dict.
+
+    Columns (positional):
+      0  id, 1 feedback_signal_id, 2 doc_id, 3 source_version_id,
+      4  status, 5 assigned_to, 6 priority,
+      7  resolution_type, 8 resolution_note, 9 resolved_by,
+      10 created_at, 11 assigned_at, 12 resolved_at
+    """
+    (tid, feedback_signal_id, doc_id, source_version_id,
+     status, assigned_to, priority,
+     resolution_type, resolution_note, resolved_by,
+     created_at, assigned_at, resolved_at) = row[:13]
+    return {
+        "id":                  str(tid),
+        "feedback_signal_id":  str(feedback_signal_id),
+        "doc_id":              doc_id,
+        "source_version_id":   source_version_id,
+        "status":              status,
+        "assigned_to":         assigned_to,
+        "priority":            priority,
+        "resolution_type":     resolution_type,
+        "resolution_note":     resolution_note,
+        "resolved_by":         resolved_by,
+        "created_at":          created_at.isoformat() if created_at else None,
+        "assigned_at":         assigned_at.isoformat() if assigned_at else None,
+        "resolved_at":         resolved_at.isoformat() if resolved_at else None,
+    }
+
+
+_TASK_SELECT = """
+    SELECT id, feedback_signal_id, doc_id, source_version_id,
+           status, assigned_to, priority,
+           resolution_type, resolution_note, resolved_by,
+           created_at, assigned_at, resolved_at
+    FROM review_tasks
+"""
+
+
+def _comment_to_dict(row: tuple) -> dict:
+    (cid, task_id, author, author_role, body, created_at) = row
+    return {
+        "id":          str(cid),
+        "task_id":     str(task_id),
+        "author":      author,
+        "author_role": author_role,
+        "body":        body,
+        "created_at":  created_at.isoformat() if created_at else None,
+    }
+
+
+def _pub_decision_to_dict(row: tuple) -> dict:
+    (did, review_task_id, old_vid, new_vid,
+     decision, decided_by, decided_by_role, decided_at) = row
+    return {
+        "id":              str(did),
+        "review_task_id":  str(review_task_id),
+        "old_version_id":  old_vid,
+        "new_version_id":  new_vid,
+        "decision":        decision,
+        "decided_by":      decided_by,
+        "decided_by_role": decided_by_role,
+        "decided_at":      decided_at.isoformat() if decided_at else None,
+    }
+
+
+@app.get("/review/tasks")
+def list_review_tasks(
+    status: "str | None" = QueryParam(default=None),
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """List review tasks with optional status filter (custodian, officer, or authority)."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    params: dict = {}
+    where = ""
+    if status:
+        where = "WHERE rt.status = :status"
+        params["status"] = status
+
+    try:
+        rows = db.execute(text(f"""
+            SELECT rt.id, rt.feedback_signal_id, rt.doc_id, rt.source_version_id,
+                   rt.status, rt.assigned_to, rt.priority,
+                   rt.resolution_type, rt.resolution_note, rt.resolved_by,
+                   rt.created_at, rt.assigned_at, rt.resolved_at,
+                   cd.title AS document_title,
+                   fs.comment AS feedback_comment
+            FROM review_tasks rt
+            LEFT JOIN corpus_documents cd ON cd.id = rt.doc_id
+            LEFT JOIN feedback_signals fs ON fs.id = rt.feedback_signal_id
+            {where}
+            ORDER BY rt.created_at DESC
+        """), params).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    items = []
+    for r in rows:
+        task = _task_to_dict(r[:13])
+        task["document_title"]    = r[13]
+        task["feedback_snippet"]  = (r[14] or "")[:100] if r[14] else None
+        items.append(task)
+    return {"tasks": items}
+
+
+@app.get("/review/tasks/{task_id}")
+def get_review_task(
+    task_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Full task detail including feedback, source version, and comments."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+
+    # Feedback detail
+    feedback = None
+    try:
+        fb_row = db.execute(text("""
+            SELECT fs.id, fs.query_id, fs.signal_type, fs.comment,
+                   fs.created_by, fs.created_by_role, fs.created_at_utc,
+                   fs.document_title, fs.answer_source, fs.factual_consistency_score,
+                   q.question
+            FROM feedback_signals fs
+            LEFT JOIN queries q ON q.id = fs.query_id
+            WHERE fs.id = :fid
+        """), {"fid": task["feedback_signal_id"]}).fetchone()
+        if fb_row:
+            feedback = {
+                "id":                       str(fb_row[0]),
+                "query_id":                 fb_row[1],
+                "signal_type":              fb_row[2],
+                "comment":                  fb_row[3],
+                "created_by":               fb_row[4],
+                "created_by_role":          fb_row[5],
+                "created_at_utc":           fb_row[6].isoformat() if fb_row[6] else None,
+                "document_title":           fb_row[7],
+                "answer_source":            fb_row[8],
+                "factual_consistency_score": fb_row[9],
+                "question":                 fb_row[10],
+            }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Source version info
+    source_version = None
+    if task.get("source_version_id"):
+        try:
+            ver_row = db.execute(
+                text(f"{_VERSION_SELECT} WHERE id = :vid"),
+                {"vid": task["source_version_id"]},
+            ).fetchone()
+            if ver_row:
+                source_version = _version_to_dict(ver_row)
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    # Comments
+    try:
+        comment_rows = db.execute(text("""
+            SELECT id, task_id, author, author_role, body, created_at
+            FROM review_comments
+            WHERE task_id = :tid
+            ORDER BY created_at ASC
+        """), {"tid": task_id}).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "task":           task,
+        "feedback":       feedback,
+        "source_version": source_version,
+        "comments":       [_comment_to_dict(r) for r in comment_rows],
+    }
+
+
+@app.post("/review/tasks/{task_id}/assign")
+def assign_review_task(
+    task_id: str,
+    body: AssignTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Assign a review task to a user (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] != "open":
+        raise HTTPException(status_code=400, detail=f"Task status is '{task['status']}'; only open tasks can be assigned")
+
+    try:
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'assigned', assigned_to = :assigned_to, assigned_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {"assigned_to": body.assigned_to, "tid": task_id}).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _task_to_dict(updated)
+
+
+@app.post("/review/tasks/{task_id}/comment", status_code=201)
+def add_review_comment(
+    task_id: str,
+    body: ReviewCommentRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Add a comment to a review task (custodian, officer, or authority)."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; comments are not allowed on resolved or dismissed tasks",
+        )
+
+    try:
+        comment_row = db.execute(text("""
+            INSERT INTO review_comments (task_id, author, author_role, body, created_at)
+            VALUES (:tid, :author, :author_role, :body, now())
+            RETURNING id, task_id, author, author_role, body, created_at
+        """), {
+            "tid":         task_id,
+            "author":      current_session.user_id,
+            "author_role": current_session.role,
+            "body":        body.body,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _comment_to_dict(comment_row)
+
+
+@app.post("/review/tasks/{task_id}/resolve")
+def resolve_review_task(
+    task_id: str,
+    body: ResolveTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Resolve a review task (custodian, officer, or authority). Separation of duties enforced."""
+    if _ROLE_LEVEL.get(current_session.role, -1) < _REVIEW_MIN_ROLE_LEVEL:
+        raise HTTPException(status_code=403, detail="officer or authority role required")
+
+    valid_resolution_types = {"new_version_published", "no_change_needed", "escalated", "duplicate"}
+    if body.resolution_type not in valid_resolution_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"resolution_type must be one of: {', '.join(sorted(valid_resolution_types))}",
+        )
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; only open, assigned, or in_review tasks can be resolved",
+        )
+
+    # Separation of duties: look up feedback submitter
+    try:
+        fb_row = db.execute(
+            text("SELECT created_by FROM feedback_signals WHERE id = :fid"),
+            {"fid": task["feedback_signal_id"]},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if fb_row and fb_row[0] == current_session.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Separation of duties: feedback submitter cannot resolve their own task",
+        )
+
+    # If publishing a new version, verify it exists
+    if body.resolution_type == "new_version_published":
+        if not body.new_version_id:
+            raise HTTPException(status_code=400, detail="new_version_id required when resolution_type is 'new_version_published'")
+        try:
+            ver_check = db.execute(
+                text("SELECT id FROM document_versions WHERE id = :vid"),
+                {"vid": body.new_version_id},
+            ).fetchone()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+        if not ver_check:
+            raise HTTPException(status_code=404, detail=f"document_versions id {body.new_version_id} not found")
+
+    decision_value = _RESOLUTION_TYPE_TO_DECISION.get(body.resolution_type, "no_change")
+    actor = current_session.user_id
+
+    try:
+        pub_row = db.execute(text("""
+            INSERT INTO publication_decisions
+                (review_task_id, old_version_id, new_version_id, decision, decided_by, decided_by_role, decided_at)
+            VALUES
+                (:tid, :old_vid, :new_vid, :decision, :decided_by, :decided_by_role, now())
+            RETURNING id, review_task_id, old_version_id, new_version_id,
+                      decision, decided_by, decided_by_role, decided_at
+        """), {
+            "tid":            task_id,
+            "old_vid":        task["source_version_id"],
+            "new_vid":        body.new_version_id,
+            "decision":       decision_value,
+            "decided_by":     actor,
+            "decided_by_role": current_session.role,
+        }).fetchone()
+
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'resolved',
+                resolution_type = :resolution_type,
+                resolution_note = :resolution_note,
+                resolved_by = :resolved_by,
+                resolved_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {
+            "resolution_type": body.resolution_type,
+            "resolution_note": body.resolution_note,
+            "resolved_by":     actor,
+            "tid":             task_id,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "task":                 _task_to_dict(updated),
+        "publication_decision": _pub_decision_to_dict(pub_row),
+    }
+
+
+@app.post("/review/tasks/{task_id}/dismiss")
+def dismiss_review_task(
+    task_id: str,
+    body: DismissTaskRequest,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Dismiss a review task (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        task_row = db.execute(
+            text(f"{_TASK_SELECT} WHERE id = :tid"),
+            {"tid": task_id},
+        ).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Review task not found")
+
+    task = _task_to_dict(task_row)
+    if task["status"] not in ("open", "assigned", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task status is '{task['status']}'; only open, assigned, or in_review tasks can be dismissed",
+        )
+
+    try:
+        updated = db.execute(text("""
+            UPDATE review_tasks
+            SET status = 'dismissed',
+                resolution_note = :resolution_note,
+                resolved_by = :resolved_by,
+                resolved_at = now()
+            WHERE id = :tid
+            RETURNING id, feedback_signal_id, doc_id, source_version_id,
+                      status, assigned_to, priority,
+                      resolution_type, resolution_note, resolved_by,
+                      created_at, assigned_at, resolved_at
+        """), {
+            "resolution_note": body.resolution_note,
+            "resolved_by":     current_session.user_id,
+            "tid":             task_id,
+        }).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return _task_to_dict(updated)
+
+
+@app.get("/audit/chain/{feedback_signal_id}")
+def get_audit_chain(
+    feedback_signal_id: str,
+    db: DBSession = Depends(get_db),
+    current_session: AppUser = Depends(get_current_user),
+):
+    """Reconstruct full governance chain from a feedback signal (authority only)."""
+    if current_session.role != "authority":
+        raise HTTPException(status_code=403, detail="authority role required")
+
+    try:
+        fb_row = db.execute(text("""
+            SELECT id, query_id, signal_type, comment, created_by, created_by_role,
+                   created_at_utc, document_title, answer_source, factual_consistency_score
+            FROM feedback_signals
+            WHERE id = :fid
+        """), {"fid": feedback_signal_id}).fetchone()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    if not fb_row:
+        raise HTTPException(status_code=404, detail="Feedback signal not found")
+
+    feedback = {
+        "id":                       str(fb_row[0]),
+        "query_id":                 fb_row[1],
+        "signal_type":              fb_row[2],
+        "comment":                  fb_row[3],
+        "created_by":               fb_row[4],
+        "created_by_role":          fb_row[5],
+        "created_at_utc":           fb_row[6].isoformat() if fb_row[6] else None,
+        "document_title":           fb_row[7],
+        "answer_source":            fb_row[8],
+        "factual_consistency_score": fb_row[9],
+    }
+
+    try:
+        task_rows = db.execute(
+            text(f"{_TASK_SELECT} WHERE feedback_signal_id = :fid ORDER BY created_at ASC"),
+            {"fid": feedback_signal_id},
+        ).fetchall()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    tasks_out = []
+    versions_seen: dict = {}
+
+    for task_row in task_rows:
+        task = _task_to_dict(task_row)
+
+        # Comments for this task
+        try:
+            comment_rows = db.execute(text("""
+                SELECT id, task_id, author, author_role, body, created_at
+                FROM review_comments
+                WHERE task_id = :tid
+                ORDER BY created_at ASC
+            """), {"tid": task["id"]}).fetchall()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+        # Publication decisions for this task
+        try:
+            pd_rows = db.execute(text("""
+                SELECT id, review_task_id, old_version_id, new_version_id,
+                       decision, decided_by, decided_by_role, decided_at
+                FROM publication_decisions
+                WHERE review_task_id = :tid
+                ORDER BY decided_at ASC
+            """), {"tid": task["id"]}).fetchall()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+        decisions = []
+        for pd in pd_rows:
+            decisions.append(_pub_decision_to_dict(pd))
+            for vid in (pd[2], pd[3]):  # old_version_id, new_version_id
+                if vid and vid not in versions_seen:
+                    try:
+                        vrow = db.execute(
+                            text(f"{_VERSION_SELECT} WHERE id = :vid"),
+                            {"vid": vid},
+                        ).fetchone()
+                        if vrow:
+                            versions_seen[vid] = _version_to_dict(vrow)
+                    except Exception:
+                        pass
+
+        task["comments"]             = [_comment_to_dict(r) for r in comment_rows]
+        task["publication_decisions"] = decisions
+        tasks_out.append(task)
+
+    return {
+        "feedback":     feedback,
+        "review_tasks": tasks_out,
+        "versions":     versions_seen,
+    }
 
 
 def _build_incident_files(
@@ -4498,8 +5992,14 @@ def _change_req_to_dict(row: tuple) -> dict:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_STATUS_OVERRIDES = {"", "active", "superseded", "draft", "restricted"}
-_ALLOWED_DOMAINS        = {"fire_ops", "medical_emr", "lrfd_protocol"}
-_ALLOWED_CONTENT_KINDS  = {"procedure", "requirements", "reference"}
+_ALLOWED_DOMAINS        = {
+    "fire_ops", "medical_emr", "lrfd_protocol",
+    "ohs_regulation", "industry_reference", "training_material", "guide",
+}
+_ALLOWED_CONTENT_KINDS  = {
+    "procedure", "requirements", "reference",
+    "regulation", "guide", "training",
+}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -4581,7 +6081,9 @@ def list_documents(
         params["q"] = f"%{q}%"
     if status:
         if status == "active":
-            filters.append("(status_override = '' OR status_override IS NULL)")
+            # Documents are "active" when status_override is NULL, empty string,
+            # or the literal value 'active' (ingest may write either convention).
+            filters.append("(status_override IS NULL OR status_override IN ('', 'active'))")
         else:
             filters.append("status_override = :status")
             params["status"] = status

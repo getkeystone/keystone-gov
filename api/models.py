@@ -111,3 +111,71 @@ class UserManagementEvent(Base):
     old_value     = Column(String)
     new_value     = Column(String)
     note          = Column(String)
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(Integer, nullable=False, index=True)
+    version_number = Column(Integer, nullable=False, default=1)
+    status = Column(String, nullable=False, default="draft")
+    effective_from = Column(DateTime(timezone=True))
+    effective_to = Column(DateTime(timezone=True))
+    supersedes_version_id = Column(Integer)
+    content_hash = Column(String)
+    file_path = Column(String)
+    change_summary = Column(Text)
+    created_by = Column(String, nullable=False)
+    approved_by = Column(String)
+    published_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True))
+
+
+class VersionEvent(Base):
+    __tablename__ = "version_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version_id = Column(Integer, nullable=False, index=True)
+    event_type = Column(String, nullable=False)
+    actor = Column(String, nullable=False)
+    actor_role = Column(String, nullable=False)
+    detail = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True))
+
+
+class ReviewTask(Base):
+    __tablename__ = "review_tasks"
+    id = Column(String, primary_key=True)
+    feedback_signal_id = Column(String, nullable=False)
+    doc_id = Column(Integer, nullable=False)
+    source_version_id = Column(Integer)
+    status = Column(String, nullable=False, default="open")
+    assigned_to = Column(String)
+    priority = Column(String, default="normal")
+    resolution_type = Column(String)
+    resolution_note = Column(Text)
+    resolved_by = Column(String)
+    created_at = Column(DateTime(timezone=True))
+    assigned_at = Column(DateTime(timezone=True))
+    resolved_at = Column(DateTime(timezone=True))
+
+
+class ReviewComment(Base):
+    __tablename__ = "review_comments"
+    id = Column(String, primary_key=True)
+    task_id = Column(String, nullable=False)
+    author = Column(String, nullable=False)
+    author_role = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True))
+
+
+class PublicationDecision(Base):
+    __tablename__ = "publication_decisions"
+    id = Column(String, primary_key=True)
+    review_task_id = Column(String, nullable=False)
+    old_version_id = Column(Integer)
+    new_version_id = Column(Integer)
+    decision = Column(String, nullable=False)
+    decided_by = Column(String, nullable=False)
+    decided_by_role = Column(String, nullable=False)
+    decided_at = Column(DateTime(timezone=True))

@@ -1,10 +1,11 @@
 from typing import Any, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    # Upper bounds prevent oversized payloads reaching auth logic.
+    username: str = Field(..., max_length=128)
+    password: str = Field(..., max_length=256)
 
 
 class LoginResponse(BaseModel):
@@ -14,7 +15,8 @@ class LoginResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    question: str
+    # 2000-char limit prevents FTS/LLM abuse and controls DB storage size.
+    question: str = Field(..., max_length=2000)
     mode: Literal["operational", "training", "medical_reference"]
     # role is accepted for backward-compat but ignored — server derives from token
     role: Optional[str] = None
@@ -86,3 +88,43 @@ class MeResponse(BaseModel):
     cf_enabled: bool
     sim_role: Optional[str] = None
     sim_enabled: bool = False
+
+
+class DocumentVersionResponse(BaseModel):
+    id: int
+    doc_id: int
+    version_number: int
+    status: str
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    supersedes_version_id: Optional[int] = None
+    content_hash: Optional[str] = None
+    file_path: Optional[str] = None
+    change_summary: Optional[str] = None
+    created_by: str
+    approved_by: Optional[str] = None
+    published_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CreateVersionRequest(BaseModel):
+    doc_id: int
+    change_summary: Optional[str] = None
+
+
+class AssignTaskRequest(BaseModel):
+    assigned_to: str
+
+
+class ReviewCommentRequest(BaseModel):
+    body: str = Field(..., max_length=2000)
+
+
+class ResolveTaskRequest(BaseModel):
+    resolution_type: str
+    resolution_note: Optional[str] = None
+    new_version_id: Optional[int] = None
+
+
+class DismissTaskRequest(BaseModel):
+    resolution_note: str = Field(..., max_length=2000)
