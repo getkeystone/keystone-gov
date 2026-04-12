@@ -39,6 +39,7 @@ Runs entirely on customer infrastructure. No external API calls. Air-gap compati
 ## KDAT milestones delivered
 
 101 milestones tracked. Key recent milestones:
+- KDAT-001B: Eval baseline established -- retrieval P@1=0.75 MRR=0.79, 8/8 adversarial blocked, audit chain intact (2026-04-11, evidence in keystone-kdat artifacts/kdat-001B/)
 - KDAT-096: Document version tracking schema + 5 API endpoints
 - KDAT-098: Review workflow + 7 API endpoints + feedback auto-task
 - KDAT-100: Governed learning loop end-to-end (46/46 tests)
