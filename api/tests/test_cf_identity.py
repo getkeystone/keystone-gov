@@ -297,7 +297,7 @@ users:
     display_name: Arnaldo Sepulveda
     role: admin
     status: active
-  - email: arnaldo@getkeystone.ai
+  - email: admin@example.com
     display_name: Arnaldo
     role: admin
     status: active
@@ -305,7 +305,7 @@ users:
 
 
 def test_both_admin_emails_load():
-    """Both testuser@example.com and arnaldo@getkeystone.ai must be present."""
+    """Both testuser@example.com and admin@example.com must be present."""
     path = _yaml_file(DUAL_ADMIN_YAML)
     result = load_role_config(path)
 
@@ -315,8 +315,8 @@ def test_both_admin_emails_load():
     assert e1.display_name == "Arnaldo Sepulveda"
     assert e1.status == "active"
 
-    assert "arnaldo@getkeystone.ai" in result
-    e2 = result["arnaldo@getkeystone.ai"]
+    assert "admin@example.com" in result
+    e2 = result["admin@example.com"]
     assert e2.role == "admin"
     assert e2.display_name == "Arnaldo"
     assert e2.status == "active"
@@ -338,7 +338,7 @@ def test_both_admin_emails_idempotent():
 
 
 def test_getkeystone_email_not_treated_as_duplicate_of_lrfd():
-    """arnaldo@getkeystone.ai and testuser@example.com are distinct emails."""
+    """admin@example.com and testuser@example.com are distinct emails."""
     path = _yaml_file(DUAL_ADMIN_YAML)
     result = load_role_config(path)
     # If they were treated as duplicates, load_role_config would have raised.
@@ -356,7 +356,7 @@ users:
     display_name: Arnaldo Sepulveda
     role: admin
     status: active
-  - email: arnaldo@getkeystone.ai
+  - email: admin@example.com
     display_name: Arnaldo
     role: admin
     status: active
@@ -378,7 +378,7 @@ def test_demo_users_load():
 
     expected = {
         "testuser@example.com":    ("admin",   "Arnaldo Sepulveda"),
-        "arnaldo@getkeystone.ai":       ("admin",   "Arnaldo"),
+        "admin@example.com":       ("admin",   "Arnaldo"),
         "testuser2@example.com":   ("member",  "Arnaldo Demo"),
         "otheruser@example.com":  ("officer", "Nature Uplift"),
     }
