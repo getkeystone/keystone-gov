@@ -2884,6 +2884,90 @@ def submit_query(
         db.commit()
         return QueryResponse(query_id=_jur_query_id, scenario_key="policy_refusal")
 
+    # ── Domain scope guard — refuse queries outside OHS corpus topic scope ──
+    # FC-005 (KDAT-001B) demonstrated that queries about non-OHS Alberta
+    # regulations (e.g. TIER greenhouse gas reporting) could pass injection
+    # and jurisdiction checks, then return wrong-Part chunks via semantic
+    # overlap (mine gas chunks for a greenhouse gas query). HHEM cannot
+    # catch this class because it scores answer-chunk consistency, not
+    # query-corpus relevance.
+    #
+    # Phrases are multi-word anchors to avoid the KDAT-086 over-refusal
+    # failure mode. Single tokens like "gas" or "tier" are intentionally
+    # NOT listed because they appear legitimately in mine/fire/oil
+    # contexts in the OHS Code.
+    _OUT_OF_SCOPE_PHRASES = (
+        # Emissions / environmental regulations (not OHS)
+        "greenhouse gas",
+        "emissions reporting",
+        "carbon pricing",
+        "carbon tax",
+        # Workers Comp Board (separate Alberta agency)
+        "wcb claim",
+        "workers compensation",
+        # CRA / tax (federal)
+        "t2 corporate",
+        "corporate tax",
+        "income tax filing",
+        # IT / procurement (not OHS)
+        "microsoft 365",
+        "office 365",
+    )
+    _scope_match = [p for p in _OUT_OF_SCOPE_PHRASES if p in _q_lower]
+    if _scope_match:
+        _scope_query_id = str(uuid.uuid4())
+        _scope_now = datetime.now(timezone.utc).isoformat()
+        _scope_guidance = {
+            "type": "refusal",
+            "reasonCode": "DOMAIN_OUT_OF_SCOPE",
+            "title": "Query outside corpus scope",
+            "message": (
+                f"This corpus covers Alberta occupational health and safety "
+                f"procedures only. Your query references topics outside that "
+                f"scope: {', '.join(_scope_match)}. "
+                f"Consult the relevant regulatory authority directly."
+            ),
+            "safeNextStep": (
+                "Ask about a workplace safety procedure, hazard, or piece "
+                "of equipment covered by the Alberta OHS Code."
+            ),
+            "hiddenSource": False,
+        }
+        _scope_last = db.query(AuditEntry).order_by(AuditEntry.timestamp.desc()).first()
+        _scope_prev_hash = _scope_last.entry_hash if _scope_last else ""
+        _scope_entry_hash = compute_entry_hash(
+            _scope_query_id, _scope_now, role, req.mode, "refused", _scope_prev_hash
+        )
+        db.add(Query(
+            id=_scope_query_id,
+            question=req.question,
+            role=role,
+            mode=req.mode,
+            scenario_key="policy_refusal",
+            guidance_json=_scope_guidance,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.add(AuditEntry(
+            id=str(uuid.uuid4()),
+            query_id=_scope_query_id,
+            receipt_id=f"receipt-{_scope_query_id[:8]}",
+            timestamp=_scope_now,
+            role_used=role,
+            mode_used=req.mode,
+            policy_outcome="refused",
+            sources_considered_json=[],
+            citations_returned_json=[],
+            prev_hash=_scope_prev_hash,
+            entry_hash=_scope_entry_hash,
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            simulated_role_used=current_user.sim_role,
+        ))
+        db.commit()
+        return QueryResponse(query_id=_scope_query_id, scenario_key="policy_refusal")
+
     # medical_reference mode always forces domain_filter to medical_emr only.
     # This is a defense-in-depth guard — the FTS gate in _corpus_fts_retrieve
     # also enforces this, but we set it here so it applies to all retrieval paths.
