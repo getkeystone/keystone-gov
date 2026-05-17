@@ -214,3 +214,4 @@ eval/results/
 scripts/backfill_embeddings.py
 *.bak.*
 =
+eval_results_*.json
