@@ -215,3 +215,6 @@ scripts/backfill_embeddings.py
 *.bak.*
 =
 eval_results_*.json
+
+# Local eval run artifacts. Sealed runs are committed to keystone-kdat.
+eval_results_*.json
