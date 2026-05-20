@@ -133,12 +133,13 @@ class TestQueueNotification:
 
     def test_result_has_notification_id(self, db_client):
         client, _ = db_client
+        # severity=3 (Medium) → ALLOW for supervisor; severity=2 (High) would route to HITL
         resp = _post_plan(
             client, "supervisor",
             [{
                 "step_index": 0,
                 "tool_name": "queue_notification",
-                "params": {"severity": 2, "message": "High severity test", "recipients": ["custodian"]},
+                "params": {"severity": 3, "message": "Medium severity test", "recipients": ["custodian"]},
             }],
         )
         sr = resp.json()["step_results"][0]
@@ -146,10 +147,13 @@ class TestQueueNotification:
         assert "notification_id" in sr["result"]
 
 
-# ── 3. Positive: custodian + draft_procedure_update ──────────────────────────
+# ── 3. draft_procedure_update is Critical tier → always routes to HITL ───────
+# M5 wired Critical tier to HITL for ALL roles (spec §4.5, P5.3).
+# Full approve-then-execute flow is covered in test_m5_hitl.py.
 
 class TestDraftProcedureUpdate:
-    def test_plan_completed(self, db_client):
+    def test_plan_hitl_pending(self, db_client):
+        """Critical tier always pauses for HITL regardless of role."""
         client, db = db_client
         doc = db.execute(
             text("SELECT rel_path FROM corpus_documents LIMIT 1")
@@ -170,45 +174,16 @@ class TestDraftProcedureUpdate:
             user_id="test-custodian-m3",
         )
         assert resp.status_code == 201
-        assert resp.json()["status"] == "completed"
+        assert resp.json()["status"] == "hitl_pending"
 
-    def test_version_row_created_as_draft(self, db_client):
+    def test_hitl_response_fields(self, db_client):
+        """HITL pause response carries hitl_step_index and approval_id."""
         client, db = db_client
         doc = db.execute(
             text("SELECT rel_path FROM corpus_documents LIMIT 1")
         ).fetchone()
         if not doc:
             pytest.skip("No corpus documents in DB — seed the corpus first")
-        _post_plan(
-            client, "custodian",
-            [{
-                "step_index": 0,
-                "tool_name": "draft_procedure_update",
-                "params": {
-                    "procedure_id": doc[0],
-                    "proposed_text": "M3 test draft.",
-                    "citations": ["ohs-doc-001"],
-                },
-            }],
-            user_id="test-custodian-m3",
-        )
-        ver = db.execute(
-            text(
-                "SELECT status FROM document_versions"
-                " WHERE created_by = 'test-custodian-m3'"
-                " ORDER BY created_at DESC LIMIT 1"
-            )
-        ).fetchone()
-        assert ver is not None, "DocumentVersion row not found"
-        assert ver[0] == "draft"
-
-    def test_result_contains_version_id(self, db_client):
-        client, db = db_client
-        doc = db.execute(
-            text("SELECT rel_path FROM corpus_documents LIMIT 1")
-        ).fetchone()
-        if not doc:
-            pytest.skip("No corpus documents in DB")
         resp = _post_plan(
             client, "custodian",
             [{
@@ -216,15 +191,47 @@ class TestDraftProcedureUpdate:
                 "tool_name": "draft_procedure_update",
                 "params": {
                     "procedure_id": doc[0],
-                    "proposed_text": "Test.",
+                    "proposed_text": "HITL fields test.",
                     "citations": [],
                 },
             }],
             user_id="test-custodian-m3",
         )
-        sr = resp.json()["step_results"][0]
-        assert sr["result"]["status"] == "drafted"
-        assert "version_id" in sr["result"]
+        body = resp.json()
+        assert body["hitl_step_index"] == 0
+        assert body["approval_id"] is not None
+
+    def test_no_version_row_before_approval(self, db_client):
+        """No document_versions row is created until the HITL step is approved."""
+        client, db = db_client
+        doc = db.execute(
+            text("SELECT rel_path FROM corpus_documents LIMIT 1")
+        ).fetchone()
+        if not doc:
+            pytest.skip("No corpus documents in DB — seed the corpus first")
+        unique_uid = "test-custodian-m3-no-exec"
+        _post_plan(
+            client, "custodian",
+            [{
+                "step_index": 0,
+                "tool_name": "draft_procedure_update",
+                "params": {
+                    "procedure_id": doc[0],
+                    "proposed_text": "Should not be saved yet.",
+                    "citations": [],
+                },
+            }],
+            user_id=unique_uid,
+        )
+        ver = db.execute(
+            text(
+                "SELECT status FROM document_versions"
+                " WHERE created_by = :uid"
+                " ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"uid": unique_uid},
+        ).fetchone()
+        assert ver is None, "No version row should exist before HITL approval"
 
 
 # ── 4. Negative: operator + queue_notification → denied ──────────────────────

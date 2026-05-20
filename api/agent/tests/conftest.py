@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 # at import time (ollama_client, audit) get the right values.
 os.environ.setdefault("AUDIT_HMAC_KEY", "kdat002-test-key-32-chars-for-unit-tests!")
 os.environ.setdefault("DATABASE_URL", "postgresql://keystone:keystone@127.0.0.1:5433/keystone_dev")
+os.environ.setdefault("TAMPER_DATABASE_URL", "postgresql://keystone:keystone@127.0.0.1:5433/keystone_dev")
 os.environ.setdefault("OLLAMA_URL", "http://127.0.0.1:11434")
 
 

@@ -17,6 +17,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session as DBSession
 
 from .controller import authorize
+from .hitl import create_approval_task
 from .models import AgentPlan, AgentPlanStep
 from .registry import tools as _registry_tools, permitted_tools_for
 
@@ -221,61 +222,126 @@ def execute_plan(
     db: DBSession,
     user_id: str = "agent",
     plan_depth_cap: int = PLAN_DEPTH_CAP,
+    resume_from_step: int = 0,
 ) -> dict:
     """
-    Execute a plan per spec §4.6 generate-then-execute architecture.
+    Execute a plan per spec §4.6 generate-then-execute with §4.8 HITL pause.
 
-    Phase 1 — schema validation of ALL steps before any execution.
-    Phase 2 — controller authorization of ALL steps before any execution.
-    Phase 3 — sequential tool execution, persisting each step to DB.
+    Phase 1 — schema validation of ALL steps (skipped when resuming after HITL).
+    Phase 2+3 — sequential: authorize each step, then execute immediately.
+      - ALLOW   → execute; continue
+      - HITL    → pause; create ApprovalTask; return hitl_pending
+      - DENY    → fail plan; return failed
 
-    plan_depth_cap is enforced by truncating raw_steps; if the input
-    exceeds the cap the plan terminates with reason='plan_depth_exceeded'
-    after the allowed steps complete (T12.7).
+    resume_from_step > 0: skip all steps with step_index < resume_from_step,
+    loading their already-persisted results from agent_plan_steps instead of
+    re-executing. Used after an approval decision is recorded.
+
+    plan_depth_cap is enforced by truncating raw_steps; if the input exceeds
+    the cap the plan terminates with reason='plan_depth_exceeded' after the
+    allowed steps complete (T12.7).
 
     Returns:
         {
-          "status": str,               # completed | terminated | failed
+          "status": str,
           "terminated_reason": str | None,
           "step_results": list[dict],
-          "validation_errors": list[str],  # populated only on Phase 1 failure
+          "validation_errors": list[str],
+          "hitl_step_index": int | None,
+          "approval_id": str | None,
         }
     """
     registry = _registry_tools()
     depth_exceeded = len(raw_steps) > plan_depth_cap
     steps = raw_steps[:plan_depth_cap]
 
-    # ── Phase 1: Schema validation (all steps, before any execution) ─────────
+    # ── Phase 1: Schema validation (first-run only) ───────────────────────────
+    if resume_from_step == 0:
+        for step in steps:
+            errors = _validate_step(step, registry)
+            if errors:
+                _update_plan_status(plan_id, "failed", "plan_validation_failed", db)
+                db.commit()
+                return {
+                    "status": "failed",
+                    "terminated_reason": "plan_validation_failed",
+                    "step_results": [],
+                    "validation_errors": errors,
+                    "hitl_step_index": None,
+                    "approval_id": None,
+                }
+
+    # ── Phase 2+3: Sequential authorize-then-execute ──────────────────────────
+    step_results: list[dict] = []
+
     for idx, step in enumerate(steps):
-        errors = _validate_step(step, registry)
-        if errors:
-            _update_plan_status(plan_id, "failed", "plan_validation_failed", db)
+        tool_name = step["tool_name"]
+        params = step.get("params", {})
+        step_index = step.get("step_index", idx)
+
+        # ── Resume shortcut: load already-persisted result ───────────────────
+        if step_index < resume_from_step:
+            record = (
+                db.query(AgentPlanStep)
+                .filter(
+                    AgentPlanStep.plan_id == uuid.UUID(plan_id),
+                    AgentPlanStep.step_index == step_index,
+                )
+                .first()
+            )
+            if record:
+                step_results.append({
+                    "step_index": step_index,
+                    "tool_name": record.tool_name,
+                    "auth_decision": record.auth_decision,
+                    "severity_tier": record.severity_tier or "Unknown",
+                    "result": record.result,
+                    "error": record.error,
+                })
+            continue
+
+        # ── Authorize ────────────────────────────────────────────────────────
+        auth = authorize(
+            role, tool_name, params,
+            plan_id=plan_id, step_index=step_index, db=db,
+        )
+
+        # ── HITL: pause plan ─────────────────────────────────────────────────
+        if auth.get("routed_to_hitl"):
+            task = create_approval_task(
+                plan_id=plan_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                proposed_params=params,
+                severity_tier=auth["severity_tier"],
+                user_id=user_id,
+                db=db,
+            )
+            _update_plan_status(plan_id, "hitl_pending", None, db)
             db.commit()
             return {
-                "status": "failed",
-                "terminated_reason": "plan_validation_failed",
-                "step_results": [],
-                "validation_errors": errors,
+                "status": "hitl_pending",
+                "terminated_reason": None,
+                "step_results": step_results,
+                "validation_errors": [],
+                "hitl_step_index": step_index,
+                "approval_id": str(task.approval_id),
             }
 
-    # ── Phase 2: Authorization of all steps (before any execution) ───────────
-    auth_decisions: list[dict] = []
-    for step in steps:
-        auth = authorize(role, step["tool_name"], step.get("params", {}))
-        auth_decisions.append(auth)
+        # ── Deny ─────────────────────────────────────────────────────────────
         if not auth["allowed"]:
-            step_index = step.get("step_index", len(auth_decisions) - 1)
-            _update_plan_status(plan_id, "failed", "authorization_denied", db)
+            policy_ref = auth.get("policy_reference", "P1.2")
+            _update_plan_status(plan_id, "failed", f"{policy_ref}_denied", db)
             db.commit()
             return {
                 "status": "failed",
                 "terminated_reason": (
-                    f"step_{step_index}_denied: {auth['rationale']}"
+                    f"step_{step_index}_{policy_ref}_denied: {auth['rationale']}"
                 ),
                 "step_results": [
                     {
                         "step_index": step_index,
-                        "tool_name": step["tool_name"],
+                        "tool_name": tool_name,
                         "auth_decision": "deny",
                         "severity_tier": auth["severity_tier"],
                         "result": None,
@@ -283,16 +349,11 @@ def execute_plan(
                     }
                 ],
                 "validation_errors": [],
+                "hitl_step_index": None,
+                "approval_id": None,
             }
 
-    # ── Phase 3: Sequential execution ────────────────────────────────────────
-    step_results: list[dict] = []
-
-    for step, auth in zip(steps, auth_decisions):
-        tool_name = step["tool_name"]
-        params = step.get("params", {})
-        step_index = step.get("step_index", len(step_results))
-
+        # ── Execute ───────────────────────────────────────────────────────────
         step_record = AgentPlanStep(
             plan_id=uuid.UUID(plan_id),
             step_index=step_index,
@@ -311,20 +372,17 @@ def execute_plan(
         step_record.executed_at = datetime.utcnow()
         db.flush()
 
-        step_results.append(
-            {
-                "step_index": step_index,
-                "tool_name": tool_name,
-                "auth_decision": "allow",
-                "severity_tier": auth["severity_tier"],
-                "result": result,
-                "error": error,
-            }
-        )
+        step_results.append({
+            "step_index": step_index,
+            "tool_name": tool_name,
+            "auth_decision": "allow",
+            "severity_tier": auth["severity_tier"],
+            "result": result,
+            "error": error,
+        })
 
     # ── Finalize plan ─────────────────────────────────────────────────────────
     if depth_exceeded:
-        # Plan had more steps than the cap; executed the allowed ones.
         final_status = "terminated"
         terminated_reason = "plan_depth_exceeded"
     else:
@@ -339,4 +397,6 @@ def execute_plan(
         "terminated_reason": terminated_reason,
         "step_results": step_results,
         "validation_errors": [],
+        "hitl_step_index": None,
+        "approval_id": None,
     }

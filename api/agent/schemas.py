@@ -97,6 +97,8 @@ class PlanResponse(BaseModel):
     terminated_reason: Optional[str] = None
     step_results: list[PlanStepResult]
     validation_errors: list[str] = Field(default_factory=list)
+    hitl_step_index: Optional[int] = None
+    approval_id: Optional[str] = None
 
 
 class PlanDetailStep(BaseModel):
@@ -133,3 +135,61 @@ class RolePermittedToolsResponse(BaseModel):
     role: str
     permitted_tools: list[ToolDef]
     count: int
+
+
+# ---------------------------------------------------------------------------
+# M4: audit chain responses
+# ---------------------------------------------------------------------------
+
+class AuditEntryResponse(BaseModel):
+    action_id: str
+    plan_id: str
+    step_index: int
+    tool_name: str
+    params_hash: str
+    auth_decision: str
+    severity_tier: str
+    policy_reference: str
+    role: str
+    timestamp: datetime
+    prev_hash: str
+    entry_hash: str
+
+
+class ChainVerifyResponse(BaseModel):
+    valid: bool
+    entries_checked: int
+    first_invalid_index: Optional[int] = None
+
+
+class AgentTamperResponse(BaseModel):
+    tampered: bool
+    plan_id: str
+    action_id: str
+    detail: str
+
+
+# ---------------------------------------------------------------------------
+# M5: HITL approval schemas
+# ---------------------------------------------------------------------------
+
+class ApprovalTaskResponse(BaseModel):
+    approval_id: str
+    plan_id: str
+    step_index: int
+    tool_name: str
+    proposed_params: dict[str, Any]
+    severity_tier: str
+    requested_by: str
+    requested_at: datetime
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    decision: Optional[str] = None
+    decision_rationale: Optional[str] = None
+    status: str  # "pending" | "decided"
+
+
+class ApprovalDecision(BaseModel):
+    approver_user_id: str
+    approver_role: str
+    rationale: Optional[str] = None

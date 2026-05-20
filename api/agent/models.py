@@ -37,6 +37,7 @@ class AgentPlan(Base):
     # status in {"proposed", "executing", "completed", "failed", "hitl_pending", "terminated"}
     plan_depth_cap = Column(Integer, nullable=False, default=5)
     terminated_reason = Column(String, nullable=True)
+    raw_steps = Column(JSON, nullable=True)  # persisted for HITL resume
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
