@@ -32,6 +32,15 @@ _INJECTION_PATTERNS = [
     r'what\s+(documents?|files?)\s+(do\s+you|are\s+in)',
     r'dump\s+(all|the|your)',
     r'reveal\s+(your|the)\s+(prompt|instructions?|system)',
+    # SQL injection patterns
+    r';\s*(DROP|DELETE|TRUNCATE|ALTER|CREATE|INSERT|UPDATE)\s+',
+    r'UNION\s+(ALL\s+)?SELECT',
+    r"'\s*(OR|AND)\s+'?\s*\d+\s*[='<>]",
+    r'--\s*$',
+    # XSS patterns
+    r'<\s*script',
+    r'javascript\s*:',
+    r'on(load|error|click|mouseover|submit)\s*=',
 ]
 
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in _INJECTION_PATTERNS]
