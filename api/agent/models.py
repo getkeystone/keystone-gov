@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -61,6 +62,11 @@ class AgentPlanStep(Base):
     executed_at = Column(DateTime, nullable=True)
     result = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
+    # M6: per-step evidence gating sensor readings
+    evidence_score = Column(Float, nullable=True)
+    hhem_score = Column(Float, nullable=True)
+    citation_count = Column(Integer, nullable=True)
+    evidence_passed = Column(Boolean, nullable=True)
 
     __table_args__ = (
         Index("ix_agent_plan_steps_plan_index", "plan_id", "step_index", unique=True),

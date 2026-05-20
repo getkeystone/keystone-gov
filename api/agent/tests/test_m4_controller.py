@@ -36,6 +36,16 @@ def _lookup_step(idx=0):
     }
 
 
+def _evidence_pass():
+    """Stub for check_evidence used in M4 tests that focus on authorization
+    audit, not evidence gating (which is covered in test_m6_evidence.py)."""
+    return {
+        "passed": True, "policy_reference": "none",
+        "evidence_score": None, "hhem_score": None,
+        "citation_count": 0, "rationale": "mocked",
+    }
+
+
 def _audit_rows(db, plan_id: str):
     return db.execute(
         text(
@@ -51,28 +61,36 @@ def _audit_rows(db, plan_id: str):
 # ── 1. Audit entry created for an allowed call ───────────────────────────────
 
 class TestAuditEntryOnAllow:
-    def test_allow_creates_audit_row(self, db_client):
+    def test_allow_creates_audit_row(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
         rows = _audit_rows(db, plan_id)
         assert len(rows) == 1, f"expected 1 audit row, got {len(rows)}"
 
-    def test_allow_audit_decision_is_allow(self, db_client):
+    def test_allow_audit_decision_is_allow(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
         rows = _audit_rows(db, plan_id)
         assert rows[0][2] == "allow"
 
-    def test_allow_audit_policy_reference(self, db_client):
+    def test_allow_audit_policy_reference(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
         rows = _audit_rows(db, plan_id)
         assert rows[0][3] == "P1.2"
 
-    def test_multi_step_creates_one_entry_per_step(self, db_client):
+    def test_multi_step_creates_one_entry_per_step(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         steps = [_lookup_step(i) for i in range(3)]
         resp = _post_plan(client, "operator", steps)
@@ -121,7 +139,9 @@ class TestAuditEntryOnDeny:
 # ── 3. Hash chain is valid for a clean plan ───────────────────────────────────
 
 class TestChainIntegrity:
-    def test_verify_returns_valid_true(self, db_client):
+    def test_verify_returns_valid_true(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
@@ -129,7 +149,9 @@ class TestChainIntegrity:
         assert v.status_code == 200
         assert v.json()["valid"] is True
 
-    def test_verify_entries_checked_equals_step_count(self, db_client):
+    def test_verify_entries_checked_equals_step_count(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         steps = [_lookup_step(i) for i in range(3)]
         resp = _post_plan(client, "operator", steps)
@@ -137,7 +159,9 @@ class TestChainIntegrity:
         v = client.get(f"/agent/audit/{plan_id}/verify")
         assert v.json()["entries_checked"] == 3
 
-    def test_verify_first_invalid_index_is_null(self, db_client):
+    def test_verify_first_invalid_index_is_null(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
@@ -148,7 +172,9 @@ class TestChainIntegrity:
 # ── 4. Tamper detection ───────────────────────────────────────────────────────
 
 class TestTamperDetection:
-    def test_tamper_endpoint_returns_tampered_true(self, db_client):
+    def test_tamper_endpoint_returns_tampered_true(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
@@ -156,20 +182,21 @@ class TestTamperDetection:
         assert t.status_code == 200
         assert t.json()["tampered"] is True
 
-    def test_verify_after_tamper_returns_invalid(self, db_client):
+    def test_verify_after_tamper_returns_invalid(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
-        # Confirm chain is valid before tampering.
         v_before = client.get(f"/agent/audit/{plan_id}/verify")
         assert v_before.json()["valid"] is True
-        # Tamper the first entry.
         client.post(f"/agent/admin/agent-tamper/{plan_id}")
-        # Chain must now report invalid.
         v_after = client.get(f"/agent/audit/{plan_id}/verify")
         assert v_after.json()["valid"] is False
 
-    def test_verify_reports_first_invalid_index_zero(self, db_client):
+    def test_verify_reports_first_invalid_index_zero(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
@@ -270,14 +297,18 @@ class TestInsertOnlyEnforcement:
 # ── 7. Chain linkage ──────────────────────────────────────────────────────────
 
 class TestChainLinkage:
-    def test_first_entry_prev_hash_is_genesis(self, db_client):
+    def test_first_entry_prev_hash_is_genesis(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
         rows = _audit_rows(db, plan_id)
         assert rows[0][4] == "genesis", f"expected 'genesis', got {rows[0][4]!r}"
 
-    def test_consecutive_entries_link(self, db_client):
+    def test_consecutive_entries_link(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         steps = [_lookup_step(i) for i in range(3)]
         resp = _post_plan(client, "operator", steps)
@@ -295,14 +326,18 @@ class TestChainLinkage:
 # ── 8. GET /agent/audit/{plan_id} ─────────────────────────────────────────────
 
 class TestAuditEndpoint:
-    def test_returns_200(self, db_client):
+    def test_returns_200(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]
         r = client.get(f"/agent/audit/{plan_id}")
         assert r.status_code == 200
 
-    def test_entry_count_matches_steps(self, db_client):
+    def test_entry_count_matches_steps(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         steps = [_lookup_step(i) for i in range(2)]
         resp = _post_plan(client, "operator", steps)
@@ -310,7 +345,9 @@ class TestAuditEndpoint:
         r = client.get(f"/agent/audit/{plan_id}")
         assert len(r.json()) == 2
 
-    def test_entry_fields_populated(self, db_client):
+    def test_entry_fields_populated(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, _ = db_client
         resp = _post_plan(client, "operator", [_lookup_step()])
         plan_id = resp.json()["plan_id"]

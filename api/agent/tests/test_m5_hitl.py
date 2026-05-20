@@ -62,6 +62,19 @@ def _lookup_step(idx=0):
     }
 
 
+def _evidence_pass():
+    """Mock return value for check_evidence; used in approve-path tests that
+    focus on HITL flow, not evidence gating (which is tested in test_m6_evidence.py)."""
+    return {
+        "passed": True,
+        "policy_reference": "none",
+        "evidence_score": None,
+        "hhem_score": None,
+        "citation_count": 0,
+        "rationale": "mocked for M5 HITL flow test",
+    }
+
+
 def _first_doc(db):
     row = db.execute(text("SELECT rel_path FROM corpus_documents LIMIT 1")).fetchone()
     return row[0] if row else None
@@ -180,7 +193,9 @@ class TestHITLResponseFields:
 # ── 6. Approve resumes and executes ──────────────────────────────────────────
 
 class TestApproveResumesExecution:
-    def test_approve_returns_completed(self, db_client):
+    def test_approve_returns_completed(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         doc = _first_doc(db)
         if not doc:
@@ -192,7 +207,9 @@ class TestApproveResumesExecution:
         assert appr.status_code == 200
         assert appr.json()["status"] == "completed"
 
-    def test_approve_step_result_present(self, db_client):
+    def test_approve_step_result_present(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         doc = _first_doc(db)
         if not doc:
@@ -208,7 +225,9 @@ class TestApproveResumesExecution:
         assert sr["auth_decision"] == "allow"
         assert sr["result"] is not None
 
-    def test_approve_version_row_created(self, db_client):
+    def test_approve_version_row_created(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         doc = _first_doc(db)
         if not doc:
@@ -344,7 +363,9 @@ class TestInsufficientRoleCannotApprove:
 # ── 10. Approval writes P5.1 audit entry ─────────────────────────────────────
 
 class TestApprovalAuditEntry:
-    def test_approve_writes_p5_1_entry(self, db_client):
+    def test_approve_writes_p5_1_entry(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         doc = _first_doc(db)
         if not doc:
@@ -396,7 +417,9 @@ class TestApprovalAuditEntry:
 # ── 11. Plan state transitions ────────────────────────────────────────────────
 
 class TestPlanStateTransitions:
-    def test_hitl_then_completed(self, db_client):
+    def test_hitl_then_completed(self, db_client, monkeypatch):
+        import agent.plan_loop as pl
+        monkeypatch.setattr(pl, "check_evidence", lambda **kw: _evidence_pass())
         client, db = db_client
         doc = _first_doc(db)
         if not doc:

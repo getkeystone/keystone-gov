@@ -88,6 +88,11 @@ class PlanStepResult(BaseModel):
     severity_tier: str
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    # M6: per-step evidence sensor readings
+    evidence_score: Optional[float] = None
+    hhem_score: Optional[float] = None
+    citation_count: Optional[int] = None
+    evidence_passed: Optional[bool] = None
 
 
 class PlanResponse(BaseModel):
@@ -99,6 +104,9 @@ class PlanResponse(BaseModel):
     validation_errors: list[str] = Field(default_factory=list)
     hitl_step_index: Optional[int] = None
     approval_id: Optional[str] = None
+    # M6: plan-level evidence coverage metrics
+    citation_coverage: int = Field(default=0)
+    evidence_pass_rate: Optional[float] = None
 
 
 class PlanDetailStep(BaseModel):
@@ -111,6 +119,11 @@ class PlanDetailStep(BaseModel):
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     executed_at: Optional[datetime] = None
+    # M6: evidence sensor readings persisted on the step record
+    evidence_score: Optional[float] = None
+    hhem_score: Optional[float] = None
+    citation_count: Optional[int] = None
+    evidence_passed: Optional[bool] = None
 
 
 class PlanDetail(BaseModel):

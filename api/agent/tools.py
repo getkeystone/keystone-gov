@@ -136,6 +136,23 @@ def draft_procedure_update(
         db.rollback()
         return {"status": "error", "error": f"draft insert failed: {exc}"}
 
+    # M6: Retrieve evidence for HHEM consistency check (P2.2).
+    # Query the corpus using proposed_text so we surface the chunks most
+    # relevant to the proposed revision; HHEM then verifies consistency.
+    source_chunks = ""
+    try:
+        from agent.retrieval import retrieve_for_topic
+        ev = retrieve_for_topic(
+            topic=proposed_text[:200],
+            facility_type="",
+            role="operator",
+            db=db,
+            top_k=3,
+        )
+        source_chunks = ev.get("content", "")
+    except Exception as exc:
+        log.warning("draft_procedure_update: evidence retrieval failed: %s", exc)
+
     return {
         "status": "drafted",
         "version_id": new_ver[0],
@@ -143,4 +160,5 @@ def draft_procedure_update(
         "version_number": new_ver[2],
         "procedure_id": procedure_id,
         "citation_count": len(citations),
+        "source_chunks": source_chunks,
     }

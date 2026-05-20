@@ -160,6 +160,10 @@ def create_plan(req: PlanRequest, db: DBSession = Depends(get_db)) -> PlanRespon
             severity_tier=sr.get("severity_tier", "Unknown"),
             result=sr.get("result"),
             error=sr.get("error"),
+            evidence_score=sr.get("evidence_score"),
+            hhem_score=sr.get("hhem_score"),
+            citation_count=sr.get("citation_count"),
+            evidence_passed=sr.get("evidence_passed"),
         )
         for sr in result.get("step_results", [])
     ]
@@ -173,6 +177,8 @@ def create_plan(req: PlanRequest, db: DBSession = Depends(get_db)) -> PlanRespon
         validation_errors=result.get("validation_errors", []),
         hitl_step_index=result.get("hitl_step_index"),
         approval_id=result.get("approval_id"),
+        citation_coverage=result.get("citation_coverage", 0),
+        evidence_pass_rate=result.get("evidence_pass_rate"),
     )
 
 
@@ -423,6 +429,10 @@ def approve_action(
             severity_tier=sr.get("severity_tier", "Unknown"),
             result=sr.get("result"),
             error=sr.get("error"),
+            evidence_score=sr.get("evidence_score"),
+            hhem_score=sr.get("hhem_score"),
+            citation_count=sr.get("citation_count"),
+            evidence_passed=sr.get("evidence_passed"),
         )
         for sr in result.get("step_results", [])
     ]
@@ -436,6 +446,8 @@ def approve_action(
         validation_errors=result.get("validation_errors", []),
         hitl_step_index=result.get("hitl_step_index"),
         approval_id=result.get("approval_id"),
+        citation_coverage=result.get("citation_coverage", 0),
+        evidence_pass_rate=result.get("evidence_pass_rate"),
     )
 
 
@@ -550,6 +562,10 @@ def get_plan(plan_id: str, db: DBSession = Depends(get_db)) -> PlanDetail:
             result=s.result,
             error=s.error,
             executed_at=s.executed_at,
+            evidence_score=s.evidence_score,
+            hhem_score=s.hhem_score,
+            citation_count=s.citation_count,
+            evidence_passed=s.evidence_passed,
         )
         for s in step_records
     ]

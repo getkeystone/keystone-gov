@@ -17,6 +17,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session as DBSession
 
 from .controller import authorize
+from .evidence import check_evidence
 from .hitl import create_approval_task
 from .models import AgentPlan, AgentPlanStep
 from .registry import tools as _registry_tools, permitted_tools_for
@@ -269,6 +270,8 @@ def execute_plan(
                     "validation_errors": errors,
                     "hitl_step_index": None,
                     "approval_id": None,
+                    "citation_coverage": 0,
+                    "evidence_pass_rate": None,
                 }
 
     # ── Phase 2+3: Sequential authorize-then-execute ──────────────────────────
@@ -297,6 +300,10 @@ def execute_plan(
                     "severity_tier": record.severity_tier or "Unknown",
                     "result": record.result,
                     "error": record.error,
+                    "evidence_score": record.evidence_score,
+                    "hhem_score": record.hhem_score,
+                    "citation_count": record.citation_count or 0,
+                    "evidence_passed": record.evidence_passed,
                 })
             continue
 
@@ -326,6 +333,8 @@ def execute_plan(
                 "validation_errors": [],
                 "hitl_step_index": step_index,
                 "approval_id": str(task.approval_id),
+                "citation_coverage": sum(s.get("citation_count") or 0 for s in step_results),
+                "evidence_pass_rate": None,
             }
 
         # ── Deny ─────────────────────────────────────────────────────────────
@@ -346,11 +355,17 @@ def execute_plan(
                         "severity_tier": auth["severity_tier"],
                         "result": None,
                         "error": auth["rationale"],
+                        "evidence_score": None,
+                        "hhem_score": None,
+                        "citation_count": 0,
+                        "evidence_passed": None,
                     }
                 ],
                 "validation_errors": [],
                 "hitl_step_index": None,
                 "approval_id": None,
+                "citation_coverage": 0,
+                "evidence_pass_rate": None,
             }
 
         # ── Execute ───────────────────────────────────────────────────────────
@@ -372,6 +387,70 @@ def execute_plan(
         step_record.executed_at = datetime.utcnow()
         db.flush()
 
+        # ── Evidence gating (M6 P2.1/P2.2) ───────────────────────────────────
+        evidence_score: float | None = None
+        hhem_score: float | None = None
+        citation_count: int = 0
+        evidence_passed: bool | None = None
+
+        if result is not None and error is None:
+            ev = check_evidence(
+                tool_name=tool_name,
+                params=params,
+                result=result,
+                plan_id=plan_id,
+                step_index=step_index,
+                role=role,
+                severity_tier=auth["severity_tier"],
+                db=db,
+            )
+            evidence_score = ev["evidence_score"]
+            hhem_score = ev["hhem_score"]
+            citation_count = ev["citation_count"]
+            # Only set a boolean for evidence-bound tools; evidence-free tools stay None
+            evidence_passed = ev["passed"] if ev["policy_reference"] != "none" else None
+
+            step_record.evidence_score = evidence_score
+            step_record.hhem_score = hhem_score
+            step_record.citation_count = citation_count
+            step_record.evidence_passed = evidence_passed
+            db.flush()
+
+            if not ev["passed"]:
+                policy_ref = ev["policy_reference"]
+                step_results.append({
+                    "step_index": step_index,
+                    "tool_name": tool_name,
+                    "auth_decision": "allow",
+                    "severity_tier": auth["severity_tier"],
+                    "result": result,
+                    "error": f"evidence check failed: {ev['rationale']}",
+                    "evidence_score": evidence_score,
+                    "hhem_score": hhem_score,
+                    "citation_count": citation_count,
+                    "evidence_passed": False,
+                })
+                _update_plan_status(
+                    plan_id, "failed",
+                    f"step_{step_index}_{policy_ref}_evidence_fail",
+                    db,
+                )
+                db.commit()
+                return {
+                    "status": "failed",
+                    "terminated_reason": (
+                        f"step_{step_index}_{policy_ref}: {ev['rationale']}"
+                    ),
+                    "step_results": step_results,
+                    "validation_errors": [],
+                    "hitl_step_index": None,
+                    "approval_id": None,
+                    "citation_coverage": sum(
+                        s.get("citation_count") or 0 for s in step_results
+                    ),
+                    "evidence_pass_rate": None,
+                }
+
         step_results.append({
             "step_index": step_index,
             "tool_name": tool_name,
@@ -379,6 +458,10 @@ def execute_plan(
             "severity_tier": auth["severity_tier"],
             "result": result,
             "error": error,
+            "evidence_score": evidence_score,
+            "hhem_score": hhem_score,
+            "citation_count": citation_count,
+            "evidence_passed": evidence_passed,
         })
 
     # ── Finalize plan ─────────────────────────────────────────────────────────
@@ -392,6 +475,13 @@ def execute_plan(
     _update_plan_status(plan_id, final_status, terminated_reason, db)
     db.commit()
 
+    citation_coverage = sum(s.get("citation_count") or 0 for s in step_results)
+    bound_steps = [s for s in step_results if s.get("evidence_passed") is not None]
+    evidence_pass_rate = (
+        sum(1 for s in bound_steps if s.get("evidence_passed") is True) / len(bound_steps)
+        if bound_steps else None
+    )
+
     return {
         "status": final_status,
         "terminated_reason": terminated_reason,
@@ -399,4 +489,6 @@ def execute_plan(
         "validation_errors": [],
         "hitl_step_index": None,
         "approval_id": None,
+        "citation_coverage": citation_coverage,
+        "evidence_pass_rate": evidence_pass_rate,
     }
