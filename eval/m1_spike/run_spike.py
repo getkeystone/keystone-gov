@@ -31,15 +31,11 @@ SYSTEM_PROMPT = (
 
 def call_model(prompt_text: str) -> tuple[str, float]:
     t0 = time.time()
-    # Use whichever chat API ollama_client exposes; adjust call name to match.
-    # The expected interface: ollama_client.chat(messages=[...], model=...).
-    raw = ollama_client.chat(
-        model="qwen2.5:7b-instruct",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_text},
-        ],
-    )
+    # ollama_client.generate(system_prompt, user_prompt) -> str | None
+    # Uses GEN_MODEL from env (default qwen2.5:7b-instruct), /api/generate endpoint.
+    raw = ollama_client.generate(SYSTEM_PROMPT, prompt_text)
+    if raw is None:
+        raw = ""
     return raw, time.time() - t0
 
 
