@@ -28,7 +28,7 @@ ROLE_TOOL_MATRIX = {
 EXPECTED_BASE_TIERS = {
     "lookup_procedure":      "Low",
     "queue_notification":    "High",
-    "draft_procedure_update": "High",
+    "draft_procedure_update": "Critical",
 }
 
 # queue_notification severity param → expected tier per spec Section 4.3
@@ -189,7 +189,7 @@ class TestSeverityTier:
         from agent.registry import effective_severity_tier
         # draft_procedure_update is not parameter-dependent
         result = effective_severity_tier("draft_procedure_update", {"anything": "ignored"})
-        assert result == "High"
+        assert result == "Critical"
 
 
 # ── Endpoint tests ────────────────────────────────────────────────────────────

@@ -75,7 +75,7 @@ tools:
       Draft a procedure revision with citations and route it to a review
       queue. Operator and Supervisor submissions require custodian approval
       (HITL_REQUIRED). Custodian submissions execute directly.
-    severity_tier: High
+    severity_tier: Critical
     requires_evidence: true
     parameters_schema:
       type: object
