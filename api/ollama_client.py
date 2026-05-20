@@ -71,6 +71,27 @@ def generate(system_prompt: str, user_prompt: str) -> str | None:
     return text if text else None
 
 
+def generate_json(system_prompt: str, user_prompt: str) -> dict | None:
+    """Generate a structured JSON response. Returns parsed dict or None on failure."""
+    result = _post("/api/generate", {
+        "model": GEN_MODEL,
+        "system": system_prompt,
+        "prompt": user_prompt,
+        "stream": False,
+        "format": "json",
+    }, GEN_TIMEOUT)
+    if result is None:
+        return None
+    raw = result.get("response", "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("generate_json: failed to parse response: %s", exc)
+        return None
+
+
 def healthy() -> dict:
     """Check Ollama reachability and model availability.
     Returns a dict for the /health endpoint."""

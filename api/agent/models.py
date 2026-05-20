@@ -94,6 +94,26 @@ class AgentActionAudit(Base):
     )
 
 
+class AgentNotification(Base):
+    """
+    Queued notifications produced by queue_notification tool calls.
+    No actual dispatch in M3 — records intent for audit and HITL review.
+    """
+    __tablename__ = "agent_notifications"
+
+    notification_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    plan_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    step_index = Column(Integer, nullable=False)
+    severity = Column(Integer, nullable=False)
+    message = Column(Text, nullable=False)
+    recipients = Column(JSON, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_agent_notifications_plan", "plan_id"),
+    )
+
+
 class AgentApprovalTask(Base):
     __tablename__ = "agent_approval_tasks"
 

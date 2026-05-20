@@ -70,6 +70,60 @@ class ApprovalTaskDecision(BaseModel):
     rationale: Optional[str] = None
 
 
+class PlanRequest(BaseModel):
+    query: str
+    role: str
+    session_id: str = Field(default_factory=lambda: str(__import__("uuid").uuid4()))
+    user_id: str = "agent-test-user"
+    steps: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description="Pre-formed steps; if provided, skips LLM plan generation.",
+    )
+
+
+class PlanStepResult(BaseModel):
+    step_index: int
+    tool_name: str
+    auth_decision: str  # "allow" | "deny"
+    severity_tier: str
+    result: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class PlanResponse(BaseModel):
+    plan_id: str
+    role: str
+    status: str
+    terminated_reason: Optional[str] = None
+    step_results: list[PlanStepResult]
+    validation_errors: list[str] = Field(default_factory=list)
+
+
+class PlanDetailStep(BaseModel):
+    step_index: int
+    tool_name: str
+    proposed_params: dict[str, Any]
+    executed_params: Optional[dict[str, Any]] = None
+    auth_decision: str
+    severity_tier: Optional[str] = None
+    result: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    executed_at: Optional[datetime] = None
+
+
+class PlanDetail(BaseModel):
+    plan_id: str
+    session_id: str
+    user_id: str
+    role: str
+    status: str
+    terminated_reason: Optional[str] = None
+    plan_depth_cap: int
+    created_at: datetime
+    updated_at: datetime
+    steps: list[PlanDetailStep]
+
+
 class ToolRegistryResponse(BaseModel):
     tools: list[ToolDef]
     count: int
