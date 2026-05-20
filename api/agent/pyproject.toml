@@ -1,0 +1,7 @@
+# Local pyproject for the agent extension. Scopes pytest configuration to
+# api/agent/tests so the new module's tests are discoverable independently
+# of the existing bash smoke tests in api/tests/.
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
