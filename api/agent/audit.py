@@ -188,7 +188,7 @@ def verify_plan_chain(plan_id: str, db) -> dict:
             severity_tier=e.severity_tier,
             policy_reference=e.policy_reference,
             role=e.role,
-            timestamp=e.timestamp.isoformat(),
+            timestamp=e.timestamp.replace(tzinfo=None).isoformat(),
             prev_hash=e.prev_hash,
             stored_hash=e.entry_hash,
         ):
