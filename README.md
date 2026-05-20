@@ -26,7 +26,9 @@ Audit: hash-chained, tamper-evident logging on every query and every refusal.
 
 ## Evaluation baselines
 
-**KDAT-002B (2026-05-20, v0.6.1):** Governed agent extension baseline. 159 unit tests. 66 eval cases × 3 runs = 198 executions, 0 failures. H1 confirmed: governance primitives extend to tool-using agents without redesign. All adversarial categories at 100% strict pass. All STRIDE categories and all 4 severity tiers covered. Audit chain intact across all 198 executions.
+| Baseline | Description | Date | Verdict | Notes |
+|---|---|---|---|---|
+| KDAT-002D | Governed agent extension | 2026-05-20 | PASS | 186 cases, 12 categories, 558 executions, 0 fail. 4 bugs found by eval, all fixed. |
 
 **KDAT-001B (2026-04-11):**
 
