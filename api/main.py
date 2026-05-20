@@ -78,6 +78,7 @@ from text_clean import clean_lines, make_summary
 import hhem_scorer
 import ollama_client
 from compliance import router as compliance_router
+from agent.router import router as agent_router
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -2405,6 +2406,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 # ── Compliance router ─────────────────────────────────────────────────────────
 app.include_router(compliance_router)
+app.include_router(agent_router)
 
 
 # ---------------------------------------------------------------------------

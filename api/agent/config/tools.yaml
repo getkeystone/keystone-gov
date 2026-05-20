@@ -1,0 +1,9 @@
+# Agent tool registry. Loaded by api/agent/registry.py.
+# Real content lands in M2; this placeholder makes the registry loader
+# return an empty registry without errors during M1.
+tools: []
+role_permitted_tools:
+  operator: []
+  supervisor: []
+  custodian: []
+  admin: []
