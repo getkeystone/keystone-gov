@@ -1,6 +1,6 @@
 # Keystone Gov
 
-Governed retrieval API for regulated industries. Hybrid search, LLM generation, query-time access control, and tamper-evident audit logging.
+Governed retrieval and agent API for regulated industries. Hybrid search, LLM generation, query-time ACL, per-step evidence gating, HITL routing, and tamper-evident audit logging.
 
 ## What this is
 
@@ -24,7 +24,11 @@ Retrieval: hybrid (pgvector + full-text search), ACL filtering, reranking.
 Post-retrieval: evidence thresholding, LLM synthesis, factual consistency scoring (HHEM-2.1-Open), fail-closed gate.
 Audit: hash-chained, tamper-evident logging on every query and every refusal.
 
-## Evaluation baseline (KDAT-001B, 2026-04-11)
+## Evaluation baselines
+
+**KDAT-002B (2026-05-20, v0.6.1):** Governed agent extension baseline. 159 unit tests. 66 eval cases × 3 runs = 198 executions, 0 failures. H1 confirmed: governance primitives extend to tool-using agents without redesign. All adversarial categories at 100% strict pass. All STRIDE categories and all 4 severity tiers covered. Audit chain intact across all 198 executions.
+
+**KDAT-001B (2026-04-11):**
 
 | Metric | Result |
 |--------|--------|
@@ -32,10 +36,8 @@ Audit: hash-chained, tamper-evident logging on every query and every refusal.
 | Retrieval P@1 | 0.75 |
 | MRR | 0.79 |
 | Adversarial ACL | 8/8 blocked, 0 leaks |
-| Fail-closed | 5/6 (83%) |
+| Fail-closed | 5/6 (83%). FC-005 remediated 2026-05-17 (v0.5.2-fc005). |
 | Audit chain | Intact, immutable |
-
-**FC-005 remediation (2026-05-17, v0.5.2-fc005):** Pre-retrieval domain scope guard refusing out-of-corpus queries. Closes the KDAT-001B FC-005 failure where a TIER greenhouse gas query returned Part 36 mine gas chunks via embedding overlap. Validated manually against the probe set. Full taxonomy-based two-stage gate scoped for KDAT-002. Commit: [38ef89f](https://github.com/getkeystone/keystone-gov/commit/38ef89f).
 
 Full eval methodology and ledger: [getkeystone/keystone-kdat](https://github.com/getkeystone/keystone-kdat)
 
@@ -55,9 +57,9 @@ docker compose up -d
 
 See .env.example for required environment variables.
 
-## In development
+## Governed agent extension (KDAT-002)
 
-Governed agent extension (KDAT-002): tool authorization by role, action audit trails, HITL approval gates, multi-step reasoning with per-step evidence.
+Tool authorization by role, per-step evidence gating, HITL approval routing, and action audit chain. Same governance controller as the retrieval path — no redesign required. Shipped 2026-05-20 (v0.6.1).
 
 ## License
 
