@@ -20,10 +20,11 @@ def test_audit_canonical_params_hash():
     assert a == b, "canonical hash must be order-independent"
 
 
-def test_registry_empty_stub():
+def test_registry_loads_without_error():
     from agent import registry
     registry.load_registry()
-    assert registry.tools() == {}
+    # Registry is populated in M2; this verifies load_registry() does not raise.
+    assert isinstance(registry.tools(), dict)
 
 
 def test_hitl_severity_routing():

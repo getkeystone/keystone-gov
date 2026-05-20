@@ -68,3 +68,14 @@ class ApprovalTaskCreate(BaseModel):
 class ApprovalTaskDecision(BaseModel):
     decision: str  # "approve" | "reject"
     rationale: Optional[str] = None
+
+
+class ToolRegistryResponse(BaseModel):
+    tools: list[ToolDef]
+    count: int
+
+
+class RolePermittedToolsResponse(BaseModel):
+    role: str
+    permitted_tools: list[ToolDef]
+    count: int

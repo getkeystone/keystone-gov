@@ -1,9 +1,124 @@
-# Agent tool registry. Loaded by api/agent/registry.py.
-# Real content lands in M2; this placeholder makes the registry loader
-# return an empty registry without errors during M1.
-tools: []
+# Agent tool registry — KDAT-002-SPEC v1.2 Section 4.3.
+# Loaded by api/agent/registry.py at import time.
+#
+# Severity tiers per spec Section 4.3 and 4.5:
+#   Low    → ALLOW for any permitted role
+#   Medium → ALLOW for any permitted role
+#   High   → HITL_REQUIRED by default; explicit role override can bypass
+#   Critical → HITL_REQUIRED; no role override in v1
+#
+# queue_notification severity is parameter-dependent (spec Section 4.3):
+#   severity param 1 → Critical, 2 → High, 3 → Medium, 4 → Low
+#   Controller resolves effective tier from 'severity' param at runtime (M3).
+#   severity_tier here is the conservative base used before param is known.
+
+tools:
+  - name: lookup_procedure
+    description: >-
+      Retrieve regulatory procedure by topic. Returns content, citations,
+      and currency metadata.
+    severity_tier: Low
+    requires_evidence: true
+    parameters_schema:
+      type: object
+      properties:
+        topic:
+          type: string
+          description: The procedure topic to look up (e.g. "confined space entry").
+        facility_type:
+          type: string
+          description: >-
+            The type of facility the query is from
+            (e.g. "petroleum", "chemical", "construction").
+      required:
+        - topic
+        - facility_type
+      additionalProperties: false
+
+  - name: queue_notification
+    description: >-
+      Propose dispatching a facility-wide notification at a given severity.
+      Severity 1 = Critical, 2 = High, 3 = Medium, 4 = Low.
+    severity_tier: High          # conservative base; controller resolves from param
+    severity_parameter_dependent: true
+    severity_parameter: severity
+    severity_tier_map:           # controller reads this in M3
+      1: Critical
+      2: High
+      3: Medium
+      4: Low
+    requires_evidence: false
+    parameters_schema:
+      type: object
+      properties:
+        severity:
+          type: integer
+          description: "Notification urgency (1=Critical, 2=High, 3=Medium, 4=Low)."
+          minimum: 1
+          maximum: 4
+        message:
+          type: string
+          description: The notification message body.
+        recipients:
+          type: array
+          items:
+            type: string
+          description: List of recipient roles (e.g. ["supervisor", "operator"]).
+      required:
+        - severity
+        - message
+        - recipients
+      additionalProperties: false
+
+  - name: draft_procedure_update
+    description: >-
+      Draft a procedure revision with citations and route it to a review
+      queue. Operator and Supervisor submissions require custodian approval
+      (HITL_REQUIRED). Custodian submissions execute directly.
+    severity_tier: High
+    requires_evidence: true
+    parameters_schema:
+      type: object
+      properties:
+        procedure_id:
+          type: string
+          description: The ID of the procedure to revise.
+        proposed_text:
+          type: string
+          description: Full proposed revision text.
+        citations:
+          type: array
+          items:
+            type: string
+          description: >-
+            Document IDs from the corpus that support this revision
+            (e.g. ["ohs-doc-042", "ohs-doc-017"]).
+      required:
+        - procedure_id
+        - proposed_text
+        - citations
+      additionalProperties: false
+
+# Role-tool authorization matrix — spec Section 4.2 / 4.3.
+# Lists which tools a role MAY attempt to call. The controller then
+# applies severity-tier routing (ALLOW / HITL_REQUIRED / DENY) on top.
+#
+# operator   : read-only field user; lookup only
+# supervisor : authorized for notifications; lookup + notify
+# custodian  : document owner; full tool access, including direct drafts
+# admin      : platform admin; same tool access as custodian;
+#              separation-of-duties enforced at approval layer, not here
 role_permitted_tools:
-  operator: []
-  supervisor: []
-  custodian: []
-  admin: []
+  operator:
+    - lookup_procedure
+  supervisor:
+    - lookup_procedure
+    - queue_notification
+  custodian:
+    - lookup_procedure
+    - queue_notification
+    - draft_procedure_update
+  admin:
+    - lookup_procedure
+    - queue_notification
+    - draft_procedure_update

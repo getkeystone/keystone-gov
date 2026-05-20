@@ -79,6 +79,7 @@ import hhem_scorer
 import ollama_client
 from compliance import router as compliance_router
 from agent.router import router as agent_router
+from agent.registry import load_registry as _load_agent_registry
 
 # Maps scenario_key -> guidance template (from seeded data)
 _GUIDANCE_TEMPLATES: dict = {q["scenario_key"]: q for q in DEMO_QUERIES}
@@ -2318,6 +2319,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[startup] seed_managed_users failed: {exc}", file=sys.stderr, flush=True)
     validate_hmac_key()
+    _load_agent_registry()
     # ── Startup security warnings ────────────────────────────────────────────
     _salt_val = os.environ.get("AUTH_PASSWORD_SALT", "")
     if not _salt_val or _salt_val == "dev-salt-change-me":
