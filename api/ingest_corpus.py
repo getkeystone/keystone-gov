@@ -452,7 +452,7 @@ def main() -> None:
                    VALUES (%s, %s, %s, %s)
                    ON CONFLICT (doc_id, chunk_index)
                    DO UPDATE SET text = EXCLUDED.text, page = EXCLUDED.page""",
-                (doc_id, chunk_index, page_num, chunk_str),
+                (doc_id, chunk_index, page_num, chunk_str.replace("\x00", "")),
             )
 
         conn.commit()
