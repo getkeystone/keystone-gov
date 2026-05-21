@@ -20,7 +20,13 @@ The system runs entirely on customer-controlled infrastructure with no external 
 
 11 steps: input validation, jurisdiction scoping, RBAC, hybrid retrieval (pgvector + full-text search), ACL filtering, reranking, evidence thresholding, LLM synthesis, factual consistency scoring, fail-closed gate, hash-chained audit logging.
 
-## Evaluation baseline (KDAT-001B, 2026-04-11)
+## Evaluation baselines
+
+| Baseline | Description | Date | Verdict | Notes |
+|---|---|---|---|---|
+| KDAT-002D | Governed agent extension | 2026-05-20 | PASS | 186 cases, 12 categories, 558 executions, 0 fail. 4 bugs found by eval, all fixed. |
+
+**KDAT-001B (2026-04-11):**
 
 | Metric | Result |
 |--------|--------|
@@ -28,7 +34,7 @@ The system runs entirely on customer-controlled infrastructure with no external 
 | Retrieval P@1 | 0.75 |
 | MRR | 0.79 |
 | Adversarial ACL | 8/8 blocked, 0 leaks |
-| Fail-closed | 5/6 (83%) |
+| Fail-closed | 5/6 (83%). FC-005 remediated 2026-05-17 (v0.5.2-fc005). |
 | Audit chain | Intact, immutable |
 
 Full eval methodology and ledger: [getkeystone/keystone-kdat](https://github.com/getkeystone/keystone-kdat)
@@ -48,10 +54,6 @@ docker compose up -d
 ```
 
 See .env.example for required environment variables.
-
-## In development
-
-Governed agent extension (KDAT-002): tool authorization by role, action audit trails, HITL approval gates, multi-step reasoning with per-step evidence.
 
 ## License
 
