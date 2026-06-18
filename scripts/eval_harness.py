@@ -1,5 +1,5 @@
 """
-KDAT-001B: Sealed evaluation harness for Keystone retrieval + generation quality.
+keystone-core/retrieval-v1 (formerly KDAT-001B): Sealed evaluation harness for Keystone retrieval + generation quality.
 
 Runs 30 queries against a live Keystone API, scores each on:
   - retrieval_correct: did the top document match the expected source?
@@ -405,7 +405,7 @@ def score_query(base: str, token: str, q: dict) -> dict:
 
 def run_eval(base: str, user: str, password: str):
     """Run full eval suite and print results."""
-    print(f"Keystone KDAT-001B Evaluation Harness")
+    print(f"Keystone keystone-core/retrieval-v1 Evaluation Harness")
     print(f"API: {base}")
     print(f"Queries: {len(EVAL_SET)}")
     print(f"{'='*80}")
@@ -503,7 +503,7 @@ def run_eval(base: str, user: str, password: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KDAT-001B eval harness")
+    parser = argparse.ArgumentParser(description="keystone-core/retrieval-v1 eval harness")
     parser.add_argument("--api", default="http://localhost:8002", help="API base URL")
     parser.add_argument("--user", default="operator1")
     parser.add_argument("--password", default="demo123")

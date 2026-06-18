@@ -1,5 +1,5 @@
 """
-Plan generation, validation, and execution loop for KDAT-002.
+Plan generation, validation, and execution loop for keystone-core/agent (formerly KDAT-002).
 
 Architecture: generate-then-execute per spec Section 4.6. The LLM proposes
 a complete plan; the controller validates authorization for ALL steps before

@@ -1,4 +1,4 @@
-# Agent tool registry — KDAT-002-SPEC v1.2 Section 4.3.
+# Agent tool registry — keystone-core/agent-spec v1.2 (formerly KDAT-002-SPEC v1.2) Section 4.3.
 # Loaded by api/agent/registry.py at import time.
 #
 # Severity tiers per spec Section 4.3 and 4.5:

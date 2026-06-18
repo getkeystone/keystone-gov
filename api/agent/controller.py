@@ -1,7 +1,7 @@
 """
 The Keystone controller. The only execution path for tool calls.
 
-Per KDAT-002-SPEC v1.2 Section 1.5: the LLM does not execute tools.
+Per keystone-core/agent-spec v1.2 (formerly KDAT-002-SPEC v1.2) Section 1.5: the LLM does not execute tools.
 The LLM emits structured plan objects. The controller is the only
 execution path.
 

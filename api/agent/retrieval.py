@@ -5,7 +5,7 @@ Implements hybrid FTS + vector search using the same building blocks as
 api/main.py (_corpus_fts_retrieve, _hybrid_merge) without importing from
 that module. Reuses ollama_client.embed() and reranker.rerank_chunks().
 
-ACL note: all KDAT-002 roles (operator/supervisor/custodian/admin) map to
+ACL note: all keystone-core/agent (formerly KDAT-002) roles (operator/supervisor/custodian/admin) map to
 req_level=0 for corpus access — the full 53-document Alberta OHS corpus has
 min_role='member', so all agent roles can read it. Higher-level ACL
 enforcement (min_role='officer'/'authority') is preserved by the SQL WHERE
@@ -24,7 +24,7 @@ _HYBRID_W_VEC = 0.50
 _VEC_FLOOR = 0.20
 _TOP_K = 5
 
-# Map KDAT-002 roles to corpus ACL level.
+# Map keystone-core/agent roles to corpus ACL level.
 _AGENT_ROLE_LEVEL = {
     "operator": 0,
     "supervisor": 0,

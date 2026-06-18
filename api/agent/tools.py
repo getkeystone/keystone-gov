@@ -1,5 +1,5 @@
 """
-Tool implementations for KDAT-002.
+Tool implementations for keystone-core/agent (formerly KDAT-002).
 
 Three tools per spec Section 4.3:
   lookup_procedure      — hybrid retrieval, severity Low

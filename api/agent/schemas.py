@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 class AgentHealthResponse(BaseModel):
     status: str
     module_version: str
-    spec_contract: str = Field(default="KDAT-002-SPEC v1.2 (keystone-kdat 4b12094)")
+    spec_contract: str = Field(default="keystone-core/agent-spec v1.2 (formerly KDAT-002-SPEC v1.2) (keystone-kdat 4b12094)")
     tables_present: bool
 
 

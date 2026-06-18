@@ -291,7 +291,7 @@ def tamper_agent_audit(plan_id: str, db: DBSession = Depends(get_db)) -> AgentTa
 # M5: HITL approval queue
 # ---------------------------------------------------------------------------
 
-_APPROVAL_AUTHORITY_ROLES = {"custodian", "admin"}
+_APPROVAL_AUTHORITY_ROLES = {"custodian", "admin", "authority"}
 
 
 def _task_to_response(t: AgentApprovalTask) -> ApprovalTaskResponse:

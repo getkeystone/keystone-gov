@@ -1,5 +1,5 @@
 """
-Per-step evidence gating for KDAT-002 M6.
+Per-step evidence gating for keystone-core/agent (formerly KDAT-002) M6.
 
 Implements P2.1 (retrieval evidence threshold) and P2.2 (HHEM consistency).
 Called by plan_loop.execute_plan AFTER each tool executes, implementing

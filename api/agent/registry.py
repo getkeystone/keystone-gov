@@ -1,5 +1,5 @@
 """
-Tool registry and role-tool authorization matrix for KDAT-002.
+Tool registry and role-tool authorization matrix for keystone-core/agent (formerly KDAT-002).
 
 Loads from api/agent/config/tools.yaml at import time. Tests that need a
 custom path call load_registry(path) explicitly to reload.

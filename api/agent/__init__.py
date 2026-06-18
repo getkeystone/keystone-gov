@@ -1,7 +1,7 @@
 """
-Keystone agent extension package (KDAT-002).
+Keystone agent extension package (keystone-core/agent, formerly KDAT-002).
 
-Implements the single-agent governed extension per KDAT-002-SPEC v1.2
+Implements the single-agent governed extension per keystone-core/agent-spec v1.2 (formerly KDAT-002-SPEC v1.2)
 (keystone-kdat main, commit 4b12094). Adds three tools, four roles,
 four severity tiers, HITL routing, controller-as-reflection, and an
 action audit chain that operates alongside the existing query audit chain.

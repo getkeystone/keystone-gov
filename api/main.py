@@ -2889,7 +2889,7 @@ def submit_query(
         return QueryResponse(query_id=_jur_query_id, scenario_key="policy_refusal")
 
     # ── Domain scope guard — refuse queries outside OHS corpus topic scope ──
-    # FC-005 (KDAT-001B) demonstrated that queries about non-OHS Alberta
+    # FC-005 (keystone-core/retrieval-v1, formerly KDAT-001B) demonstrated that queries about non-OHS Alberta
     # regulations (e.g. TIER greenhouse gas reporting) could pass injection
     # and jurisdiction checks, then return wrong-Part chunks via semantic
     # overlap (mine gas chunks for a greenhouse gas query). HHEM cannot
