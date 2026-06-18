@@ -26,9 +26,13 @@ Audit: hash-chained, tamper-evident logging on every query and every refusal.
 
 ## Evaluation baselines
 
-**KDAT-002B (2026-05-20, v0.6.1):** Governed agent extension baseline. 159 unit tests. 66 eval cases × 3 runs = 198 executions, 0 failures. H1 confirmed: governance primitives extend to tool-using agents without redesign. All adversarial categories at 100% strict pass. All STRIDE categories and all 4 severity tiers covered. Audit chain intact across all 198 executions.
+**keystone-core/agent-v1 (formerly KDAT-002D) (2026-05-20, v0.6.1):** Governed agent extension, canonical eval. 186 eval cases across 12 categories, 558 executions (3 runs), 0 failures. All keystone-core/agent-v0 bugs fixed and re-verified. Audit chain intact across all 558 executions. 135 documents, 23,684 chunks.
 
-**KDAT-001B (2026-04-11):**
+**keystone-core/agent-v0 (formerly KDAT-002C):** 66-case agent eval that identified 4 system bugs: HMAC timestamp verification mismatch, 3 injection scanner gaps. Published as the failing run alongside agent-v1. All bugs fixed in agent-v1 and re-verified.
+
+**keystone-core/agent-v0-pre (formerly KDAT-002B) (2026-05-20, v0.6.1):** Governed agent extension baseline. 159 unit tests. 66 eval cases × 3 runs = 198 executions, 0 failures. H1 confirmed: governance primitives extend to tool-using agents without redesign. All adversarial categories at 100% strict pass. All STRIDE categories and all 4 severity tiers covered. Audit chain intact across all 198 executions.
+
+**keystone-core/retrieval-v1 (formerly KDAT-001B) (2026-04-11):**
 
 | Metric | Result |
 |--------|--------|
@@ -57,7 +61,7 @@ docker compose up -d
 
 See .env.example for required environment variables.
 
-## Governed agent extension (KDAT-002)
+## Governed agent extension (keystone-core/agent)
 
 Tool authorization by role, per-step evidence gating, HITL approval routing, and action audit chain. Same governance controller as the retrieval path — no redesign required. Shipped 2026-05-20 (v0.6.1).
 
