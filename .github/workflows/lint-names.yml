@@ -9,9 +9,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check for customer-specific strings (warning only)
+        env:
+          # The forbidden-name pattern is stored as a repo secret so the customer
+          # names themselves never appear in this public workflow file.
+          # Configure: Settings > Secrets > Actions > NAME_GUARD_PATTERN
+          # (a regex alternation of forbidden strings). Falls back to a no-op.
+          NAME_GUARD_PATTERN: ${{ secrets.NAME_GUARD_PATTERN }}
         run: |
-          PATTERN='long reach|saint john fire'
+          PATTERN="${NAME_GUARD_PATTERN:-__no_pattern_configured__}"
+          if [ "$PATTERN" = "__no_pattern_configured__" ]; then
+            echo "NOTE: NAME_GUARD_PATTERN secret not set; skipping name check."
+            exit 0
+          fi
           if grep -rniP --include="*.py" "$PATTERN" api/; then
             echo "WARNING: customer-specific string found"
           fi
-          echo "OK: lint passed (lrfd references tracked in issue)"
+          echo "OK: lint passed"

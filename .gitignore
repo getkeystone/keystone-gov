@@ -214,3 +214,30 @@ eval/results/
 scripts/backfill_embeddings.py
 *.bak.*
 =
+
+# --- IP-protection: keep eval gold sets / answer keys / generated results out of the public repo ---
+# The sealed eval harness embeds the gold set (expected answers). Keep it local/private only.
+eval_results_*.json
+eval/*.yaml
+eval/*.yml
+scripts/eval_harness.py
+api/eval_harness.py
+
+# --- Local AI-tooling / analysis artifacts (never commit; keep out of public repo) ---
+graphify-out/
+.graphifyignore
+.code-review-graphignore
+.github/code-review-graph.instruction.md
+.claude/
+.gemini/
+.qoder/
+.kiro/
+.vscode/
+.mcp.json
+.opencode.json
+.cursorrules
+.windsurfrules
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+QODER.md
