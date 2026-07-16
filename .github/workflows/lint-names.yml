@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check for customer-specific strings (warning only)
+      - name: Check for customer-specific strings
         env:
           # The forbidden-name pattern is stored as a repo secret so the customer
           # names themselves never appear in this public workflow file.
@@ -22,6 +22,7 @@ jobs:
             exit 0
           fi
           if grep -rniP --include="*.py" "$PATTERN" api/; then
-            echo "WARNING: customer-specific string found"
+            echo "ERROR: customer-specific string found"
+            exit 1
           fi
           echo "OK: lint passed"
