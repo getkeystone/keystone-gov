@@ -8,14 +8,14 @@ Regulated enterprises need retrieval that does more than find relevant text. It 
 
 Keystone Gov is built the other way around. Role-based access control is enforced at query time as a WHERE clause in the database, so documents above the caller's role level are never returned. Answers are refused at several independent gates rather than guessed. A dedicated model scores factual consistency and withholds answers the evidence does not support. Every query and every refusal is written to an audit trail with a keyed HMAC-SHA256 integrity check.
 
-The system runs on customer-controlled infrastructure with local models through Ollama and factual consistency scoring via HHEM-2.1-Open on CPU. There is no external API dependency for core operation.
+Retrieval and model inference run on customer-controlled infrastructure without an external model API. Optional Cloudflare Access identity integration depends on Cloudflare, and HHEM model assets may require an initial Hugging Face download before they are cached locally.
 
 ## Architecture
 
 A request to `POST /query` (`api/main.py`, `submit_query`) runs through a fixed pipeline:
 
-1. Rate limiting per session token.
-2. Role is derived from the authenticated session. The role in the request body is ignored.
+1. Rate limiting per authenticated user (see Identity boundary below for where that identity comes from).
+2. Role is derived from the resolved `AppUser`. The role in the request body is ignored.
 3. Prompt-injection check. A detected injection returns a refusal and is written to the audit trail without exposing any corpus data.
 4. Jurisdiction guard. The current corpus covers Alberta OHS only, so queries that reference other jurisdictions are refused and audited.
 5. Hybrid retrieval over full-text search and pgvector. Both queries carry the role-level ACL as a WHERE clause, plus domain and jurisdiction constraints. Documents above the caller's role level are excluded in the database and never reach the application.
@@ -39,6 +39,26 @@ These are the controls enforced in the served path.
 **Per-record HMAC-SHA256 audit trail.** Every query and every refusal writes an audit entry with a keyed HMAC-SHA256 integrity check. Entries are linked at write time, each recording the prior entry's hash, which forms a structural chain. The shipped verifier (`verify_entry`) checks one record at a time by recomputing its HMAC from that record's stored fields. There is no chain-walk verifier that validates linkage across the full ledger.
 
 The HMAC covers the query id, timestamp, role used, mode used, policy outcome, and the prior entry's hash. It does not cover the answer text, the cited document ids, or the factual consistency score. Those fields are stored on the audit row but sit outside the signature, so altering them would not be detected by the current verifier. The service refuses to start with a weak or short HMAC key.
+
+## Identity boundary
+
+The application supports two identity paths, resolved once per request into a single `AppUser`:
+
+1. a demo Bearer-session path; and
+2. an optional Cloudflare Access identity path.
+
+When Cloudflare Access is enabled (`CLOUDFLARE_ACCESS_ENABLED=true`):
+
+- startup requires both `CLOUDFLARE_ACCESS_TEAM_DOMAIN` and `CLOUDFLARE_ACCESS_AUD` to be set; the service refuses to start otherwise.
+- the Access JWT is checked for signature (against Cloudflare's JWKS), issuer, and application audience before the email is resolved against local managed-user state.
+- local provisioning and role assignment still belong to Keystone application state (`managed_users`), not to Cloudflare.
+
+When Cloudflare Access is disabled (the default):
+
+- a `Cf-Access-Jwt-Assertion` header does not activate the Cloudflare identity path; it is ignored outright.
+- authentication follows the demo Bearer-session path.
+
+This is an implementation-level identity integration. It is not evidence that a live production deployment has Cloudflare Access correctly configured, not a claim that the configured team domain or audience correspond to a real deployed Cloudflare Access application, and not independent validation of authentication security.
 
 ## Evaluation
 
@@ -69,7 +89,7 @@ Keystone Gov draws on operational patterns familiar from enterprise contact-cent
 
 Prerequisites: Python 3.12, PostgreSQL 16 with the pgvector extension, and Ollama serving `nomic-embed-text` and `qwen2.5:7b-instruct`. The HHEM-2.1-Open model is downloaded from Hugging Face on first load and cached on the host.
 
-Configure the API by copying `api/.env.example` to `api/.env` and filling in the values (database URL, `AUDIT_HMAC_KEY`, HHEM threshold, and related settings).
+Configure the API by copying `api/.env.example` to `api/.env` and filling in the values (database URL, `AUDIT_HMAC_KEY`, HHEM threshold, and related settings, including the Cloudflare Access variables described in Identity boundary above if that identity path is used).
 
 Install dependencies and run the API from the `api` directory:
 

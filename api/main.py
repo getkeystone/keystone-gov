@@ -2437,7 +2437,12 @@ def _check_login_rate_limit(ip: str) -> None:
         _login_attempts[ip] = window
 
 
-# Query rate limiter: 20 queries per session token per 60 seconds.
+# Query rate limiter: 20 queries per authenticated user per 60 seconds.
+# The key is the caller's user_id or email (see submit_query), not a
+# session token: it identifies whichever AppUser get_current_user()
+# resolved, whether that came from Cloudflare Access or the demo Bearer
+# session path. The parameter below is still named `token` to avoid an
+# unrelated rename; it holds that identifier, not a literal token string.
 _QUERY_RATE_LIMIT  = int(os.environ.get("QUERY_RATE_LIMIT", "20"))
 _QUERY_RATE_WINDOW = 60  # seconds
 _query_attempts: dict[str, list[float]] = {}
@@ -2445,7 +2450,10 @@ _query_lock = threading.Lock()
 
 
 def _check_query_rate_limit(token: str) -> None:
-    """Raise 429 if the session token has exceeded the query threshold."""
+    """Raise 429 if this authenticated-user identifier has exceeded the
+    query threshold. `token` is the caller's user_id or email, not a
+    session token; see the module comment above _QUERY_RATE_LIMIT.
+    """
     now = time.time()
     with _query_lock:
         window = _query_attempts.get(token, [])
@@ -2752,7 +2760,7 @@ def get_me(current_user: AppUser = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Query (requires auth; role from token only)
+# Query (requires auth; role from the resolved AppUser only)
 # ---------------------------------------------------------------------------
 
 
@@ -2763,10 +2771,11 @@ def submit_query(
     current_user: AppUser = Depends(get_current_user),
 ):
     # ── Rate limiting ────────────────────────────────────────────────────────
-    # 20 queries per session token per 60 seconds.  Protects GPU from abuse.
+    # 20 queries per authenticated user per 60 seconds. Protects GPU from abuse.
     _check_query_rate_limit(current_user.user_id or current_user.email)
 
-    # Role is ALWAYS derived from the authenticated session — request body value ignored.
+    # Role is ALWAYS derived from the resolved AppUser (Cloudflare Access or
+    # demo Bearer session); the request body value is ignored.
     role = current_user.role
     role_level = _ROLE_LEVEL.get(role, 0)
 
