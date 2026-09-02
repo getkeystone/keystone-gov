@@ -34,7 +34,7 @@ These are the controls enforced in the served path.
 
 **Fail-closed refusal.** Several independent gates can refuse a query: prompt-injection detection, the jurisdiction guard, the insufficient-evidence threshold, and the factual-consistency threshold. Each gate produces a specific refusal reason, and a refused query is audited with the same detail as an allowed one.
 
-**Factual consistency scoring.** A dedicated model, Vectara HHEM-2.1-Open, scores independently whether the generated answer is supported by the retrieved evidence. Two thresholds are used because the answer source predicts the score range: a deterministic default of 0.5 and an LLM default of 0.20, both configurable by environment variable. Answers below the applicable threshold are withheld with a `LOW_FACTUAL_CONSISTENCY` refusal. The scorer runs on CPU with no external API dependency. If the scorer model is unavailable, scoring degrades open and does not block, and the score field records `None`.
+**Factual consistency scoring.** Vectara HHEM-2.1-Open runs as a separate model-based factual-consistency scorer, checking whether the generated answer is supported by the retrieved evidence. Two thresholds are used because the answer source predicts the score range: a deterministic default of 0.5 and an LLM default of 0.20, both configurable by environment variable. Answers below the applicable threshold are withheld with a `LOW_FACTUAL_CONSISTENCY` refusal. This is a design choice, not independent validation of correctness: the scorer is not a correctness oracle, and a passing score does not prove the answer is factually correct. The scorer runs on CPU with no external API dependency. If the scorer model fails to load or errors at runtime, scoring degrades open rather than refusing: the score field records `None`, and the pipeline does not block solely because the scorer was unavailable.
 
 **Per-record HMAC-SHA256 audit trail.** Every query and every refusal writes an audit entry with a keyed HMAC-SHA256 integrity check. Entries are linked at write time, each recording the prior entry's hash, which forms a structural chain. The shipped verifier (`verify_entry`) checks one record at a time by recomputing its HMAC from that record's stored fields. There is no chain-walk verifier that validates linkage across the full ledger.
 
@@ -42,11 +42,11 @@ The HMAC covers the query id, timestamp, role used, mode used, policy outcome, a
 
 ## Evaluation
 
-Published baselines and the eval ledger live in [`keystone-ledger`](https://github.com/getkeystone/keystone-ledger).
+Published baselines and the eval ledger live in [`keystone-ledger`](https://github.com/getkeystone/keystone-ledger). These are retained internal evaluation results tied to a specific evaluated commit and configuration, not independent validation, and a passing run does not establish that every current keystone-gov behavior is covered.
 
-KDAT-002D (governed agent extension, 2026-05-20): 186 cases across 12 categories, 558 executions, 0 failures. Four bugs were surfaced by the eval and fixed.
+**keystone-core/agent-v1** (historical id KDAT-002D, governed agent extension, 2026-05-20): 186 cases across 12 categories, 558 executions, 153 strict pass, 33 characterization, 0 strict failures. A preceding run, keystone-core/agent-v0 (KDAT-002C), had found 9 failing cases traced to 4 root-cause defects; those were fixed before agent-v1 was recorded.
 
-KDAT-001B (2026-04-11), measured on this codebase's retrieval pipeline:
+**keystone-core/retrieval-v1** (historical id KDAT-001B, 2026-04-11), measured on this codebase's retrieval pipeline:
 
 | Metric | Result |
 | --- | --- |
@@ -54,16 +54,16 @@ KDAT-001B (2026-04-11), measured on this codebase's retrieval pipeline:
 | Retrieval P@1 | 0.75 |
 | MRR | 0.79 |
 | Adversarial ACL | 8/8 blocked, 0 leaks |
-| Fail-closed | 5/6 (83%). FC-005 domain-scope guard merged 2026-05-17 (demo-grade). |
+| Fail-closed | 5/6 (83%). FC-005 domain-scope guard merged 2026-05-17 (demo-grade remediation); a passing re-verification is not yet recorded. |
 
 ## Contact-center heritage
 
-Gov applies operational discipline that regulated contact centers used before LLMs:
+Keystone Gov draws on operational patterns familiar from enterprise contact-center systems, not on the claim that those systems solved the same problem with the same tools:
 
-- Query-time role-level access control maps to need-to-know access on regulated records.
-- Fail-closed refusal maps to refusing under uncertainty rather than guessing.
-- The per-record HMAC audit trail maps to compliance logging.
-- Independent factual-consistency scoring maps to quality monitoring of what was said.
+- Query-time role-level access control resembles need-to-know access on regulated records.
+- Fail-closed refusal resembles refusing under uncertainty rather than guessing.
+- The per-record HMAC audit trail resembles compliance logging.
+- Model-based factual-consistency scoring resembles quality monitoring of what was said, applied to a generated answer rather than a human one.
 
 ## Getting started
 
@@ -83,10 +83,10 @@ A `Dockerfile` is provided in `api/` for building a container image that runs th
 
 ## Related repos
 
-- [`keystone-ledger`](https://github.com/getkeystone/keystone-ledger): evaluation lineage and proof artifacts. Public shortly.
+- [`keystone-ledger`](https://github.com/getkeystone/keystone-ledger): retained internal evaluation artifacts and lineage. Public.
 - [`keystone-verify`](https://github.com/getkeystone/keystone-verify): the evaluation framework as a standalone tool. Public.
-- [`keystone-engage`](https://github.com/getkeystone/keystone-engage): governed conversational agent for regulated customer interaction. Public shortly.
-- `keystone-counsel`: authorization-first retrieval for regulated content. Private repo.
+- [`keystone-engage`](https://github.com/getkeystone/keystone-engage): governed conversational agent for regulated customer interaction. Public.
+- [`keystone-counsel`](https://github.com/getkeystone/keystone-counsel): authorization-first retrieval for regulated content. Public.
 
 Live demo: [demo.getkeystone.ai](https://demo.getkeystone.ai). Contact: [arnaldo@getkeystone.ai](mailto:arnaldo@getkeystone.ai).
 

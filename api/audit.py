@@ -2,7 +2,17 @@ import hashlib
 import hmac as _hmac
 import os
 
-_INSECURE_DEFAULTS = {"dev-insecure-change-in-production", "", "changeme", "secret"}
+_INSECURE_DEFAULTS = {
+    "dev-insecure-change-in-production",
+    "",
+    "changeme",
+    "secret",
+    # The literal placeholder shipped in api/.env.example. It is 33
+    # characters, long enough to clear _MIN_KEY_LEN on its own, so it must
+    # be denylisted explicitly or copying .env.example unchanged silently
+    # produces a service that accepts a known secret.
+    "change-me-to-a-long-random-secret",
+}
 _MIN_KEY_LEN = 32
 
 

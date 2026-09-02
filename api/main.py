@@ -59,6 +59,7 @@ from cf_identity import (
     get_demo_sim_enabled,
     init_role_config,
     seed_managed_users,
+    validate_cf_config,
 )
 from ingest_lib import (
     VALID_DOMAINS as _INGEST_VALID_DOMAINS,
@@ -2307,6 +2308,7 @@ async def lifespan(app: FastAPI):
         print("[startup] API will serve /health as degraded until DB is available.",
               file=sys.stderr, flush=True)
     _load_signing_key()
+    validate_cf_config()
     init_role_config()
     try:
         db = SessionLocal()

@@ -3,7 +3,7 @@
 Flow per authenticated request:
   1. Read Cf-Access-Jwt-Assertion header (injected by Cloudflare tunnel)
   2. Validate JWT signature against Cloudflare's public JWKS
-  3. Verify aud and iss claims
+  3. Verify iss (always) and aud (always, once CF is enabled; see below) claims
   4. Extract email from JWT claims
   5. Normalize email to lowercase
   6. Look up email in loaded role config → get assigned role
@@ -13,7 +13,13 @@ Flow per authenticated request:
 Feature flags (env vars):
   CLOUDFLARE_ACCESS_ENABLED            true/false (default false)
   CLOUDFLARE_ACCESS_TEAM_DOMAIN        e.g. keystone-ai.cloudflareaccess.com
-  CLOUDFLARE_ACCESS_AUD                CF Access application audience tag
+  CLOUDFLARE_ACCESS_AUD                CF Access application audience tag.
+                                        Mandatory once CLOUDFLARE_ACCESS_ENABLED=true:
+                                        validate_cf_config() fails startup otherwise,
+                                        because without it audience verification is
+                                        disabled and any token Cloudflare signed for
+                                        this team domain, not only this application,
+                                        would be accepted.
   DEMO_ROLE_SIMULATION_ENABLED         true/false (default false)
   DEMO_ROLE_SIMULATION_ALLOWED_EMAILS  comma-separated allowlist
 
@@ -120,6 +126,32 @@ def load_role_config(path: str = _CONFIG_PATH) -> dict[str, RoleEntry]:
             status=status,
         )
     return result
+
+
+def validate_cf_config() -> None:
+    """Raise SystemExit if Cloudflare Access is enabled without an audience.
+
+    When CLOUDFLARE_ACCESS_ENABLED=true and CLOUDFLARE_ACCESS_AUD is unset,
+    _validate_cf_jwt_inner() disables audience verification entirely
+    (options={"verify_aud": False}). That means any token Cloudflare signed
+    for any Access application on the same team domain would be accepted
+    here, not just tokens for this application. Call this from application
+    startup, alongside validate_hmac_key(), so the process refuses to start
+    in that configuration rather than silently running with audience
+    checking off. This does not add any new production auth guarantee; it
+    only makes an existing, already-documented CF Access parameter
+    mandatory when CF Access is the active identity path.
+    """
+    if _CF_ENABLED and not _CF_AUD:
+        raise SystemExit(
+            "[cf_identity] FATAL: CLOUDFLARE_ACCESS_ENABLED=true but "
+            "CLOUDFLARE_ACCESS_AUD is not set. Without it, audience "
+            "verification is disabled and any Cloudflare Access token "
+            "signed for this team domain, not only tokens for this "
+            "application, would be accepted. Set CLOUDFLARE_ACCESS_AUD to "
+            "this application's Access application audience (AUD) tag "
+            "before starting the service."
+        )
 
 
 def init_role_config() -> None:
@@ -285,20 +317,34 @@ def _validate_cf_jwt_inner(assertion: str) -> str:
         jwk = _get_jwk(kid)
         public_key = pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
 
+        # _get_jwk() above calls _fetch_jwks(), which raises RuntimeError if
+        # _CF_TEAM_DOMAIN is unset. Reaching this line means _CF_TEAM_DOMAIN
+        # is non-empty, so the expected issuer is always defined here.
+        # Cloudflare Access issues tokens with iss == https://<team-domain>
+        # (the same team domain used to fetch JWKS above).
+        expected_issuer = f"https://{_CF_TEAM_DOMAIN}"
+
         if _CF_AUD:
             payload = pyjwt.decode(
                 assertion,
                 key=public_key,
                 algorithms=["RS256"],
                 audience=_CF_AUD,
+                issuer=expected_issuer,
             )
         else:
             payload = pyjwt.decode(
                 assertion,
                 key=public_key,
                 algorithms=["RS256"],
+                issuer=expected_issuer,
                 options={"verify_aud": False},
             )
+    except pyjwt.InvalidIssuerError:
+        raise HTTPException(
+            status_code=401,
+            detail={"message": "CF Access token issuer mismatch", "reasonCode": "CF_TOKEN_ISS_MISMATCH"},
+        )
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=401,

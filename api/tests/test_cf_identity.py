@@ -14,6 +14,7 @@ Tests:
   T11 AppUser.username returns email
 """
 
+import json
 import sys
 import os
 import io
@@ -26,7 +27,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import cf_identity
-from cf_identity import AppUser, load_role_config, RoleEntry
+from cf_identity import AppUser, load_role_config, RoleEntry, validate_cf_config
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ version: 1
 users:
   - email: alice@lrfd.ca
     display_name: Alice Example
-    role: admin
+    role: authority
     status: active
   - email: bob@lrfd.ca
     display_name: Bob Member
@@ -55,7 +56,7 @@ version: 1
 users:
   - email: alice@lrfd.ca
     display_name: Alice One
-    role: admin
+    role: authority
     status: active
   - email: ALICE@LRFD.CA
     display_name: Alice Two
@@ -107,7 +108,7 @@ def test_load_role_config_valid():
     result = load_role_config(path)
     assert len(result) == 3
     assert "alice@lrfd.ca" in result
-    assert result["alice@lrfd.ca"].role == "admin"
+    assert result["alice@lrfd.ca"].role == "authority"
     assert result["alice@lrfd.ca"].display_name == "Alice Example"
     assert result["bob@lrfd.ca"].role == "member"
     assert result["carol@lrfd.ca"].role == "officer"
@@ -248,7 +249,7 @@ def test_app_user_sim_role_overrides():
         user_id="u1",
         email="alice@lrfd.ca",
         display_name="Alice",
-        assigned_role="admin",
+        assigned_role="authority",
         auth_source="cloudflare_access",
         sim_role="member",
     )
@@ -264,11 +265,11 @@ def test_app_user_no_sim_role():
         user_id="u1",
         email="alice@lrfd.ca",
         display_name="Alice",
-        assigned_role="admin",
+        assigned_role="authority",
         auth_source="cloudflare_access",
         sim_role=None,
     )
-    assert user.role == "admin"
+    assert user.role == "authority"
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +281,7 @@ def test_app_user_username_is_email():
         user_id="u1",
         email="alice@lrfd.ca",
         display_name="Alice",
-        assigned_role="admin",
+        assigned_role="authority",
         auth_source="cloudflare_access",
     )
     assert user.username == "alice@lrfd.ca"
@@ -295,11 +296,11 @@ version: 1
 users:
   - email: testuser@example.com
     display_name: Arnaldo Sepulveda
-    role: admin
+    role: authority
     status: active
   - email: admin@example.com
     display_name: Arnaldo
-    role: admin
+    role: authority
     status: active
 """
 
@@ -311,13 +312,13 @@ def test_both_admin_emails_load():
 
     assert "testuser@example.com" in result
     e1 = result["testuser@example.com"]
-    assert e1.role == "admin"
+    assert e1.role == "authority"
     assert e1.display_name == "Arnaldo Sepulveda"
     assert e1.status == "active"
 
     assert "admin@example.com" in result
     e2 = result["admin@example.com"]
-    assert e2.role == "admin"
+    assert e2.role == "authority"
     assert e2.display_name == "Arnaldo"
     assert e2.status == "active"
 
@@ -354,11 +355,11 @@ version: 1
 users:
   - email: testuser@example.com
     display_name: Arnaldo Sepulveda
-    role: admin
+    role: authority
     status: active
   - email: admin@example.com
     display_name: Arnaldo
-    role: admin
+    role: authority
     status: active
   - email: testuser2@example.com
     display_name: Arnaldo Demo
@@ -377,10 +378,10 @@ def test_demo_users_load():
     result = load_role_config(path)
 
     expected = {
-        "testuser@example.com":    ("admin",   "Arnaldo Sepulveda"),
-        "admin@example.com":       ("admin",   "Arnaldo"),
-        "testuser2@example.com":   ("member",  "Arnaldo Demo"),
-        "otheruser@example.com":  ("officer", "Nature Uplift"),
+        "testuser@example.com":    ("authority", "Arnaldo Sepulveda"),
+        "admin@example.com":       ("authority", "Arnaldo"),
+        "testuser2@example.com":   ("member",    "Arnaldo Demo"),
+        "otheruser@example.com":  ("officer",    "Nature Uplift"),
     }
     assert len(result) == len(expected), (
         f"Expected {len(expected)} users, got {len(result)}: {set(result)}"
@@ -411,5 +412,138 @@ def test_demo_users_cross_domain_no_duplicate():
     assert "testuser@example.com"  in result
     assert "testuser2@example.com" in result
     # Roles must differ — confirms they're separate entries
-    assert result["testuser@example.com"].role  == "admin"
+    assert result["testuser@example.com"].role  == "authority"
     assert result["testuser2@example.com"].role == "member"
+
+
+# ---------------------------------------------------------------------------
+# T18-T20: validate_cf_config(): mandatory audience when CF is enabled
+# ---------------------------------------------------------------------------
+#
+# _validate_cf_jwt_inner() disables audience verification entirely when
+# CLOUDFLARE_ACCESS_AUD is empty (options={"verify_aud": False}). That is a
+# real acceptance gap if CF is enabled without an audience configured:
+# any token Cloudflare signed for this team domain, not only this
+# application, would pass. validate_cf_config() is the fail-closed startup
+# guard for that configuration, called from main.py's lifespan alongside
+# validate_hmac_key().
+
+def test_validate_cf_config_cf_disabled_does_not_raise(monkeypatch):
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", False)
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "")
+    validate_cf_config()  # should not raise regardless of AUD
+
+
+def test_validate_cf_config_cf_enabled_with_aud_does_not_raise(monkeypatch):
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "some-aud-tag")
+    validate_cf_config()  # should not raise
+
+
+def test_validate_cf_config_cf_enabled_without_aud_raises(monkeypatch):
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "")
+    with pytest.raises(SystemExit, match="CLOUDFLARE_ACCESS_AUD"):
+        validate_cf_config()
+
+
+# ---------------------------------------------------------------------------
+# T21-T23: _validate_cf_jwt_inner(): issuer verification
+# ---------------------------------------------------------------------------
+#
+# These build a real RS256-signed JWT and a matching JWK so the actual
+# pyjwt.decode() call in cf_identity is exercised, not a mock of it.
+
+def _rsa_keypair_and_jwk(kid: str = "test-kid"):
+    """Generate an RSA keypair and the JWK dict cf_identity would fetch
+    from Cloudflare's JWKS endpoint for the matching public key.
+    """
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    import jwt as pyjwt
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    jwk = json.loads(pyjwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk["kid"] = kid
+    return private_pem, jwk
+
+
+def _sign_cf_token(private_pem, kid: str, claims: dict) -> str:
+    import jwt as pyjwt
+    return pyjwt.encode(claims, private_pem, algorithm="RS256", headers={"kid": kid})
+
+
+@pytest.fixture
+def cf_jwt_fixture(monkeypatch):
+    """Wires cf_identity._get_jwk() to a locally generated keypair, and
+    sets a fixed team domain / audience, without any network access.
+    """
+    private_pem, jwk = _rsa_keypair_and_jwk()
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "team.example.com")
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "aud-123")
+    monkeypatch.setattr(cf_identity, "_get_jwk", lambda kid: jwk)
+    return private_pem
+
+
+def test_validate_cf_jwt_accepts_correct_issuer_and_audience(cf_jwt_fixture):
+    private_pem = cf_jwt_fixture
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://team.example.com",
+            "aud": "aud-123",
+            "email": "alice@lrfd.ca",
+        },
+    )
+    email = cf_identity._validate_cf_jwt_inner(token)
+    assert email == "alice@lrfd.ca"
+
+
+def test_validate_cf_jwt_rejects_wrong_issuer(cf_jwt_fixture):
+    """A token signed by the same key but for a different team domain
+    (a different Cloudflare Access org) must be rejected on issuer, not
+    silently accepted because the signature still checks out.
+    """
+    private_pem = cf_jwt_fixture
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://a-different-team.cloudflareaccess.com",
+            "aud": "aud-123",
+            "email": "alice@lrfd.ca",
+        },
+    )
+    from fastapi import HTTPException as FastHTTP
+    with pytest.raises(FastHTTP) as exc_info:
+        cf_identity._validate_cf_jwt_inner(token)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail["reasonCode"] == "CF_TOKEN_ISS_MISMATCH"
+
+
+def test_validate_cf_jwt_rejects_wrong_audience(cf_jwt_fixture):
+    """Confirms audience is still enforced when CLOUDFLARE_ACCESS_AUD is
+    set (this behavior predates this change; kept here alongside the new
+    issuer test so both claims have direct coverage in one place).
+    """
+    private_pem = cf_jwt_fixture
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://team.example.com",
+            "aud": "some-other-application",
+            "email": "alice@lrfd.ca",
+        },
+    )
+    from fastapi import HTTPException as FastHTTP
+    with pytest.raises(FastHTTP) as exc_info:
+        cf_identity._validate_cf_jwt_inner(token)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail["reasonCode"] == "CF_TOKEN_AUD_MISMATCH"
