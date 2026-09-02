@@ -1,9 +1,11 @@
 """cf_identity.py — Cloudflare Access identity validation and JIT user provisioning.
 
-Flow per authenticated request:
+Flow per authenticated request, only when CLOUDFLARE_ACCESS_ENABLED=true.
+When it is false, a Cf-Access-Jwt-Assertion header is ignored outright and
+the demo Bearer path is used instead; see get_current_user():
   1. Read Cf-Access-Jwt-Assertion header (injected by Cloudflare tunnel)
   2. Validate JWT signature against Cloudflare's public JWKS
-  3. Verify iss (always) and aud (always, once CF is enabled; see below) claims
+  3. Verify iss and aud claims (both mandatory; see CLOUDFLARE_ACCESS_AUD below)
   4. Extract email from JWT claims
   5. Normalize email to lowercase
   6. Look up email in loaded role config → get assigned role
@@ -12,7 +14,11 @@ Flow per authenticated request:
 
 Feature flags (env vars):
   CLOUDFLARE_ACCESS_ENABLED            true/false (default false)
-  CLOUDFLARE_ACCESS_TEAM_DOMAIN        e.g. keystone-ai.cloudflareaccess.com
+  CLOUDFLARE_ACCESS_TEAM_DOMAIN        e.g. keystone-ai.cloudflareaccess.com.
+                                        Mandatory once CLOUDFLARE_ACCESS_ENABLED=true:
+                                        validate_cf_config() fails startup otherwise,
+                                        because JWKS retrieval and issuer
+                                        verification both depend on it.
   CLOUDFLARE_ACCESS_AUD                CF Access application audience tag.
                                         Mandatory once CLOUDFLARE_ACCESS_ENABLED=true:
                                         validate_cf_config() fails startup otherwise,
@@ -25,7 +31,9 @@ Feature flags (env vars):
 
 Backward compat:
   When CLOUDFLARE_ACCESS_ENABLED=false, falls back to Bearer token session
-  (existing demo auth path, unchanged).
+  (existing demo auth path, unchanged). Any Cf-Access-Jwt-Assertion header
+  present in that mode is ignored, not validated: header presence alone
+  cannot activate the CF identity path.
 """
 
 import json
@@ -129,28 +137,52 @@ def load_role_config(path: str = _CONFIG_PATH) -> dict[str, RoleEntry]:
 
 
 def validate_cf_config() -> None:
-    """Raise SystemExit if Cloudflare Access is enabled without an audience.
+    """Raise SystemExit if Cloudflare Access is enabled without a team
+    domain or an audience.
 
     When CLOUDFLARE_ACCESS_ENABLED=true and CLOUDFLARE_ACCESS_AUD is unset,
     _validate_cf_jwt_inner() disables audience verification entirely
     (options={"verify_aud": False}). That means any token Cloudflare signed
     for any Access application on the same team domain would be accepted
-    here, not just tokens for this application. Call this from application
-    startup, alongside validate_hmac_key(), so the process refuses to start
-    in that configuration rather than silently running with audience
-    checking off. This does not add any new production auth guarantee; it
-    only makes an existing, already-documented CF Access parameter
-    mandatory when CF Access is the active identity path.
+    here, not just tokens for this application.
+
+    CLOUDFLARE_ACCESS_TEAM_DOMAIN is equally required for the enabled CF
+    path: _fetch_jwks() cannot fetch Cloudflare's public keys without it,
+    and _validate_cf_jwt_inner() cannot construct the expected issuer
+    without it either. Today an absent team domain is not caught here; it
+    only surfaces later, per request, as a 500 CF_JWKS_ERROR the first time
+    a JWT is presented. Checking it here alongside AUD turns that into the
+    same fail-fast startup behavior as the rest of this function, instead
+    of a working process that 500s on every real request.
+
+    Call this from application startup, alongside validate_hmac_key(), so
+    the process refuses to start in either misconfiguration rather than
+    silently running with audience checking off or JWKS retrieval broken.
+    This does not add any new production auth guarantee; it only makes
+    existing, already-documented CF Access parameters mandatory when CF
+    Access is the active identity path. It does not, and cannot, confirm
+    that the configured values are correct for a real, live Cloudflare
+    Access application; only that they are present.
     """
-    if _CF_ENABLED and not _CF_AUD:
+    if not _CF_ENABLED:
+        return
+
+    missing = []
+    if not _CF_TEAM_DOMAIN:
+        missing.append("CLOUDFLARE_ACCESS_TEAM_DOMAIN")
+    if not _CF_AUD:
+        missing.append("CLOUDFLARE_ACCESS_AUD")
+
+    if missing:
         raise SystemExit(
             "[cf_identity] FATAL: CLOUDFLARE_ACCESS_ENABLED=true but "
-            "CLOUDFLARE_ACCESS_AUD is not set. Without it, audience "
-            "verification is disabled and any Cloudflare Access token "
-            "signed for this team domain, not only tokens for this "
-            "application, would be accepted. Set CLOUDFLARE_ACCESS_AUD to "
-            "this application's Access application audience (AUD) tag "
-            "before starting the service."
+            f"{' and '.join(missing)} not set. Without "
+            "CLOUDFLARE_ACCESS_TEAM_DOMAIN, JWKS retrieval and issuer "
+            "verification cannot work. Without CLOUDFLARE_ACCESS_AUD, "
+            "audience verification is disabled and any Cloudflare Access "
+            "token signed for this team domain, not only tokens for this "
+            "application, would be accepted. Set both before starting the "
+            "service."
         )
 
 
@@ -482,10 +514,17 @@ def get_current_user(
 ) -> AppUser:
     """Resolve the current app user from either CF Access JWT or demo Bearer token.
 
-    Resolution order:
-      1. If CF Access JWT header is present → validate and provision from CF.
-      2. If CF Access is enabled but JWT is absent → 401 (CF assertion required).
-      3. If CF Access is disabled → fall back to Bearer token (demo session path).
+    Resolution order (gated on CLOUDFLARE_ACCESS_ENABLED, not on header
+    presence: a Cf-Access-Jwt-Assertion header cannot activate the CF
+    identity path while CF Access is disabled):
+      1. CF Access enabled + JWT present → validate and provision from CF.
+      2. CF Access enabled + JWT absent → 401 (CF assertion required).
+      3. CF Access disabled → Bearer token (demo session path). Any
+         Cf-Access-Jwt-Assertion header is ignored, not validated, in this
+         mode: validate_cf_config() only guarantees CLOUDFLARE_ACCESS_AUD
+         and CLOUDFLARE_ACCESS_TEAM_DOMAIN are present when CF Access is
+         enabled, so honoring the header while disabled could mean running
+         _validate_cf_jwt_inner() with an unconfigured or empty audience.
 
     Simulation path (internal only):
       - CF JWT present (real identity validated) + Bearer token present
@@ -493,44 +532,44 @@ def get_current_user(
       - real email is in DEMO_ROLE_SIMULATION_ALLOWED_EMAILS
       - → AppUser.assigned_role = real CF role, AppUser.sim_role = sim session role
     """
-    # ── Path 1: Cloudflare Access JWT ──────────────────────────────────────────
-    if cf_access_jwt_assertion:
-        print(
-            f"[cf_identity] CF JWT received (len={len(cf_access_jwt_assertion)}"
-            f" prefix={cf_access_jwt_assertion[:20]!r})",
-            flush=True,
-        )
-        email = _validate_cf_jwt_inner(cf_access_jwt_assertion)
-        cf_user = provision_cf_user(email, db)
-        real_role = cf_user.assigned_role
-
-        # Check for simulation overlay
-        sim_role: Optional[str] = None
-        if (
-            _DEMO_SIM_ENABLED
-            and email in _DEMO_SIM_ALLOWED
-            and authorization
-            and authorization.startswith("Bearer ")
-        ):
-            token = authorization.removeprefix("Bearer ")
-            from models import Session as DBSession_model
-            sim_session = db.query(DBSession_model).filter(
-                DBSession_model.token == token
-            ).first()
-            if sim_session:
-                sim_role = sim_session.role
-
-        return AppUser(
-            user_id=cf_user.id,
-            email=cf_user.email,
-            display_name=cf_user.display_name,
-            assigned_role=real_role,
-            auth_source="cloudflare_access",
-            sim_role=sim_role,
-        )
-
-    # ── Path 2: CF enabled but no JWT → deny ──────────────────────────────────
     if _CF_ENABLED:
+        # ── Path 1: Cloudflare Access JWT ──────────────────────────────────
+        if cf_access_jwt_assertion:
+            print(
+                f"[cf_identity] CF JWT received (len={len(cf_access_jwt_assertion)}"
+                f" prefix={cf_access_jwt_assertion[:20]!r})",
+                flush=True,
+            )
+            email = _validate_cf_jwt_inner(cf_access_jwt_assertion)
+            cf_user = provision_cf_user(email, db)
+            real_role = cf_user.assigned_role
+
+            # Check for simulation overlay
+            sim_role: Optional[str] = None
+            if (
+                _DEMO_SIM_ENABLED
+                and email in _DEMO_SIM_ALLOWED
+                and authorization
+                and authorization.startswith("Bearer ")
+            ):
+                token = authorization.removeprefix("Bearer ")
+                from models import Session as DBSession_model
+                sim_session = db.query(DBSession_model).filter(
+                    DBSession_model.token == token
+                ).first()
+                if sim_session:
+                    sim_role = sim_session.role
+
+            return AppUser(
+                user_id=cf_user.id,
+                email=cf_user.email,
+                display_name=cf_user.display_name,
+                assigned_role=real_role,
+                auth_source="cloudflare_access",
+                sim_role=sim_role,
+            )
+
+        # ── Path 2: CF enabled but no JWT → deny ───────────────────────────
         print(
             "[cf_identity] CF_ASSERTION_MISSING — CF enabled but no JWT header received",
             flush=True,
@@ -544,6 +583,19 @@ def get_current_user(
         )
 
     # ── Path 3: CF disabled → Bearer token (demo/dev path) ───────────────────
+    # A Cf-Access-Jwt-Assertion header, if present, is intentionally not
+    # inspected here: audience verification cannot be guaranteed configured
+    # while CF Access is disabled (validate_cf_config() does not require
+    # CLOUDFLARE_ACCESS_AUD/TEAM_DOMAIN in that mode), so this path must not
+    # let header presence alone activate CF authentication.
+    if cf_access_jwt_assertion:
+        print(
+            "[cf_identity] Cf-Access-Jwt-Assertion header present but "
+            "CLOUDFLARE_ACCESS_ENABLED=false; ignoring it and using the demo "
+            "Bearer path",
+            flush=True,
+        )
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 

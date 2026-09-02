@@ -417,34 +417,62 @@ def test_demo_users_cross_domain_no_duplicate():
 
 
 # ---------------------------------------------------------------------------
-# T18-T20: validate_cf_config(): mandatory audience when CF is enabled
+# T18-T20: validate_cf_config(): mandatory team domain + audience when CF is enabled
 # ---------------------------------------------------------------------------
 #
 # _validate_cf_jwt_inner() disables audience verification entirely when
 # CLOUDFLARE_ACCESS_AUD is empty (options={"verify_aud": False}). That is a
 # real acceptance gap if CF is enabled without an audience configured:
 # any token Cloudflare signed for this team domain, not only this
-# application, would pass. validate_cf_config() is the fail-closed startup
-# guard for that configuration, called from main.py's lifespan alongside
-# validate_hmac_key().
+# application, would pass. CLOUDFLARE_ACCESS_TEAM_DOMAIN is equally required
+# for the enabled path (JWKS retrieval and issuer verification both depend
+# on it); left unset, it previously surfaced only per-request as a 500
+# CF_JWKS_ERROR rather than at startup. validate_cf_config() is the
+# fail-closed startup guard for both, called from main.py's lifespan
+# alongside validate_hmac_key().
 
 def test_validate_cf_config_cf_disabled_does_not_raise(monkeypatch):
     monkeypatch.setattr(cf_identity, "_CF_ENABLED", False)
     monkeypatch.setattr(cf_identity, "_CF_AUD", "")
-    validate_cf_config()  # should not raise regardless of AUD
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "")
+    validate_cf_config()  # should not raise regardless of AUD/TEAM_DOMAIN
 
 
-def test_validate_cf_config_cf_enabled_with_aud_does_not_raise(monkeypatch):
+def test_validate_cf_config_cf_enabled_with_both_does_not_raise(monkeypatch):
     monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
     monkeypatch.setattr(cf_identity, "_CF_AUD", "some-aud-tag")
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "team.example.com")
     validate_cf_config()  # should not raise
 
 
 def test_validate_cf_config_cf_enabled_without_aud_raises(monkeypatch):
+    """CF enabled, team domain present, audience missing -> startup failure."""
     monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "team.example.com")
     monkeypatch.setattr(cf_identity, "_CF_AUD", "")
     with pytest.raises(SystemExit, match="CLOUDFLARE_ACCESS_AUD"):
         validate_cf_config()
+
+
+def test_validate_cf_config_cf_enabled_without_team_domain_raises(monkeypatch):
+    """CF enabled, audience present, team domain missing -> startup failure."""
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "some-aud-tag")
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "")
+    with pytest.raises(SystemExit, match="CLOUDFLARE_ACCESS_TEAM_DOMAIN"):
+        validate_cf_config()
+
+
+def test_validate_cf_config_cf_enabled_without_either_raises_and_names_both(monkeypatch):
+    """Both missing -> the single startup failure message names both."""
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "")
+    monkeypatch.setattr(cf_identity, "_CF_TEAM_DOMAIN", "")
+    with pytest.raises(SystemExit) as exc_info:
+        validate_cf_config()
+    message = str(exc_info.value)
+    assert "CLOUDFLARE_ACCESS_TEAM_DOMAIN" in message
+    assert "CLOUDFLARE_ACCESS_AUD" in message
 
 
 # ---------------------------------------------------------------------------
@@ -547,3 +575,180 @@ def test_validate_cf_jwt_rejects_wrong_audience(cf_jwt_fixture):
         cf_identity._validate_cf_jwt_inner(token)
     assert exc_info.value.status_code == 401
     assert exc_info.value.detail["reasonCode"] == "CF_TOKEN_AUD_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# T24-T26: get_current_user() gates the CF JWT path on CLOUDFLARE_ACCESS_ENABLED
+# ---------------------------------------------------------------------------
+#
+# Residual case this closes: with CLOUDFLARE_ACCESS_ENABLED=false and
+# CLOUDFLARE_ACCESS_AUD unset (both allowed together, since AUD is only
+# mandatory while CF is enabled), a correctly-signed token for a DIFFERENT
+# Cloudflare Access application -- same team domain, wrong audience -- used
+# to authenticate successfully as a real cloudflare_access user, because
+# get_current_user() activated the CF path on header presence alone, and
+# _validate_cf_jwt_inner() disables audience verification whenever _CF_AUD
+# is empty. Reproduced directly against the pre-fix code (see the increment
+# report) before writing this test.
+
+class _FakeManagedUser:
+    display_name = "Alice"
+    role = "authority"
+    status = "enabled"
+    last_login = None
+
+
+class _FakeCFUser:
+    id = "u-alice"
+    email = "alice@lrfd.ca"
+    display_name = "Alice"
+    assigned_role = "authority"
+    status = "enabled"
+
+
+class _FakeProvisioningDB:
+    """Fakes just enough of the DB session for provision_cf_user() to
+    succeed: an enabled ManagedUser row and a pre-existing CFUser row.
+    """
+
+    def query(self, model):
+        import models
+        name = getattr(model, "__name__", "")
+        if model is models.ManagedUser or name == "ManagedUser":
+            return _FakeQueryResult(_FakeManagedUser())
+        if model is models.CFUser or name == "CFUser":
+            return _FakeQueryResult(_FakeCFUser())
+        raise AssertionError(f"Unexpected model queried: {model!r}")
+
+    def commit(self):
+        pass
+
+    def refresh(self, obj):
+        pass
+
+
+class _FakeQueryResult:
+    def __init__(self, result):
+        self._result = result
+
+    def filter(self, *a, **kw):
+        return self
+
+    def first(self):
+        return self._result
+
+
+def test_get_current_user_cf_disabled_ignores_cf_header_even_with_valid_signature(
+    cf_jwt_fixture, monkeypatch,
+):
+    """The exact residual case: CF disabled, AUD empty, a correctly-signed
+    token for a different application's audience must not authenticate.
+
+    cf_jwt_fixture sets _CF_AUD to a non-empty value by default; override it
+    back to empty here, matching the reported configuration
+    (CLOUDFLARE_ACCESS_AUD unset is exactly what makes audience checking
+    disabled in _validate_cf_jwt_inner when the CF path runs at all).
+    """
+    private_pem = cf_jwt_fixture
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "")
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", False)
+
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://team.example.com",
+            "aud": "some-completely-different-applications-aud",
+            "email": "attacker@lrfd.ca",
+        },
+    )
+
+    from fastapi import HTTPException as FastHTTP
+
+    with pytest.raises(FastHTTP) as exc_info:
+        cf_identity.get_current_user(
+            cf_access_jwt_assertion=token,
+            authorization=None,
+            db=_FakeProvisioningDB(),
+        )
+    # Falls through to the demo path and is rejected there for lack of a
+    # Bearer token -- not authenticated as cloudflare_access.
+    assert exc_info.value.status_code == 401
+
+
+def test_get_current_user_cf_disabled_cf_header_does_not_override_demo_bearer(
+    cf_jwt_fixture, monkeypatch,
+):
+    """A CF header present alongside a valid demo Bearer session must not
+    change which path wins: CF disabled means the demo path, full stop.
+    """
+    private_pem = cf_jwt_fixture
+    monkeypatch.setattr(cf_identity, "_CF_AUD", "")
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", False)
+
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://team.example.com",
+            "aud": "some-completely-different-applications-aud",
+            "email": "attacker@lrfd.ca",
+        },
+    )
+
+    fake_token = "test-token-" + str(uuid.uuid4())
+
+    class FakeSession:
+        user_id = "demo-user"
+        username = "demo@lrfd.ca"
+        role = "member"
+
+    class FakeQuery:
+        def filter(self, *a, **kw):
+            return self
+        def first(self):
+            return FakeSession()
+
+    class FakeDB:
+        def query(self, model):
+            return FakeQuery()
+
+    user = cf_identity.get_current_user(
+        cf_access_jwt_assertion=token,
+        authorization=f"Bearer {fake_token}",
+        db=FakeDB(),
+    )
+
+    assert user.auth_source == "demo_session"
+    assert user.email == "demo@lrfd.ca"
+    assert user.assigned_role == "member"
+
+
+def test_get_current_user_cf_enabled_accepts_correct_issuer_and_audience(
+    cf_jwt_fixture, monkeypatch,
+):
+    """End-to-end through get_current_user() (not just _validate_cf_jwt_inner)
+    with CF enabled and a token matching the configured issuer and audience.
+    """
+    private_pem = cf_jwt_fixture
+    monkeypatch.setattr(cf_identity, "_CF_ENABLED", True)
+
+    token = _sign_cf_token(
+        private_pem,
+        "test-kid",
+        {
+            "iss": "https://team.example.com",
+            "aud": "aud-123",
+            "email": "alice@lrfd.ca",
+        },
+    )
+
+    user = cf_identity.get_current_user(
+        cf_access_jwt_assertion=token,
+        authorization=None,
+        db=_FakeProvisioningDB(),
+    )
+
+    assert user.auth_source == "cloudflare_access"
+    assert user.email == "alice@lrfd.ca"
+    assert user.assigned_role == "authority"
